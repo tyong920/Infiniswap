@@ -42,7 +42,7 @@ int main(int argc, char **argv)
 
   //free
   running = 1;
-  TEST_NZ(pthread_create(&free_mem_thread, NULL, (void *)free_mem, NULL));
+  TEST_NZ(pthread_create(&free_mem_thread, NULL, free_mem, NULL));
 
   while (rdma_get_cm_event(ec, &event) == 0) {
     struct rdma_cm_event event_copy;

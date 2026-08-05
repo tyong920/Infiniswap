@@ -45,41 +45,48 @@
 
 #include "infiniswap.h"
 
-/* lookup_bdev patch: https://www.redhat.com/archives/dm-devel/2016-April/msg00372.html */
-#ifdef HAVE_LOOKUP_BDEV_PATCH
-#define LOOKUP_BDEV(x) lookup_bdev(x, 0)
+struct stackbd_t stackbd;
+
+static int major_num;
+module_param(major_num, int, 0);
+static int logical_block_size = 512;
+module_param(logical_block_size, int, 0);
+
+static DECLARE_WAIT_QUEUE_HEAD(req_event);
+
+struct bio *IS_bio_clone(struct bio *source, gfp_t gfp)
+{
+#ifdef INFINISWAP_HAVE_BIO_ALLOC_CLONE
+	return bio_alloc_clone(stackbd.bdev_raw, source, gfp, NULL);
 #else
-#define LOOKUP_BDEV(x) lookup_bdev(x)
+	return bio_clone_fast(source, gfp, NULL);
 #endif
-
-
-void IS_stackbd_end_io(struct bio *bio, int err)
-{
-	struct request *req = (struct request *)ptr_from_uint64(bio->bi_private);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 18, 0)
-	blk_mq_end_request(req, err);
-#else
-	blk_mq_end_io(req, err);
-#endif	
-
-}
-void IS_stackbd_end_io2(struct bio *bio, int err)
-{
-	struct request *req = (struct request *)ptr_from_uint64(bio->bi_private);
-	pr_info("%s is called, req=%p, err=%d\n", __func__, req, err);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 18, 0)
-	blk_mq_end_request(req, err);
-#else
-	blk_mq_end_io(req, err);
-#endif	
-
 }
 
-void IS_stackbd_end_io3(struct bio *bio, int err)
+
+static void IS_stackbd_end_io(struct bio *bio)
 {
-    struct rdma_ctx *ctx = (struct rdma_ctx *)ptr_from_uint64(bio->bi_private);
-    
+	struct request *req = ptr_from_uint64((uint64_t)bio->bi_private);
+
+	blk_mq_end_request(req, bio->bi_status);
+	bio_put(bio);
+}
+static void IS_stackbd_end_io2(struct bio *bio)
+{
+	struct request *req = ptr_from_uint64((uint64_t)bio->bi_private);
+
+	pr_info("%s is called, req=%p, status=%d\n", __func__, req,
+		bio->bi_status);
+	blk_mq_end_request(req, bio->bi_status);
+	bio_put(bio);
+}
+
+static void IS_stackbd_end_io3(struct bio *bio)
+{
+    struct rdma_ctx *ctx = ptr_from_uint64((uint64_t)bio->bi_private);
+
     IS_insert_ctx(ctx);
+    bio_put(bio);
 }
 
 
@@ -88,15 +95,8 @@ static void stackbd_io_fn(struct bio *bio)
 	if (bio == NULL)
         printk("bio is NULL\n");
 
-	bio->bi_bdev = stackbd.bdev_raw;
-	trace_block_bio_remap(bdev_get_queue(stackbd.bdev_raw), bio, bio->bi_bdev->bd_dev, 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
-	bio->bi_iter.bi_sector);
-#else
-	bio->bi_sector);
-#endif 
-	
-	generic_make_request(bio);
+	bio_set_dev(bio, stackbd.bdev_raw);
+	submit_bio_noacct(bio);
 }
 static int stackbd_threadfn(void *data)
 {
@@ -132,7 +132,7 @@ void stackbd_make_request5(struct bio *bio)
         printk("stackbd: Device not active yet, aborting\n");
         goto abort;
     }
-    bio->bi_end_io = (bio_end_io_t*)IS_stackbd_end_io3;
+    bio->bi_end_io = IS_stackbd_end_io3;
     bio_list_add(&stackbd.bio_list, bio);
 
     wake_up(&req_event);
@@ -162,12 +162,12 @@ void stackbd_make_request4(struct request_queue *q, struct request *req)
         goto abort;
     }
     for (i=0; i<len -1; i++){
-    	bio = bio_clone(b, GFP_ATOMIC);
-    	bio_list_add(&stackbd.bio_list, bio);
-    	b = b->bi_next;
+		bio = IS_bio_clone(b, GFP_ATOMIC);
+		bio_list_add(&stackbd.bio_list, bio);
+		b = b->bi_next;
 	}
-    bio = bio_clone(b, GFP_ATOMIC);
-	bio->bi_end_io = (bio_end_io_t*)IS_stackbd_end_io2;
+    bio = IS_bio_clone(b, GFP_ATOMIC);
+	bio->bi_end_io = IS_stackbd_end_io2;
 	bio->bi_private = (void*) uint64_from_ptr(req);
     bio_list_add(&stackbd.bio_list, bio);
 
@@ -199,9 +199,9 @@ void stackbd_make_request3(struct request_queue *q, struct request *req)
         goto abort;
     }
     for (i=0; i<len; i++){
-    	bio = bio_clone(b, GFP_ATOMIC);
-    	bio_list_add(&stackbd.bio_list, bio);
-    	b = b->bi_next;
+		bio = IS_bio_clone(b, GFP_ATOMIC);
+		bio_list_add(&stackbd.bio_list, bio);
+		b = b->bi_next;
 	}
     wake_up(&req_event);
     spin_unlock_irq(&stackbd.lock);
@@ -231,12 +231,12 @@ void stackbd_make_request2(struct request_queue *q, struct request *req)
         goto abort;
     }
     for (i=0; i<len -1; i++){
-    	bio = bio_clone(b, GFP_ATOMIC);
-    	bio_list_add(&stackbd.bio_list, bio);
-    	b = b->bi_next;
+		bio = IS_bio_clone(b, GFP_ATOMIC);
+		bio_list_add(&stackbd.bio_list, bio);
+		b = b->bi_next;
 	}
-    bio = bio_clone(b, GFP_ATOMIC);
-	bio->bi_end_io = (bio_end_io_t*)IS_stackbd_end_io;
+    bio = IS_bio_clone(b, GFP_ATOMIC);
+	bio->bi_end_io = IS_stackbd_end_io;
 	bio->bi_private = (void*) uint64_from_ptr(req);
     bio_list_add(&stackbd.bio_list, bio);
 
@@ -250,10 +250,10 @@ abort:
 }
 
 // from original stackbd
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
-blk_qc_t stackbd_make_request(struct request_queue *q, struct bio *bio)
+#ifdef INFINISWAP_HAVE_BDEV_HANDLE
+void stackbd_make_request(struct bio *bio)
 #else
-void stackbd_make_request(struct request_queue *q, struct bio *bio)
+blk_qc_t stackbd_make_request(struct bio *bio)
 #endif
 {
     spin_lock_irq(&stackbd.lock);
@@ -271,50 +271,52 @@ void stackbd_make_request(struct request_queue *q, struct bio *bio)
     wake_up(&req_event);
     spin_unlock_irq(&stackbd.lock);
 
-    #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
-    return 0;
-    #else
-    return;
-    #endif
+#ifndef INFINISWAP_HAVE_BDEV_HANDLE
+    return BLK_QC_T_NONE;
+#endif
 abort:
     spin_unlock_irq(&stackbd.lock);
     printk("<%p> Abort request\n\n", bio);
     bio_io_error(bio);
-    #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
-    return 0;
-    #endif
+#ifndef INFINISWAP_HAVE_BDEV_HANDLE
+    return BLK_QC_T_NONE;
+#endif
 }
 
-static struct block_device *stackbd_bdev_open(char dev_path[])
+static struct block_device *stackbd_bdev_open(const char *dev_path)
 {
-    /* Open underlying device */
-	/*
-   #if LINUX_VERSION_CODE == KERNEL_VERSION(4, 4, 0)
-        struct block_device *bdev_raw = lookup_bdev(dev_path, 0);
-   #else
-        struct block_device *bdev_raw = lookup_bdev(dev_path);
-   #endif 
-	*/
-    struct block_device *bdev_raw = LOOKUP_BDEV(dev_path);
+#ifdef INFINISWAP_HAVE_BDEV_HANDLE
+    stackbd.bdev_handle = bdev_open_by_path(dev_path, STACKBD_BDEV_MODE,
+                                            &stackbd, NULL);
+    if (IS_ERR(stackbd.bdev_handle)) {
+        printk("stackbd: error opening %s: %ld\n", dev_path,
+               PTR_ERR(stackbd.bdev_handle));
+        stackbd.bdev_handle = NULL;
+        return NULL;
+    }
+    return stackbd.bdev_handle->bdev;
+#else
+    struct block_device *bdev_raw;
 
-    printk("Opened %s\n", dev_path);
-    if (IS_ERR(bdev_raw))
-    {
-        printk("stackbd: error opening raw device <%lu>\n", PTR_ERR(bdev_raw));
-        return NULL;
-    }
-    if (!bdget(bdev_raw->bd_dev))
-    {
-        printk("stackbd: error bdget()\n");
-        return NULL;
-    }
-    if (blkdev_get(bdev_raw, STACKBD_BDEV_MODE, &stackbd))
-    {
-        printk("stackbd: error blkdev_get()\n");
-        bdput(bdev_raw);
+    bdev_raw = blkdev_get_by_path(dev_path, STACKBD_BDEV_MODE, &stackbd);
+    if (IS_ERR(bdev_raw)) {
+        printk("stackbd: error opening %s: %ld\n", dev_path,
+               PTR_ERR(bdev_raw));
         return NULL;
     }
     return bdev_raw;
+#endif
+}
+
+static void stackbd_bdev_close(void)
+{
+#ifdef INFINISWAP_HAVE_BDEV_HANDLE
+    bdev_release(stackbd.bdev_handle);
+    stackbd.bdev_handle = NULL;
+#else
+    blkdev_put(stackbd.bdev_raw, STACKBD_BDEV_MODE);
+#endif
+    stackbd.bdev_raw = NULL;
 }
 
 static int stackbd_start(char dev_path[])
@@ -347,71 +349,22 @@ static int stackbd_start(char dev_path[])
     wake_up_process(stackbd.thread);
     return 0;
 error_after_bdev:
-    blkdev_put(stackbd.bdev_raw, STACKBD_BDEV_MODE);
-    bdput(stackbd.bdev_raw);
+    stackbd_bdev_close();
     return -EFAULT;
 }
 
-int stackbd_getgeo(struct block_device * block_device, struct hd_geometry * geo)
+static int stackbd_getgeo(struct block_device * block_device, struct hd_geometry * geo)
 {
         long size;
         /* We have no real geometry, of course, so make something up. */
-        size = stackbd.capacity * (LOGICAL_BLOCK_SIZE / KERNEL_SECTOR_SIZE);
+        size = stackbd.capacity *
+               (logical_block_size / KERNEL_SECTOR_SIZE);
         geo->cylinders = (size & ~0x3f) >> 6;
         geo->heads = 4;
         geo->sectors = 16;
         geo->start = 0;
         return 0;
 }
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 16, 0)
-static struct blk_mq_hw_ctx *IS_alloc_hctx(struct blk_mq_reg *reg,
-					     unsigned int hctx_index)
-{
-	int b_size = DIV_ROUND_UP(reg->nr_hw_queues, nr_online_nodes); 
-	int tip = (reg->nr_hw_queues % nr_online_nodes);
-	int node = 0, i, n;
-	struct blk_mq_hw_ctx * hctx;
-
-	pr_info("hctx_index=%u, b_size=%d, tip=%d, nr_online_nodes=%d\n",
-		 hctx_index, b_size, tip, nr_online_nodes);
-	/*
-	 * Split submit queues evenly wrt to the number of nodes. If uneven,
-	 * fill the first buckets with one extra, until the rest is filled with
-	 * no extra.
-	 */
-	for (i = 0, n = 1; i < hctx_index; i++, n++) {
-		if (n % b_size == 0) {
-			n = 0;
-			node++;
-
-			tip--;
-			if (!tip)
-				b_size = reg->nr_hw_queues / nr_online_nodes;
-		}
-	}
-
-	/*
-	 * A node might not be online, therefore map the relative node id to the
-	 * real node id.
-	 */
-	for_each_online_node(n) {
-		if (!node)
-			break;
-		node--;
-	}
-	pr_debug("%s: n=%d\n", __func__, n);
-	hctx = kzalloc_node(sizeof(struct blk_mq_hw_ctx), GFP_KERNEL, n);
-
-	return hctx;
-}
-
-static void IS_free_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_index)
-{
-	pr_info("%s called\n", __func__);
-	kfree(hctx);
-}
-#endif
 
 void IS_mq_request_stackbd(struct request *req)
 {
@@ -424,7 +377,7 @@ void IS_mq_request_stackbd2(struct request *req)
 
 static int IS_request(struct request *req, struct IS_queue *xq)
 {
-	struct IS_file *xdev = req->rq_disk->private_data;
+	struct IS_file *xdev = xq->xdev;
 	int write = rq_data_dir(req) == WRITE;
 	unsigned long start = blk_rq_pos(req) << IS_SECT_SHIFT;
 	unsigned long len  = blk_rq_bytes(req);
@@ -537,33 +490,20 @@ static int IS_request(struct request *req, struct IS_queue *xq)
 	return err;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
-static int IS_queue_rq(struct blk_mq_hw_ctx *hctx, const struct blk_mq_queue_data *bd)
-#elif LINUX_VERSION_CODE == KERNEL_VERSION(3, 18, 0)
-static int IS_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *rq, bool last)
-#else
-static int IS_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *rq)
-#endif
+static blk_status_t IS_queue_rq(struct blk_mq_hw_ctx *hctx,
+				const struct blk_mq_queue_data *bd)
 {
 	struct IS_queue *IS_q;
-	int err;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
 	struct request *rq = bd->rq;
-#endif
+	int err;
 
-	IS_q = hctx->driver_data; //get the queue from the hctx
-	err = IS_request(rq, IS_q);
-
-	if (unlikely(err)) {
-		rq->errors = -EIO;
-		return BLK_MQ_RQ_QUEUE_ERROR;
-	}
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 18, 0)
+	IS_q = hctx->driver_data;
 	blk_mq_start_request(rq);
-#endif
+	err = IS_request(rq, IS_q);
+	if (unlikely(err))
+		blk_mq_end_request(rq, BLK_STS_IOERR);
 
-	return BLK_MQ_RQ_QUEUE_OK;
+	return BLK_STS_OK;
 }
 
 // connect hctx with IS-file, IS-conn, and queue
@@ -586,28 +526,8 @@ static int IS_init_hctx(struct blk_mq_hw_ctx *hctx, void *data,
 
 static struct blk_mq_ops IS_mq_ops = {
 	.queue_rq       = IS_queue_rq,
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 0)
-	.map_queues      = blk_mq_map_queues,  
-#else
-	.map_queue      = blk_mq_map_queue,  
-#endif
-	.init_hctx	= IS_init_hctx,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 16, 0)
-	.alloc_hctx	= IS_alloc_hctx,
-	.free_hctx	= IS_free_hctx,
-#endif
+	.init_hctx      = IS_init_hctx,
 };
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 16, 0)
-static struct blk_mq_reg IS_mq_reg = {
-	.ops		= &IS_mq_ops,
-	.cmd_size	= sizeof(struct raio_io_u),
-	.flags		= BLK_MQ_F_SHOULD_MERGE,
-	.numa_node	= NUMA_NO_NODE,
-	.queue_depth	= IS_QUEUE_DEPTH,
-};
-#endif
 
 int IS_setup_queues(struct IS_file *xdev)
 {
@@ -620,6 +540,21 @@ int IS_setup_queues(struct IS_file *xdev)
 	return 0;
 }
 
+#ifdef INFINISWAP_HAVE_BDEV_HANDLE
+static int IS_open(struct gendisk *gd, blk_mode_t mode)
+{
+	pr_debug("%s called\n", __func__);
+	return 0;
+}
+
+static void IS_release(struct gendisk *gd)
+{
+	pr_debug("%s called\n", __func__);
+}
+
+static int IS_ioctl(struct block_device *bd, blk_mode_t mode,
+		    unsigned cmd, unsigned long arg)
+#else
 static int IS_open(struct block_device *bd, fmode_t mode)
 {
 	pr_debug("%s called\n", __func__);
@@ -631,20 +566,9 @@ static void IS_release(struct gendisk *gd, fmode_t mode)
 	pr_debug("%s called\n", __func__);
 }
 
-static int IS_media_changed(struct gendisk *gd)
-{
-	pr_debug("%s called\n", __func__);
-	return 0;
-}
-
-static int IS_revalidate(struct gendisk *gd)
-{
-	pr_debug("%s called\n", __func__);
-	return 0;
-}
-
 static int IS_ioctl(struct block_device *bd, fmode_t mode,
-		      unsigned cmd, unsigned long arg)
+		    unsigned cmd, unsigned long arg)
+#endif
 {
 	pr_debug("%s called\n", __func__);
 	return -ENOTTY;
@@ -653,16 +577,15 @@ static int IS_ioctl(struct block_device *bd, fmode_t mode,
 // bind to IS_file in IS_register_block_device
 static struct block_device_operations IS_ops = {
 	.owner           = THIS_MODULE,
-	.open 	         = IS_open,
-	.release 	 = IS_release,
-	.media_changed   = IS_media_changed,
-	.revalidate_disk = IS_revalidate,
-	.ioctl	         = IS_ioctl
+	.open            = IS_open,
+	.release         = IS_release,
+	.ioctl           = IS_ioctl,
 };
 
 static struct block_device_operations stackbd_ops = {
-    .owner           = THIS_MODULE,
-    .getgeo      = stackbd_getgeo,
+	.owner           = THIS_MODULE,
+	.submit_bio      = stackbd_make_request,
+	.getgeo          = stackbd_getgeo,
 };
 
 void IS_destroy_queues(struct IS_file *xdev)
@@ -673,145 +596,128 @@ void IS_destroy_queues(struct IS_file *xdev)
 
 int IS_register_block_device(struct IS_file *IS_file)
 {
-	sector_t size = IS_file->stbuf.st_size;
-	int page_size = PAGE_SIZE;
-	int err = 0;
+	sector_t sectors = IS_file->stbuf.st_size / IS_SECT_SIZE;
+	unsigned int max_sectors = (PAGE_SIZE / IS_SECT_SIZE) * MAX_SGL_LEN;
+	int err;
 
 	pr_info("%s\n", __func__);
 	IS_file->major = IS_major;
-
-	// set device params 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 16, 0)
-	IS_mq_reg.nr_hw_queues = submit_queues;
-	IS_file->queue = blk_mq_init_queue(&IS_mq_reg, IS_file);  // IS_mq_req was defined above
-#else
 	IS_file->tag_set.ops = &IS_mq_ops;
 	IS_file->tag_set.nr_hw_queues = submit_queues;
 	IS_file->tag_set.queue_depth = IS_QUEUE_DEPTH;
 	IS_file->tag_set.numa_node = NUMA_NO_NODE;
-	IS_file->tag_set.cmd_size	= sizeof(struct raio_io_u); // this may need chagne
+	IS_file->tag_set.cmd_size = sizeof(struct raio_io_u);
 	IS_file->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
 	IS_file->tag_set.driver_data = IS_file;
 
 	err = blk_mq_alloc_tag_set(&IS_file->tag_set);
 	if (err)
-		goto out;
+		return err;
 
-	IS_file->queue = blk_mq_init_queue(&IS_file->tag_set);
-#endif
-	if (IS_ERR(IS_file->queue)) {
-		pr_err("%s: Failed to allocate blk queue ret=%ld\n",
-		       __func__, PTR_ERR(IS_file->queue));
-		err = PTR_ERR(IS_file->queue);
-		goto blk_mq_init;
+	IS_file->disk = blk_mq_alloc_disk(&IS_file->tag_set, IS_file);
+	if (IS_ERR(IS_file->disk)) {
+		err = PTR_ERR(IS_file->disk);
+		IS_file->disk = NULL;
+		goto free_tag_set;
 	}
+	IS_file->queue = IS_file->disk->queue;
+	blk_queue_flag_set(QUEUE_FLAG_NONROT, IS_file->queue);
+	blk_queue_flag_clear(QUEUE_FLAG_ADD_RANDOM, IS_file->queue);
 
-	IS_file->queue->queuedata = IS_file;
-	queue_flag_set_unlocked(QUEUE_FLAG_NONROT, IS_file->queue);
-	queue_flag_clear_unlocked(QUEUE_FLAG_ADD_RANDOM, IS_file->queue);
-
-	IS_file->disk = alloc_disk_node(1, NUMA_NO_NODE);
-	if (!IS_file->disk) {
-		pr_err("%s: Failed to allocate disk node\n", __func__);
-		err = -ENOMEM;
-		goto alloc_disk;
-	}
-
-	// device setting info, kernel may make swap based on this info
 	IS_file->disk->major = IS_file->major;
 	IS_file->disk->first_minor = IS_file->index;
-	IS_file->disk->fops = &IS_ops;	// pay attention to IS_ops
-	IS_file->disk->queue = IS_file->queue;
+	IS_file->disk->minors = 1;
+	IS_file->disk->fops = &IS_ops;
 	IS_file->disk->private_data = IS_file;
-	blk_queue_logical_block_size(IS_file->queue, IS_SECT_SIZE); //block size = 512
+	blk_queue_logical_block_size(IS_file->queue, IS_SECT_SIZE);
 	blk_queue_physical_block_size(IS_file->queue, IS_SECT_SIZE);
-	sector_div(page_size, IS_SECT_SIZE);
-	blk_queue_max_hw_sectors(IS_file->queue, page_size * MAX_SGL_LEN);
-	sector_div(size, IS_SECT_SIZE);
-	set_capacity(IS_file->disk, size);  // size is in remote file state->size, add size info into block device
-	sscanf(IS_file->dev_name, "%s", IS_file->disk->disk_name);
-	pr_err("%s, dev_name %s\n", __func__, IS_file->dev_name);
+	blk_queue_max_hw_sectors(IS_file->queue, max_sectors);
+	set_capacity(IS_file->disk, sectors);
+	strscpy(IS_file->disk->disk_name, IS_file->dev_name, DISK_NAME_LEN);
 
-	printk("IS: init done\n");
-	/* Set up our internal device */
-    spin_lock_init(&stackbd.lock);
-    /* blk_alloc_queue() instead of blk_init_queue() so it won't set up the
-     * queue for requests.
-     */
-    if (!(stackbd.queue = blk_alloc_queue(GFP_KERNEL)))
-    {
-        printk("stackbd: alloc_queue failed\n");
-        return -EFAULT;
-    }
-    blk_queue_make_request(stackbd.queue, stackbd_make_request);
-    blk_queue_logical_block_size(stackbd.queue, LOGICAL_BLOCK_SIZE);
-    /* Get registered */
-    if ((major_num = register_blkdev(major_num, STACKBD_NAME)) < 0)
-    {
-        printk("stackbd: unable to get major number\n");
-        err=-EFAULT;
-        goto error_after_alloc_queue;
-    }
-    /* Gendisk structure */
-    if (!(stackbd.gd = alloc_disk(16))){  
-    	goto error_after_redister_blkdev; 
-    	err=-EFAULT;
-    }
-    stackbd.gd->major = major_num;
-    stackbd.gd->first_minor = 0;
-    stackbd.gd->fops = &stackbd_ops;
-    stackbd.gd->private_data = &stackbd;
-    strcpy(stackbd.gd->disk_name, STACKBD_NAME_0);
-    stackbd.gd->queue = stackbd.queue;
-    add_disk(stackbd.gd);
-    printk("stackbd: init done\n");
-    if (stackbd_start(BACKUP_DISK) < 0){
-        printk("Kernel call returned: %m");
-        err= -1;
-    }
-
-    add_disk(IS_file->disk);
-
-    goto out;
-
-alloc_disk:
-	blk_cleanup_queue(IS_file->queue);
-blk_mq_init:
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 16, 0)
-	blk_mq_free_tag_set(&IS_file->tag_set);
+	spin_lock_init(&stackbd.lock);
+	bio_list_init(&stackbd.bio_list);
+	stackbd.is_active = 0;
+	stackbd.bdev_raw = NULL;
+#ifdef INFINISWAP_HAVE_BDEV_HANDLE
+	stackbd.bdev_handle = NULL;
 #endif
-	return err;
+	stackbd.gd = blk_alloc_disk(NUMA_NO_NODE);
+	if (IS_ERR(stackbd.gd)) {
+		err = PTR_ERR(stackbd.gd);
+		stackbd.gd = NULL;
+		goto put_is_disk;
+	}
+	stackbd.queue = stackbd.gd->queue;
+	stackbd.gd->fops = &stackbd_ops;
+	stackbd.gd->private_data = &stackbd;
+	strscpy(stackbd.gd->disk_name, STACKBD_NAME_0, DISK_NAME_LEN);
+	blk_queue_logical_block_size(stackbd.queue, logical_block_size);
 
-error_after_redister_blkdev:
-    unregister_blkdev(major_num, STACKBD_NAME); 
-error_after_alloc_queue:
-    blk_cleanup_queue(stackbd.queue);   
-    printk("stackbd queue cleaned up\n");
+	major_num = register_blkdev(major_num, STACKBD_NAME);
+	if (major_num < 0) {
+		err = major_num;
+		goto put_stackbd_disk;
+	}
+	stackbd.gd->major = major_num;
+	stackbd.gd->first_minor = 0;
+	stackbd.gd->minors = 1;
 
-out:
+	err = add_disk(stackbd.gd);
+	if (err)
+		goto unregister_stackbd;
+	err = stackbd_start(BACKUP_DISK);
+	if (err)
+		goto delete_stackbd;
+
+	err = add_disk(IS_file->disk);
+	if (err)
+		goto stop_stackbd;
+
+	return 0;
+
+stop_stackbd:
+	stackbd.is_active = 0;
+	kthread_stop(stackbd.thread);
+	stackbd_bdev_close();
+delete_stackbd:
+	del_gendisk(stackbd.gd);
+unregister_stackbd:
+	unregister_blkdev(major_num, STACKBD_NAME);
+	major_num = 0;
+put_stackbd_disk:
+	put_disk(stackbd.gd);
+	stackbd.gd = NULL;
+put_is_disk:
+	put_disk(IS_file->disk);
+	IS_file->disk = NULL;
+free_tag_set:
+	blk_mq_free_tag_set(&IS_file->tag_set);
 	return err;
 }
 
 void IS_unregister_block_device(struct IS_file *IS_file)
 {
 	del_gendisk(IS_file->disk);
-	blk_cleanup_queue(IS_file->queue);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 16, 0)
-	blk_mq_free_tag_set(&IS_file->tag_set);
-#endif
-	put_disk(IS_file->disk);
 
-	printk("stackbd: exit\n");
-    if (stackbd.is_active)
-    {
-        kthread_stop(stackbd.thread);
-        blkdev_put(stackbd.bdev_raw, STACKBD_BDEV_MODE);
-        bdput(stackbd. bdev_raw);
-    }
-    del_gendisk(stackbd.gd);
-    put_disk(stackbd.gd);
-    unregister_blkdev(major_num, STACKBD_NAME);
-    blk_cleanup_queue(stackbd.queue);
+	if (stackbd.is_active) {
+		stackbd.is_active = 0;
+		kthread_stop(stackbd.thread);
+		stackbd_bdev_close();
+	}
+	if (stackbd.gd) {
+		del_gendisk(stackbd.gd);
+		put_disk(stackbd.gd);
+		stackbd.gd = NULL;
+	}
+	if (major_num > 0) {
+		unregister_blkdev(major_num, STACKBD_NAME);
+		major_num = 0;
+	}
+
+	put_disk(IS_file->disk);
+	IS_file->disk = NULL;
+	blk_mq_free_tag_set(&IS_file->tag_set);
 }
 
 void IS_single_chunk_init(struct kernel_cb *cb)

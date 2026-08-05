@@ -26,9 +26,6 @@ is_blocked() {
     infiniswap_daemon/config.h|infiniswap_daemon/Makefile|infiniswap_daemon/Makefile.in|infiniswap_daemon/infiniswap-daemon)
       return 0
       ;;
-    infiniswap_bd/Makefile)
-      return 0
-      ;;
   esac
   return 1
 }

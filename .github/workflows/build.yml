@@ -1,0 +1,74 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu-build:
+    name: Ubuntu ${{ matrix.ubuntu }} / Linux ${{ matrix.kernel }}
+    runs-on: ubuntu-${{ matrix.ubuntu }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ubuntu: "22.04"
+            kernel: "5.15"
+          - ubuntu: "24.04"
+            kernel: "6.8"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            libibverbs-dev \
+            librdmacm-dev \
+            libssl-dev \
+            linux-headers-generic
+
+      - name: Configure Memory Provider
+        run: >-
+          cmake -S infiniswap_daemon
+          -B "${{ runner.temp }}/infiniswap-daemon"
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build Memory Provider with warnings as errors
+        run: cmake --build "${{ runner.temp }}/infiniswap-daemon"
+
+      - name: Test Memory Provider
+        run: >-
+          ctest --test-dir "${{ runner.temp }}/infiniswap-daemon"
+          --output-on-failure
+
+      - name: Test RDMA tuple discovery
+        run: infiniswap_bd/tests/rdma-build-flags-test.sh
+
+      - name: Select GA kernel headers
+        id: headers
+        shell: bash
+        run: |
+          kdir=$(find /usr/src -maxdepth 1 -type d \
+            -name "linux-headers-${{ matrix.kernel }}.*-generic" \
+            -print | sort -V | tail -n 1)
+          test -n "$kdir"
+          echo "kdir=$kdir" >> "$GITHUB_OUTPUT"
+
+      - name: Build Memory Consumer module
+        run: >-
+          make -C infiniswap_bd
+          KDIR="${{ steps.headers.outputs.kdir }}"
+          modules
+
+      - name: Check whitespace
+        run: git diff --check

@@ -13,31 +13,14 @@
 *.swo
 *.bak
 
-# Autotools / configure output
-autom4te.cache/
-aclocal.m4
-configure
-config.status
-config.log
-config.h.in
-stamp-h1
-.deps/
-.libs/
-
-# Generated headers / makefiles
-# infiniswap_bd/config.h is a tracked empty stub; daemon's is always generated.
-infiniswap_daemon/config.h
-infiniswap_bd/Makefile
-infiniswap_daemon/Makefile
-infiniswap_daemon/Makefile.in
-
-# Automake helper copies under the daemon tree (bd keeps a tracked install-sh)
-infiniswap_daemon/install-sh
-infiniswap_daemon/missing
-infiniswap_daemon/compile
-infiniswap_daemon/depcomp
-infiniswap_daemon/INSTALL
-infiniswap_daemon/ar-lib
+# CMake output
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
 
 # C / userspace build
 *.o

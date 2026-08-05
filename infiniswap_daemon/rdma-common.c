@@ -42,13 +42,14 @@ int atomic_read(struct atomic_t *m)
   return res;
 }
 
-uint64_t htonll(uint64_t value)
+uint64_t infiniswap_htonll(uint64_t value)
 {
-     int num = 42;
-     if(*(char *)&num == 42)
-          return ((uint64_t)htonl(value & 0xFFFFFFFF) << 32LL) | htonl(value >> 32);
-     else 
-          return value;
+  int num = 42;
+  if (*(char *)&num == 42)
+    return ((uint64_t)htonl(value & UINT32_MAX) << 32) |
+           htonl((uint32_t)(value >> 32));
+
+  return value;
 }
 
 void die(const char *reason)
@@ -63,13 +64,18 @@ long get_free_mem(void)
   FILE *fd = fopen("/proc/meminfo", "r");
   int i;
   long res = 0;
-  fgets(result, 60, fd);
-  memset(result, 0x00, 60);
-  fgets(result, 60, fd);
-  for (i=0;i<60;i++){
-    if (result[i] >= 48 && result[i] <= 57){
+
+  if (!fd)
+    return 0;
+  if (!fgets(result, sizeof(result), fd) ||
+      !fgets(result, sizeof(result), fd)) {
+    fclose(fd);
+    return 0;
+  }
+  for (i = 0; result[i] != '\0'; i++) {
+    if (result[i] >= '0' && result[i] <= '9') {
       res *= 10;
-      res += (int)(result[i] - 48);
+      res += result[i] - '0';
     }
   }
   fclose(fd);
@@ -231,7 +237,9 @@ void rdma_session_init(struct rdma_session *sess){
   }
 
   for (i=0; i < free_mem_g; i++){
-    posix_memalign((void **)&(sess->rdma_remote.region_list[i]), page_size, ONE_GB);
+    if (posix_memalign((void **)&(sess->rdma_remote.region_list[i]),
+                       page_size, ONE_GB) != 0)
+      die("could not allocate a Remote Memory chunk");
     memset(sess->rdma_remote.region_list[i], 0x00, ONE_GB);
     sess->rdma_remote.malloc_map[i] = CHUNK_MALLOCED;
   }
@@ -399,7 +407,7 @@ void evict_mem(int stop_g)
 
   for (i=0; i<MAX_CLIENT; i++){
     if (send_list[i] == 2){
-      send_stop(session.conns[i], session.conns[conn_index]->send_msg->size_gb);
+      send_stop(session.conns[i], session.conns[i]->send_msg->size_gb);
     }else if (send_list[i] == 1){
       send_stop(session.conns[i], 0);
     }
@@ -408,7 +416,7 @@ void evict_mem(int stop_g)
 
 }
 
-void* free_mem(void *data)
+void *free_mem(void *data)
 {
   int free_mem_g = 0;
   int last_free_mem_g;
@@ -420,6 +428,7 @@ void* free_mem(void *data)
   int expand_size_g;
   int i, j;
 
+  (void)data;
   rdma_session_init(&session);
   last_free_mem_g = (int)(get_free_mem() / ONE_MB);
   printf("%s, is called, last %d GB, weight: %f, %f\n", __func__, last_free_mem_g, (float)(CURR_FREE_MEM_WEIGHT), last_free_mem_weight); 
@@ -457,7 +466,10 @@ void* free_mem(void *data)
         j = 0;
         for (i = 0; i < MAX_FREE_MEM_GB; i++){
           if (session.rdma_remote.malloc_map[i] == CHUNK_EMPTY){
-            posix_memalign((void **)&(session.rdma_remote.region_list[i]), page_size, ONE_GB);
+            if (posix_memalign(
+                  (void **)&(session.rdma_remote.region_list[i]),
+                  page_size, ONE_GB) != 0)
+              die("could not allocate a Remote Memory chunk");
             memset(session.rdma_remote.region_list[i], 0x00, ONE_GB);
             session.rdma_remote.malloc_map[i] = CHUNK_MALLOCED;
             j += 1;
@@ -659,7 +671,7 @@ void send_single_mr(void *context, int client_chunk_index)
       conn->sess_chunk_map[i] = i;
       session.rdma_remote.conn_map[i] = conn->conn_index;
       TEST_Z(session.rdma_remote.mr_list[i] = ibv_reg_mr(s_ctx->pd, session.rdma_remote.region_list[i], ONE_GB, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ)); //Write permission can't cover read permission, different traditional understanding
-      conn->send_msg->buf[i] = htonll((uint64_t)session.rdma_remote.mr_list[i]->addr);
+      conn->send_msg->buf[i] = infiniswap_htonll((uint64_t)session.rdma_remote.mr_list[i]->addr);
       conn->send_msg->rkey[i] = htonl((uint64_t)session.rdma_remote.mr_list[i]->rkey);
       printf("RDMA addr %llx  rkey %x\n", (unsigned long long)conn->send_msg->buf[i], conn->send_msg->rkey[i]);
       break;
@@ -686,7 +698,7 @@ void send_mr(void *context, int size)
       conn->sess_chunk_map[i] = i;
       session.rdma_remote.conn_map[i] = conn->conn_index;
       TEST_Z(session.rdma_remote.mr_list[i] = ibv_reg_mr(s_ctx->pd, session.rdma_remote.region_list[i], ONE_GB, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ)); //Write permission can't cover read permission, different traditional understanding
-      conn->send_msg->buf[i] = htonll((uint64_t)session.rdma_remote.mr_list[i]->addr);
+      conn->send_msg->buf[i] = infiniswap_htonll((uint64_t)session.rdma_remote.mr_list[i]->addr);
       conn->send_msg->rkey[i] = htonl((uint64_t)session.rdma_remote.mr_list[i]->rkey);
       printf("RDMA addr %llx  rkey %x\n", (unsigned long long)conn->send_msg->buf[i], conn->send_msg->rkey[i]);
       j += 1;

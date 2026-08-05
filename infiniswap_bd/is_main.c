@@ -124,19 +124,15 @@ void IS_insert_ctx(struct rdma_ctx *ctx)
 	spin_unlock_irqrestore(&free_ctxs->ctx_lock, flags);
 }
 
-int IS_rdma_read(struct IS_connection *IS_conn, struct kernel_cb *cb, int cb_index, int chunk_index, struct remote_chunk_g *chunk, unsigned long offset, unsigned long len, struct request *req, struct IS_queue *q)
+static int IS_rdma_read(struct IS_connection *IS_conn, struct kernel_cb *cb, int cb_index, int chunk_index, struct remote_chunk_g *chunk, unsigned long offset, unsigned long len, struct request *req, struct IS_queue *q)
 {
 	int ret;
-	struct ib_send_wr *bad_wr;
+	const struct ib_send_wr *bad_wr;
 	struct rdma_ctx *ctx = NULL;
 	int ctx_loop = 0;
 	
 	// get ctx_buf based on request address
-	#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
-	int conn_id = (uint64_t)( bio_data(req->bio)   ) & QUEUE_NUM_MASK;
-	#else
-	int conn_id = (uint64_t)(req->buffer) & QUEUE_NUM_MASK;
-	#endif
+	int conn_id = (uint64_t)bio_data(req->bio) & QUEUE_NUM_MASK;
 
 	IS_conn = IS_conn->IS_sess->IS_conns[conn_id];
 	ctx = IS_get_ctx(IS_conn->ctx_pools[cb_index]);
@@ -161,18 +157,11 @@ int IS_rdma_read(struct IS_connection *IS_conn, struct kernel_cb *cb, int cb_ind
 		return 0;
 	}
 
-	#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
 	ctx->rdma_sq_wr.wr.sg_list->length = len;
 	ctx->rdma_sq_wr.rkey = chunk->remote_rkey;
 	ctx->rdma_sq_wr.remote_addr = chunk->remote_addr + offset;
 	ctx->rdma_sq_wr.wr.opcode = IB_WR_RDMA_READ;
-	#else
-	ctx->rdma_sq_wr.sg_list->length = len;
-	ctx->rdma_sq_wr.wr.rdma.rkey = chunk->remote_rkey;
-	ctx->rdma_sq_wr.wr.rdma.remote_addr = chunk->remote_addr + offset;
-	ctx->rdma_sq_wr.opcode = IB_WR_RDMA_READ;
-	#endif	
-	ret = ib_post_send(cb->qp, (struct ib_send_wr *) &ctx->rdma_sq_wr, &bad_wr);
+	ret = ib_post_send(cb->qp, &ctx->rdma_sq_wr.wr, &bad_wr);
 
 	if (ret) {
 		printk(KERN_ALERT PFX "client post read %d, wr=%p\n", ret, &ctx->rdma_sq_wr);
@@ -181,57 +170,48 @@ int IS_rdma_read(struct IS_connection *IS_conn, struct kernel_cb *cb, int cb_ind
 	return 0;
 }
 
-void stackbd_bio_generate(struct rdma_ctx *ctx, struct request *req)
+static void stackbd_bio_generate(struct rdma_ctx *ctx, struct request *req)
 {
 	struct bio *cloned_bio = NULL;
 	struct page *pg = NULL;
 	unsigned int nr_segs = req->nr_phys_segments;
 	unsigned int io_size = nr_segs * IS_PAGE_SIZE;
 
-	cloned_bio = bio_clone(req->bio, GFP_ATOMIC); 
+	cloned_bio = IS_bio_clone(req->bio, GFP_ATOMIC);
 	pg = virt_to_page(ctx->rdma_buf);
 	cloned_bio->bi_io_vec->bv_page  = pg; 
 	cloned_bio->bi_io_vec->bv_len = io_size;
 	cloned_bio->bi_io_vec->bv_offset = 0;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
 	cloned_bio->bi_iter.bi_size = io_size;
-#else
-	cloned_bio->bi_size = io_size;
-#endif
-	cloned_bio->bi_private = uint64_from_ptr(ctx);
+	cloned_bio->bi_private = ctx;
 	stackbd_make_request5(cloned_bio);
 }
 
-void mem_gather(char *rdma_buf, struct request *req)
+static void mem_gather(char *rdma_buf, struct request *req)
 {
-	char *buffer = NULL;
-	unsigned int i = 0;
-	unsigned int j = 0;
-	struct bio *tmp = req->bio;
-	unsigned int nr_seg = req->nr_phys_segments;
+	struct req_iterator iter;
+	struct bio_vec bvec;
+	size_t copied = 0;
 
-	for (i=0; i < nr_seg;){
-		buffer = bio_data(tmp);
-		j = tmp->bi_phys_segments;
-		memcpy(rdma_buf + (i * IS_PAGE_SIZE), buffer, IS_PAGE_SIZE * j);
-		i += j;
-		tmp = tmp->bi_next;
+	rq_for_each_segment(bvec, req, iter) {
+		void *source = kmap_local_page(bvec.bv_page);
+
+		memcpy(rdma_buf + copied, (char *)source + bvec.bv_offset,
+		       bvec.bv_len);
+		kunmap_local(source);
+		copied += bvec.bv_len;
 	}
 }
 
-int IS_rdma_write(struct IS_connection *IS_conn, struct kernel_cb *cb, int cb_index, int chunk_index, struct remote_chunk_g *chunk, unsigned long offset, unsigned long len, struct request *req, struct IS_queue *q)
+static int IS_rdma_write(struct IS_connection *IS_conn, struct kernel_cb *cb, int cb_index, int chunk_index, struct remote_chunk_g *chunk, unsigned long offset, unsigned long len, struct request *req, struct IS_queue *q)
 {
 	int ret;
-	struct ib_send_wr *bad_wr;	
+	const struct ib_send_wr *bad_wr;
 	struct rdma_ctx *ctx;
 	int ctx_loop = 0;
 
 	// get ctx_buf based on request address
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
-	int conn_id = (uint64_t)(bio_data(req->bio)) & QUEUE_NUM_MASK;
-#else
-	int conn_id = (uint64_t)(req->buffer) & QUEUE_NUM_MASK;
-#endif
+	int conn_id = (uint64_t)bio_data(req->bio) & QUEUE_NUM_MASK;
 	IS_conn = IS_conn->IS_sess->IS_conns[conn_id];
 	ctx = IS_get_ctx(IS_conn->ctx_pools[cb_index]);
 	while (!ctx){
@@ -263,18 +243,11 @@ int IS_rdma_write(struct IS_connection *IS_conn, struct kernel_cb *cb, int cb_in
 
 	mem_gather(ctx->rdma_buf, req);
 	stackbd_bio_generate(ctx, req);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
 	ctx->rdma_sq_wr.wr.sg_list->length = len;
 	ctx->rdma_sq_wr.rkey = chunk->remote_rkey;
 	ctx->rdma_sq_wr.remote_addr = chunk->remote_addr + offset;
 	ctx->rdma_sq_wr.wr.opcode = IB_WR_RDMA_WRITE;
-#else
-	ctx->rdma_sq_wr.sg_list->length = len;
-	ctx->rdma_sq_wr.wr.rdma.rkey = chunk->remote_rkey;
-	ctx->rdma_sq_wr.wr.rdma.remote_addr = chunk->remote_addr + offset;
-	ctx->rdma_sq_wr.opcode = IB_WR_RDMA_WRITE;
-#endif
-	ret = ib_post_send(cb->qp, (struct ib_send_wr *) &ctx->rdma_sq_wr, &bad_wr);
+	ret = ib_post_send(cb->qp, &ctx->rdma_sq_wr.wr, &bad_wr);
 	if (ret) {
 		printk(KERN_ALERT PFX "client post write %d, wr=%p\n", ret, &ctx->rdma_sq_wr);
 		return ret;
@@ -282,21 +255,10 @@ int IS_rdma_write(struct IS_connection *IS_conn, struct kernel_cb *cb, int cb_in
 	return 0;
 }
 
-uint32_t bitmap_value(int *bitmap)
-{
-	int i;
-	uint32_t val = 1;
-	for (i =0; i < BITMAP_INT_SIZE; i+=32) {
-		if (bitmap[i] != 0){
-			val += 1;	
-		}
-	}	
-	return val;
-}
 static int IS_send_activity(struct kernel_cb *cb)
 {
 	int ret = 0;
-	struct ib_send_wr *bad_wr;	
+	const struct ib_send_wr *bad_wr;
 	int i;
 	int count=0;
 	int chunk_sess_index = -1;
@@ -323,7 +285,7 @@ static int IS_send_activity(struct kernel_cb *cb)
 static int IS_send_query(struct kernel_cb *cb)
 {
 	int ret = 0;
-	struct ib_send_wr * bad_wr;
+	const struct ib_send_wr *bad_wr;
 
 	cb->send_buf.type = QUERY;
 	ret = ib_post_send(cb->qp, &cb->sq_wr, &bad_wr);
@@ -336,7 +298,7 @@ static int IS_send_query(struct kernel_cb *cb)
 static int IS_send_bind_single(struct kernel_cb *cb, int select_chunk)
 {
 	int ret = 0;
-	struct ib_send_wr * bad_wr;
+	const struct ib_send_wr *bad_wr;
 	cb->send_buf.type = BIND_SINGLE;
 	cb->send_buf.size_gb = select_chunk; 
 
@@ -351,7 +313,7 @@ static int IS_send_bind_single(struct kernel_cb *cb, int select_chunk)
 static int IS_send_done(struct kernel_cb *cb, int num)
 {
 	int ret = 0;
-	struct ib_send_wr * bad_wr;
+	const struct ib_send_wr *bad_wr;
 	cb->send_buf.type = DONE;
 	cb->send_buf.size_gb = num;
 	ret = ib_post_send(cb->qp, &cb->sq_wr, &bad_wr);
@@ -494,11 +456,7 @@ static int IS_disconnect_handler(struct kernel_cb *cb)
 					if (ctx->req == NULL){ 
 						break;
 					}
-				#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 18, 0)
-					blk_mq_end_request(ctx->req, 0);
-				#else
-					blk_mq_end_io(ctx->req, 0);
-				#endif
+					blk_mq_end_request(ctx->req, BLK_STS_OK);
 					break;
 				default:
 					;
@@ -633,7 +591,7 @@ static int IS_chunk_wait_in_flight_requests(struct kernel_cb *cb)
 					case CTX_R_IN_FLIGHT:
 					case CTX_W_IN_FLIGHT:
 						//the chunk is going to be cancelled
-						pr_debug("%s %d %d in write flight %p start 0x%lx, chunk_index %d\n", __func__, i, j, ctx->req, (blk_rq_pos(ctx->req) << IS_SECT_SHIFT), ctx->chunk_index);
+						pr_debug("%s %d %d in write flight %p start 0x%llx, chunk_index %d\n", __func__, i, j, ctx->req, (unsigned long long)(blk_rq_pos(ctx->req) << IS_SECT_SHIFT), ctx->chunk_index);
 						if (chunk_map[ctx->chunk_index] == -1){
 							err = 1;
 						}
@@ -820,19 +778,10 @@ static int client_read_done(struct kernel_cb * cb, struct ib_wc *wc)
 	ctx->chunk_index = -1;
 	req = ctx->req;
 	ctx->req = NULL;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
 	memcpy(bio_data(req->bio), ctx->rdma_buf, IS_PAGE_SIZE);
-#else
-	memcpy(req->buffer, ctx->rdma_buf, IS_PAGE_SIZE);
-#endif
 
-	IS_insert_ctx(ctx); 
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 18, 0)
-	blk_mq_end_request(req, 0);
-#else
-	blk_mq_end_io(req, 0);
-#endif		
+	IS_insert_ctx(ctx);
+	blk_mq_end_request(req, BLK_STS_OK);
 	return 0;
 }
 
@@ -856,11 +805,7 @@ static int client_write_done(struct kernel_cb * cb, struct ib_wc *wc)
 	req = ctx->req;
 	ctx->req = NULL;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 18, 0)
-	blk_mq_end_request(req, 0);
-#else
-	blk_mq_end_io(req, 0);
-#endif		
+	blk_mq_end_request(req, BLK_STS_OK);
 	return 0;
 }
 
@@ -868,7 +813,7 @@ static void rdma_cq_event_handler(struct ib_cq * cq, void *ctx)
 {
 	struct kernel_cb *cb=ctx;
 	struct ib_wc wc;
-	struct ib_recv_wr * bad_wr;
+	const struct ib_recv_wr *bad_wr;
 	int ret;
 	BUG_ON(cb->cq != cq);
 	if (cb->state == ERROR) {
@@ -946,19 +891,13 @@ static void IS_setup_wr(struct kernel_cb *cb)
 {
 	cb->recv_sgl.addr = cb->recv_dma_addr;
 	cb->recv_sgl.length = sizeof cb->recv_buf;
-	if (cb->local_dma_lkey)
-		cb->recv_sgl.lkey = cb->qp->device->local_dma_lkey;
-	else if (cb->mem == DMA)
-		cb->recv_sgl.lkey = cb->dma_mr->lkey;
+	cb->recv_sgl.lkey = cb->pd->local_dma_lkey;
 	cb->rq_wr.sg_list = &cb->recv_sgl;
 	cb->rq_wr.num_sge = 1;
 
 	cb->send_sgl.addr = cb->send_dma_addr;
 	cb->send_sgl.length = sizeof cb->send_buf;
-	if (cb->local_dma_lkey)
-		cb->send_sgl.lkey = cb->qp->device->local_dma_lkey;
-	else if (cb->mem == DMA)
-		cb->send_sgl.lkey = cb->dma_mr->lkey;
+	cb->send_sgl.lkey = cb->pd->local_dma_lkey;
 	cb->sq_wr.opcode = IB_WR_SEND;
 	cb->sq_wr.send_flags = IB_SEND_SIGNALED;
 	cb->sq_wr.sg_list = &cb->send_sgl;
@@ -968,95 +907,37 @@ static void IS_setup_wr(struct kernel_cb *cb)
 
 static int IS_setup_buffers(struct kernel_cb *cb)
 {
-	int ret;
-
 	pr_info(PFX "IS_setup_buffers called on cb %p\n", cb);
+	pr_info(PFX "size of IS_rdma_info %zu\n", sizeof(cb->recv_buf));
 
-	pr_info(PFX "size of IS_rdma_info %lu\n", sizeof(cb->recv_buf));
+	cb->recv_dma_addr = ib_dma_map_single(cb->pd->device, &cb->recv_buf,
+					       sizeof(cb->recv_buf),
+					       DMA_BIDIRECTIONAL);
+	if (ib_dma_mapping_error(cb->pd->device, cb->recv_dma_addr))
+		return -EIO;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)	
-	cb->recv_dma_addr = dma_map_single(&cb->pd->device->dev, 
-				   &cb->recv_buf, sizeof(cb->recv_buf), DMA_BIDIRECTIONAL);
-#else
-	cb->recv_dma_addr = dma_map_single(cb->pd->device->dma_device, 
-				   &cb->recv_buf, sizeof(cb->recv_buf), DMA_BIDIRECTIONAL);
-#endif
-	pci_unmap_addr_set(cb, recv_mapping, cb->recv_dma_addr);
+	cb->send_dma_addr = ib_dma_map_single(cb->pd->device, &cb->send_buf,
+					       sizeof(cb->send_buf),
+					       DMA_BIDIRECTIONAL);
+	if (ib_dma_mapping_error(cb->pd->device, cb->send_dma_addr)) {
+		ib_dma_unmap_single(cb->pd->device, cb->recv_dma_addr,
+				    sizeof(cb->recv_buf), DMA_BIDIRECTIONAL);
+		return -EIO;
+	}
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
-	cb->send_dma_addr = dma_map_single(&cb->pd->device->dev, 
-				   &cb->send_buf, sizeof(cb->send_buf), DMA_BIDIRECTIONAL);	
-#else
-	cb->send_dma_addr = dma_map_single(cb->pd->device->dma_device, 
-					   &cb->send_buf, sizeof(cb->send_buf), DMA_BIDIRECTIONAL);
-#endif
-	pci_unmap_addr_set(cb, send_mapping, cb->send_dma_addr);
-	pr_info(PFX "cb->mem=%d \n", cb->mem);
-
-	if (cb->mem == DMA) {
-		pr_info(PFX "IS_setup_buffers, in cb->mem==DMA \n");
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
-		cb->dma_mr = cb->pd->device->get_dma_mr(cb->pd, IB_ACCESS_LOCAL_WRITE|
-							        IB_ACCESS_REMOTE_READ|
-							        IB_ACCESS_REMOTE_WRITE);
-#else
-		cb->dma_mr = ib_get_dma_mr(cb->pd, IB_ACCESS_LOCAL_WRITE|
-					   IB_ACCESS_REMOTE_READ|
-				           IB_ACCESS_REMOTE_WRITE);
-#endif
-		if (IS_ERR(cb->dma_mr)) {
-			pr_info(PFX "reg_dmamr failed\n");
-			ret = PTR_ERR(cb->dma_mr);
-			goto bail;
-		}
-	} 
-	
 	IS_setup_wr(cb);
 	pr_info(PFX "allocated & registered buffers...\n");
 	return 0;
-bail:
-
-	if (cb->rdma_mr && !IS_ERR(cb->rdma_mr))
-		ib_dereg_mr(cb->rdma_mr);
-	if (cb->dma_mr && !IS_ERR(cb->dma_mr))
-		ib_dereg_mr(cb->dma_mr);
-	if (cb->recv_mr && !IS_ERR(cb->recv_mr))
-		ib_dereg_mr(cb->recv_mr);
-	if (cb->send_mr && !IS_ERR(cb->send_mr))
-		ib_dereg_mr(cb->send_mr);
-	
-	return ret;
 }
 
 static void IS_free_buffers(struct kernel_cb *cb)
 {
 	pr_info("IS_free_buffers called on cb %p\n", cb);
-	
-	if (cb->dma_mr)
-		ib_dereg_mr(cb->dma_mr);
-	if (cb->send_mr)
-		ib_dereg_mr(cb->send_mr);
-	if (cb->recv_mr)
-		ib_dereg_mr(cb->recv_mr);
-	if (cb->rdma_mr)
-		ib_dereg_mr(cb->rdma_mr);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)	
-	dma_unmap_single(&cb->pd->device->dev,
-			 pci_unmap_addr(cb, recv_mapping),
-			 sizeof(cb->recv_buf), DMA_BIDIRECTIONAL);
-	dma_unmap_single(&cb->pd->device->dev,
-			 pci_unmap_addr(cb, send_mapping),
-			 sizeof(cb->send_buf), DMA_BIDIRECTIONAL);
-#else
-	dma_unmap_single(cb->pd->device->dma_device,
-			 pci_unmap_addr(cb, recv_mapping),
-			 sizeof(cb->recv_buf), DMA_BIDIRECTIONAL);
-	dma_unmap_single(cb->pd->device->dma_device,
-			 pci_unmap_addr(cb, send_mapping),
-			 sizeof(cb->send_buf), DMA_BIDIRECTIONAL);
-#endif
-
+	ib_dma_unmap_single(cb->pd->device, cb->recv_dma_addr,
+			    sizeof(cb->recv_buf), DMA_BIDIRECTIONAL);
+	ib_dma_unmap_single(cb->pd->device, cb->send_dma_addr,
+			    sizeof(cb->send_buf), DMA_BIDIRECTIONAL);
 }
 
 static int IS_create_qp(struct kernel_cb *cb)
@@ -1092,57 +973,45 @@ static void IS_free_qp(struct kernel_cb *cb)
  */
 static int IS_setup_qp(struct kernel_cb *cb, struct rdma_cm_id *cm_id)
 {
-	int ret;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
 	struct ib_cq_init_attr init_attr;
-#endif
+	int ret;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
-	cb->pd = ib_alloc_pd(cm_id->device, IB_ACCESS_LOCAL_WRITE|
-                                            IB_ACCESS_REMOTE_READ|
-                                            IB_ACCESS_REMOTE_WRITE );
-#else
-	cb->pd = ib_alloc_pd(cm_id->device);
-#endif
+	cb->pd = ib_alloc_pd(cm_id->device, 0);
 	if (IS_ERR(cb->pd)) {
 		printk(KERN_ERR PFX "ib_alloc_pd failed\n");
 		return PTR_ERR(cb->pd);
 	}
 	pr_info("created pd %p\n", cb->pd);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
 	memset(&init_attr, 0, sizeof(init_attr));
 	init_attr.cqe = cb->txdepth * 2;
 	init_attr.comp_vector = 0;
-	
-	cb->cq = ib_create_cq(cm_id->device, rdma_cq_event_handler, NULL, cb, &init_attr);
-#else
-	cb->cq = ib_create_cq(cm_id->device, rdma_cq_event_handler, NULL, cb, cb->txdepth * 2, 0);
-#endif
-
+	cb->cq = ib_create_cq(cm_id->device, rdma_cq_event_handler, NULL, cb,
+			      &init_attr);
 	if (IS_ERR(cb->cq)) {
 		printk(KERN_ERR PFX "ib_create_cq failed\n");
 		ret = PTR_ERR(cb->cq);
-		goto err1;
+		goto dealloc_pd;
 	}
 	pr_info("created cq %p\n", cb->cq);
 
 	ret = ib_req_notify_cq(cb->cq, IB_CQ_NEXT_COMP);
 	if (ret) {
-		printk(KERN_ERR PFX "ib_create_cq failed\n");
-		goto err2;
+		printk(KERN_ERR PFX "ib_req_notify_cq failed\n");
+		goto destroy_cq;
 	}
 
 	ret = IS_create_qp(cb);
 	if (ret) {
 		printk(KERN_ERR PFX "IS_create_qp failed: %d\n", ret);
-		goto err2;
+		goto destroy_cq;
 	}
 	pr_info("created qp %p\n", cb->qp);
 	return 0;
-err2:
+
+destroy_cq:
 	ib_destroy_cq(cb->cq);
-err1:
+dealloc_pd:
 	ib_dealloc_pd(cb->pd);
 	return ret;
 }
@@ -1395,31 +1264,21 @@ static int IS_ctx_init(struct IS_connection *IS_conn, struct kernel_cb *cb, int 
 			ret = -ENOMEM;
 			goto bail;
 		}
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
-		ctx->rdma_dma_addr = dma_map_single(&cb->pd->device->dev,
-                                       ctx->rdma_buf, cb->size,
-                                       DMA_BIDIRECTIONAL);
-#else
-		ctx->rdma_dma_addr = dma_map_single(cb->pd->device->dma_device, 
-				       ctx->rdma_buf, cb->size, 
-				       DMA_BIDIRECTIONAL);
-#endif
-		pci_unmap_addr_set(ctx, rdma_mapping, ctx->rdma_dma_addr);	
+		ctx->rdma_dma_addr = ib_dma_map_single(cb->pd->device,
+						       ctx->rdma_buf, cb->size,
+						       DMA_BIDIRECTIONAL);
+		if (ib_dma_mapping_error(cb->pd->device, ctx->rdma_dma_addr)) {
+			ret = -EIO;
+			goto bail;
+		}
 
 		// rdma_buf, peer nodes RDMA write destination
 		ctx->rdma_sgl.addr = ctx->rdma_dma_addr;
-		ctx->rdma_sgl.lkey = cb->qp->device->local_dma_lkey;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
+		ctx->rdma_sgl.lkey = cb->pd->local_dma_lkey;
 		ctx->rdma_sq_wr.wr.send_flags = IB_SEND_SIGNALED;
 		ctx->rdma_sq_wr.wr.sg_list = &ctx->rdma_sgl;
 		ctx->rdma_sq_wr.wr.num_sge = 1;
 		ctx->rdma_sq_wr.wr.wr_id = uint64_from_ptr(ctx);
-#else
-		ctx->rdma_sq_wr.send_flags = IB_SEND_SIGNALED;
-		ctx->rdma_sq_wr.sg_list = &ctx->rdma_sgl;
-		ctx->rdma_sq_wr.num_sge = 1;
-		ctx->rdma_sq_wr.wr_id = uint64_from_ptr(ctx);
-#endif
 	}
 	return 0;
 
@@ -1455,7 +1314,7 @@ static int IS_create_conn(struct IS_session *IS_session, int cpu,
 }
 static int rdma_connect_down(struct kernel_cb *cb)
 {
-	struct ib_recv_wr *bad_wr;
+	const struct ib_recv_wr *bad_wr;
 	int ret;
 
 	ret = ib_post_recv(cb->qp, &cb->rq_wr, &bad_wr); 
@@ -1556,11 +1415,8 @@ static int kernel_cb_init(struct kernel_cb *cb, struct IS_session *IS_session)
 	init_waitqueue_head(&cb->remote_chunk.sem);
 	cb->remote_chunk.c_state = C_IDLE;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
-	cb->cm_id = rdma_create_id(&init_net, IS_cma_event_handler, cb, RDMA_PS_TCP, IB_QPT_RC);
-#else
-	cb->cm_id = rdma_create_id(IS_cma_event_handler, cb, RDMA_PS_TCP, IB_QPT_RC);
-#endif
+	cb->cm_id = rdma_create_id(&init_net, IS_cma_event_handler, cb,
+				   RDMA_PS_TCP, IB_QPT_RC);
 	if (IS_ERR(cb->cm_id)) {
 		ret = PTR_ERR(cb->cm_id);
 		printk(KERN_ERR PFX "rdma_create_id error %d\n", ret);
@@ -1573,7 +1429,7 @@ out:
 	return ret;
 }
 
-void IS_ctx_dma_setup(struct kernel_cb *cb, struct IS_session *IS_session, int cb_index)
+static void IS_ctx_dma_setup(struct kernel_cb *cb, struct IS_session *IS_session, int cb_index)
 {
 	struct IS_connection *IS_conn;
 	int i;
@@ -1597,8 +1453,11 @@ int IS_single_chunk_map(struct IS_session *IS_session, int select_chunk)
 	int cb_index;
 	int need_chunk;
 	int avail_cb;
-	unsigned int random_cb_selection[NUM_CB];
+	unsigned int random_cb_selection[SUPPORTED_PORTALS];
 	unsigned int random_num;
+
+	if (NUM_CB > SUPPORTED_PORTALS)
+		return -EINVAL;
 
 	for (j = 0; j < SERVER_SELECT_NUM; j++){
 		selection[j] = NUM_CB; //no server 

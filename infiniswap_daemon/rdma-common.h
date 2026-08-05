@@ -18,10 +18,6 @@
 #include <netinet/in.h>
 #include <linux/kernel.h>
 
-#ifdef HAVE_CONFIG_H
-#include <config.h>
-#endif
-
 #define TEST_NZ(x) do { if ( (x)) die("error: " #x " failed (returned non-zero)." ); } while (0)
 #define TEST_Z(x)  do { if (!(x)) die("error: " #x " failed (returned zero/null)."); } while (0)
 
@@ -210,6 +206,7 @@ struct rdma_session {
 };
 
 void die(const char *reason);
+uint64_t infiniswap_htonll(uint64_t value);
 
 void build_connection(struct rdma_cm_id *id);
 void build_params(struct rdma_conn_param *params);
@@ -221,6 +218,6 @@ void send_mr(void *context, int n);
 void send_stop(void *context, int n);
 void send_evict(void *context, int n);
 void send_free_mem_size(void *context);
-void* free_mem(void *data);
+void *free_mem(void *data);
 
 #endif

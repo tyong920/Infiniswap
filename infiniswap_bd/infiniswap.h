@@ -47,15 +47,13 @@
 #include <linux/kthread.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 37)
-#include <asm/atomic.h>
-#else
 #include <linux/atomic.h>
-#endif
 #include <linux/completion.h>
 #include <linux/list.h>
 #include <linux/blkdev.h>
 #include <linux/blk-mq.h>
+#include <linux/bio.h>
+#include <linux/highmem.h>
 #include <linux/fs.h>
 #include <linux/wait.h>
 #include <linux/fcntl.h>
@@ -77,7 +75,6 @@
 #include <linux/random.h>
 #include <linux/sched.h>
 #include <linux/proc_fs.h>
-#include <asm/pci.h>
 
 #include <rdma/ib_verbs.h>
 #include <rdma/rdma_cm.h>
@@ -86,11 +83,11 @@
 #include <linux/errno.h>  /* error codes */
 #include <linux/types.h>  /* size_t */
 #include <linux/vmalloc.h>
+#ifdef INFINISWAP_HAVE_LINUX_GENHD_H
 #include <linux/genhd.h>
+#endif
 #include <linux/hdreg.h>
 #include <trace/events/block.h>
-
-#include "config.h"
 
 // from NBDX
 #define SUBMIT_BLOCK_SIZE				\
@@ -148,13 +145,9 @@ struct raio_iocb {
 			    sizeof(struct raio_command))
 
 #ifdef USER_MAX_PAGE_NUM
-	#define MAX_SGL_LEN USER_MAX_PAGE_NUM	/* max pages in a single struct request (swap IO request) */
+	#define MAX_SGL_LEN USER_MAX_PAGE_NUM	/* max pages in one swap request */
 #else
-	#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
-		#define MAX_SGL_LEN 1	/* kernel 4.x only supports single page request*/
-	#else
-		#define MAX_SGL_LEN 32	/* max pages in a single struct request (swap IO request) */
-	#endif
+	#define MAX_SGL_LEN 1
 #endif
 struct raio_io_u {
 	struct scatterlist  sgl[MAX_SGL_LEN];
@@ -216,7 +209,11 @@ struct raio_io_u {
 
 #define STACKBD_REDIRECT_OFF 0
 #define STACKBD_REDIRECT_ON  1
+#ifdef INFINISWAP_HAVE_BDEV_HANDLE
+#define STACKBD_BDEV_MODE (BLK_OPEN_READ | BLK_OPEN_WRITE | BLK_OPEN_EXCL)
+#else
 #define STACKBD_BDEV_MODE (FMODE_READ | FMODE_WRITE | FMODE_EXCL)
+#endif
 #define KERNEL_SECTOR_SIZE 512
 #define STACKBD_DO_IT _IOW( 0xad, 0, char * )
 #ifdef USER_STACKBD_NAME
@@ -226,7 +223,7 @@ struct raio_io_u {
 #endif
 #define STACKBD_NAME_0 STACKBD_NAME "0"
 
-static struct stackbd_t {
+struct stackbd_t {
     sector_t capacity; 
     struct gendisk *gd;
     spinlock_t lock;
@@ -234,16 +231,14 @@ static struct stackbd_t {
     struct task_struct *thread;
     int is_active;
     struct block_device *bdev_raw;
+#ifdef INFINISWAP_HAVE_BDEV_HANDLE
+    struct bdev_handle *bdev_handle;
+#endif
     struct request_queue *queue;
     atomic_t redirect_done;
-} stackbd;
+};
 
-static int major_num = 0;
-module_param(major_num, int, 0);
-static int LOGICAL_BLOCK_SIZE = 512;
-module_param(LOGICAL_BLOCK_SIZE, int, 0);
-
-static DECLARE_WAIT_QUEUE_HEAD(req_event);
+extern struct stackbd_t stackbd;
 
 //bitmap
 #define INT_BITS 32
@@ -372,25 +367,18 @@ struct kernel_cb {
 	struct ib_sge recv_sgl;		/* recv single SGE */
 	struct IS_rdma_info recv_buf;/* malloc'd buffer */
 	u64 recv_dma_addr;
-	DECLARE_PCI_UNMAP_ADDR(recv_mapping)
 	struct ib_mr *recv_mr;
 
 	struct ib_send_wr sq_wr;	/* send work requrest record */
 	struct ib_sge send_sgl;
 	struct IS_rdma_info send_buf;/* single send buf */
 	u64 send_dma_addr;
-	DECLARE_PCI_UNMAP_ADDR(send_mapping)
 	struct ib_mr *send_mr;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
-	struct ib_rdma_wr rdma_sq_wr;	/* rdma work request record */
-#else
-	struct ib_send_wr rdma_sq_wr;	/* rdma work request record */
-#endif
+	struct ib_rdma_wr rdma_sq_wr;	/* RDMA work request record */
 	struct ib_sge rdma_sgl;		/* rdma single SGE */
 	char *rdma_buf;			/* used as rdma sink */
 	u64  rdma_dma_addr;
-	DECLARE_PCI_UNMAP_ADDR(rdma_mapping)
 	struct ib_mr *rdma_mr;
 
 	// peer's addr info pay attention
@@ -401,7 +389,6 @@ struct kernel_cb {
 
 	char *start_buf;		/* rdma read src */
 	u64  start_dma_addr;
-	DECLARE_PCI_UNMAP_ADDR(start_mapping)
 	struct ib_mr *start_mr;
 
 	enum test_state state;		/* used for cond/signalling */
@@ -440,16 +427,11 @@ enum IS_dev_state {
 struct rdma_ctx {
 	struct IS_connection *IS_conn;
 	struct free_ctx_pool *free_ctxs;  //or this one
-	//struct mutex ctx_lock;	
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
-	struct ib_rdma_wr rdma_sq_wr;	/* rdma work request record */
-#else
-	struct ib_send_wr rdma_sq_wr;	/* rdma work request record */
-#endif
+	//struct mutex ctx_lock;
+	struct ib_rdma_wr rdma_sq_wr;	/* RDMA work request record */
 	struct ib_sge rdma_sgl;		/* rdma single SGE */
 	char *rdma_buf;			/* used as rdma sink */
 	u64  rdma_dma_addr;
-	DECLARE_PCI_UNMAP_ADDR(rdma_mapping)
 	struct ib_mr *rdma_mr;
 	struct request *req;
 	int chunk_index;
@@ -595,9 +577,7 @@ struct IS_file {
 	struct list_head	     list; /* next node in list of struct IS_file */
 	struct gendisk		    *disk;
 	struct request_queue	    *queue; /* The device request queue */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 16, 0)
 	struct blk_mq_tag_set	     tag_set;
-#endif
 	struct IS_queue	    *queues;
 	unsigned int		     queue_depth;
 	unsigned int		     nr_queues;
@@ -634,10 +614,11 @@ void IS_unregister_block_device(struct IS_file *IS_file);
 int IS_setup_queues(struct IS_file *xdev);
 void IS_destroy_queues(struct IS_file *xdev);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
-blk_qc_t stackbd_make_request(struct request_queue *q, struct bio *bio);
+struct bio *IS_bio_clone(struct bio *source, gfp_t gfp);
+#ifdef INFINISWAP_HAVE_BDEV_HANDLE
+void stackbd_make_request(struct bio *bio);
 #else
-void stackbd_make_request(struct request_queue *q, struct bio *bio);
+blk_qc_t stackbd_make_request(struct bio *bio);
 #endif
 void stackbd_make_request2(struct request_queue *q, struct request *req);
 void stackbd_make_request3(struct request_queue *q, struct request *req);

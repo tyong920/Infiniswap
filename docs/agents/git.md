@@ -6,11 +6,11 @@ Project git hygiene for this repository.
 
 Root [`.gitignore`](../../.gitignore) covers:
 
-- Autotools / `configure` output
+- CMake output
 - Kernel-module and userspace build artifacts
 - Local indexes (`.codegraph/`) and editor/OS files
 
-Do not commit `.ko`, `.o`, `autom4te.cache/`, generated `Makefile`s, or daemon `config.h`.
+Do not commit `.ko`, `.o`, generated CMake files, or daemon binaries.
 
 ## Line endings
 
