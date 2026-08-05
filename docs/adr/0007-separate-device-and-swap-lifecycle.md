@@ -1,0 +1,3 @@
+# Separate device creation from swap activation
+
+Creating an Infiniswap Device, formatting it as swap, and enabling it are separate explicit local-administrator actions. The control tool never disables, reformats, reprioritizes, or otherwise modifies unrelated swap resources; this deliberately replaces the legacy setup script's host-wide `swapoff` behavior so shared machines can be handled safely. During canary, Infiniswap may be assigned a higher explicit priority while the Local Swap Baseline remains online at its existing lower priority. Production cutover disables but initially retains the local swapfile as a rollback artifact, and each Infiniswap mode and acknowledgement policy must qualify independently before replacing it.

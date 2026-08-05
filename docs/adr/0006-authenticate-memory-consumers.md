@@ -1,0 +1,3 @@
+# Authenticate Memory Consumers individually
+
+Each Memory Consumer will authenticate to a Memory Provider with its own key identifier and pre-shared key, and the Provider will map that identity to an allowlist entry and resource limits. The control handshake uses a nonce-based MAC without transmitting the secret; one shared cluster key is rejected because it prevents independent revocation and gives a single leak cluster-wide impact. Providers support a bounded current/next key overlap for normal rotation and immediate per-Consumer disconnection for emergency revocation. Only a local administrator on the Memory Consumer may create, activate, stop, or destroy an Infiniswap Device; a Provider cannot remotely change Consumer device or swap state.

@@ -1,0 +1,3 @@
+# Support backed and remote-only operation
+
+Each Infiniswap Device chooses one immutable operating mode when it is created. Backed Mode maintains a recoverable local copy in a Backing Store and can start with no Remote Memory, acquiring Remote Chunks opportunistically while remaining a correct local swap device. Remote-Only Mode omits local backing to eliminate its capacity and write costs, so it must reserve its entire advertised capacity from Memory Providers before activation and enters Remote-Lost if any Provider holding data fails. The modes are explicit rather than implicit performance presets so operators cannot mistake an unbacked device for a recoverable one.

@@ -1,0 +1,5 @@
+# Require a material performance win before swap cutover
+
+The existing NVMe swapfile is the Local Swap Baseline and remains a peer implementation during evaluation. Under the same workload, local DRAM limit, and effective swap capacity, each candidate configuration must complete at least five valid runs, improve the median primary business metric by at least 20% with a 95% confidence interval excluding no improvement, and regress the no-memory-pressure case by no more than 5%. Backed with Strict, Backed with Remote-First, and Remote-Only qualify independently. A passing configuration may replace the local swapfile, which is disabled but retained for initial rollback; if none passes, production cutover does not occur.
+
+Backed Mode additionally requires a dedicated block device or LVM logical volume before production deployment. The target's existing 16 GiB system swap LV may be used only for an explicitly authorized small canary; file-backed loop devices are not accepted as production Backing Stores.

@@ -1,0 +1,3 @@
+# Introduce a versioned control protocol
+
+The modernized Memory Consumer and Memory Provider will use a fixed-width, explicitly byte-ordered control protocol with a magic value, protocol version, and capability negotiation, and incompatible peers will reject the connection. Protocol major versions must match, while peers with different minor versions negotiate their shared capabilities; production releases guarantee interoperability between the current and immediately preceding minor version. The two roles are upgraded as a coordinated pair across major versions, and compatibility with unversioned 2019 binaries is deliberately excluded because their native C struct layout and compile-time array sizes cannot be negotiated safely.
