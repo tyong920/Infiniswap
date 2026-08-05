@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Light commit-message hygiene: non-empty subject, length, no merge noise required.
+set -euo pipefail
+
+msg_file="${1:?commit message file required}"
+subject="$(sed -n '1p' "$msg_file" | tr -d '\r')"
+
+# Allow merges and reverts unchanged
+if [[ "$subject" =~ ^Merge\  ]] || [[ "$subject" =~ ^Revert\  ]]; then
+  exit 0
+fi
+
+if [[ -z "${subject// }" ]]; then
+  echo "commit-msg: subject must not be empty" >&2
+  exit 1
+fi
+
+if [[ "$subject" =~ ^[[:space:]] ]]; then
+  echo "commit-msg: subject must not start with whitespace" >&2
+  exit 1
+fi
+
+# Prefer a short subject; warn-style hard limit keeps history readable.
+if ((${#subject} > 72)); then
+  echo "commit-msg: subject is ${#subject} chars (max 72)" >&2
+  echo "  got: $subject" >&2
+  exit 1
+fi
+
+# Discourage trailing period on the subject line
+if [[ "$subject" =~ \.$ ]]; then
+  echo "commit-msg: omit the trailing period on the subject line" >&2
+  exit 1
+fi
+
+exit 0

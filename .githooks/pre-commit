@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Block staged build artifacts and other generated noise.
+set -euo pipefail
+
+is_blocked() {
+  local path="$1"
+  case "$path" in
+    *.o|*.a|*.lo|*.la|*.so|*.dylib|*.ko|*.ko.unsigned|*.mod|*.mod.c|*.mod.o|*.cmd|*.log|*.out)
+      return 0
+      ;;
+    .DS_Store|*/.DS_Store|.codegraph|/*/.codegraph/*|.codegraph/*)
+      return 0
+      ;;
+    modules.order|*/modules.order|Module.symvers|*/Module.symvers|Module.markers|*/Module.markers)
+      return 0
+      ;;
+    .tmp_versions|/*/.tmp_versions/*|.tmp_versions/*|autom4te.cache|/*/autom4te.cache/*|autom4te.cache/*)
+      return 0
+      ;;
+    config.status|*/config.status|config.log|*/config.log|stamp-h1|*/stamp-h1|aclocal.m4|*/aclocal.m4)
+      return 0
+      ;;
+    configure|*/configure|config.h.in|*/config.h.in)
+      return 0
+      ;;
+    infiniswap_daemon/config.h|infiniswap_daemon/Makefile|infiniswap_daemon/Makefile.in|infiniswap_daemon/infiniswap-daemon)
+      return 0
+      ;;
+    infiniswap_bd/Makefile)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+staged="$(git diff --cached --name-only --diff-filter=ACMR || true)"
+if [[ -z "$staged" ]]; then
+  exit 0
+fi
+
+bad=()
+while IFS= read -r path; do
+  [[ -z "$path" ]] && continue
+  if is_blocked "$path"; then
+    bad+=("$path")
+  fi
+done <<< "$staged"
+
+if ((${#bad[@]})); then
+  echo "pre-commit: refusing to commit generated/build artifacts:" >&2
+  printf '  %s\n' "${bad[@]}" >&2
+  echo "Unstage them (git restore --staged <path>) or adjust .gitignore / this hook." >&2
+  exit 1
+fi
+
+exit 0

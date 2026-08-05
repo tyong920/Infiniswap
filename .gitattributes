@@ -1,0 +1,14 @@
+* text=auto eol=lf
+
+*.c text eol=lf
+*.h text eol=lf
+*.sh text eol=lf
+*.am text eol=lf
+*.ac text eol=lf
+*.md text eol=lf
+*.list text eol=lf
+
+*.ko binary
+*.o binary
+*.a binary
+*.so binary

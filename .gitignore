@@ -1,0 +1,71 @@
+# Local tooling / indexes
+.codegraph/
+.cursor/
+.vscode/
+.idea/
+
+# OS / editor
+.DS_Store
+.AppleDouble
+.LSOverride
+*~
+*.swp
+*.swo
+*.bak
+
+# Autotools / configure output
+autom4te.cache/
+aclocal.m4
+configure
+config.status
+config.log
+config.h.in
+stamp-h1
+.deps/
+.libs/
+
+# Generated headers / makefiles
+# infiniswap_bd/config.h is a tracked empty stub; daemon's is always generated.
+infiniswap_daemon/config.h
+infiniswap_bd/Makefile
+infiniswap_daemon/Makefile
+infiniswap_daemon/Makefile.in
+
+# Automake helper copies under the daemon tree (bd keeps a tracked install-sh)
+infiniswap_daemon/install-sh
+infiniswap_daemon/missing
+infiniswap_daemon/compile
+infiniswap_daemon/depcomp
+infiniswap_daemon/INSTALL
+infiniswap_daemon/ar-lib
+
+# C / userspace build
+*.o
+*.a
+*.lo
+*.la
+*.so
+*.dylib
+*.dSYM/
+infiniswap_daemon/infiniswap-daemon
+
+# Kernel module build
+*.ko
+*.ko.unsigned
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+.*.cmd
+modules.order
+Module.symvers
+Module.markers
+.tmp_versions/
+*.order
+
+# Local deploy / experiment noise
+*.log
+*.out
+*.csv
+results/
+experiments/out/
