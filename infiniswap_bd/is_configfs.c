@@ -18,6 +18,13 @@ static inline struct is_device *to_is_device(struct config_item *item)
 	return container_of(to_config_group(item), struct is_device, group);
 }
 
+static ssize_t is_store_result(struct is_device *device, int ret, size_t count)
+{
+	if (ret)
+		WRITE_ONCE(device->last_error, -ret);
+	return ret ? ret : count;
+}
+
 static ssize_t is_device_backing_store_show(struct config_item *item,
 					    char *page)
 {
@@ -34,9 +41,10 @@ static ssize_t is_device_backing_store_store(struct config_item *item,
 					     const char *page,
 					     size_t count)
 {
-	int ret = is_device_set_backing_store(to_is_device(item), page, count);
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_backing_store(device, page, count);
 
-	return ret ? ret : count;
+	return is_store_result(device, ret, count);
 }
 
 static ssize_t is_device_mode_show(struct config_item *item, char *page)
@@ -48,9 +56,26 @@ static ssize_t is_device_mode_show(struct config_item *item, char *page)
 static ssize_t is_device_mode_store(struct config_item *item,
 				    const char *page, size_t count)
 {
-	int ret = is_device_set_mode(to_is_device(item), page, count);
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_mode(device, page, count);
 
-	return ret ? ret : count;
+	return is_store_result(device, ret, count);
+}
+
+static ssize_t is_device_acknowledgement_policy_show(struct config_item *item,
+						      char *page)
+{
+	return sysfs_emit(page, "%s\n",
+		is_device_acknowledgement_policy_name(to_is_device(item)));
+}
+
+static ssize_t is_device_acknowledgement_policy_store(
+	struct config_item *item, const char *page, size_t count)
+{
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_acknowledgement_policy(device, page, count);
+
+	return is_store_result(device, ret, count);
 }
 
 static ssize_t is_device_capacity_bytes_show(struct config_item *item,
@@ -69,9 +94,117 @@ static ssize_t is_device_capacity_bytes_store(struct config_item *item,
 					      const char *page,
 					      size_t count)
 {
-	int ret = is_device_set_capacity(to_is_device(item), page, count);
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_capacity(device, page, count);
 
-	return ret ? ret : count;
+	return is_store_result(device, ret, count);
+}
+
+static ssize_t is_device_provider_failure_deadline_ms_show(
+	struct config_item *item, char *page)
+{
+	struct is_device *device = to_is_device(item);
+	ssize_t count;
+
+	mutex_lock(&device->lifecycle_lock);
+	count = sysfs_emit(page, "%u\n",
+			   device->provider_failure_deadline_ms);
+	mutex_unlock(&device->lifecycle_lock);
+	return count;
+}
+
+static ssize_t is_device_provider_failure_deadline_ms_store(
+	struct config_item *item, const char *page, size_t count)
+{
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_failure_deadline(device, page, count);
+
+	return is_store_result(device, ret, count);
+}
+
+static ssize_t is_device_consumer_id_show(struct config_item *item, char *page)
+{
+	struct is_device *device = to_is_device(item);
+	ssize_t count;
+
+	mutex_lock(&device->lifecycle_lock);
+	count = sysfs_emit(page, "%s\n", device->consumer_id);
+	mutex_unlock(&device->lifecycle_lock);
+	return count;
+}
+
+static ssize_t is_device_consumer_id_store(struct config_item *item,
+					   const char *page, size_t count)
+{
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_consumer_id(device, page, count);
+
+	return is_store_result(device, ret, count);
+}
+
+static ssize_t is_device_providers_show(struct config_item *item, char *page)
+{
+	struct is_device *device = to_is_device(item);
+	ssize_t count;
+
+	mutex_lock(&device->lifecycle_lock);
+	count = sysfs_emit(page, "%s\n", device->providers);
+	mutex_unlock(&device->lifecycle_lock);
+	return count;
+}
+
+static ssize_t is_device_providers_store(struct config_item *item,
+					 const char *page, size_t count)
+{
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_providers(device, page, count);
+
+	return is_store_result(device, ret, count);
+}
+
+static ssize_t is_device_swap_priority_show(struct config_item *item,
+					    char *page)
+{
+	struct is_device *device = to_is_device(item);
+	ssize_t count;
+
+	mutex_lock(&device->lifecycle_lock);
+	count = sysfs_emit(page, "%d\n", device->swap_priority);
+	mutex_unlock(&device->lifecycle_lock);
+	return count;
+}
+
+static ssize_t is_device_swap_priority_store(struct config_item *item,
+					     const char *page, size_t count)
+{
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_swap_priority(device, page, count);
+
+	return is_store_result(device, ret, count);
+}
+
+static ssize_t is_device_connection_state_show(struct config_item *item,
+						char *page)
+{
+	return sysfs_emit(page, "not-connected\n");
+}
+
+static ssize_t is_device_remote_capacity_bytes_show(struct config_item *item,
+						     char *page)
+{
+	struct is_device *device = to_is_device(item);
+	ssize_t count;
+
+	mutex_lock(&device->lifecycle_lock);
+	count = sysfs_emit(page, "%llu\n", device->remote_capacity_bytes);
+	mutex_unlock(&device->lifecycle_lock);
+	return count;
+}
+
+static ssize_t is_device_last_error_show(struct config_item *item, char *page)
+{
+	return sysfs_emit(page, "%d\n",
+			  READ_ONCE(to_is_device(item)->last_error));
 }
 
 static ssize_t is_device_state_show(struct config_item *item, char *page)
@@ -117,20 +250,36 @@ static ssize_t is_device_state_store(struct config_item *item,
 	}
 
 out:
-	result = ret ? ret : count;
+	result = is_store_result(device, ret, count);
 	mutex_unlock(&device->configfs_lock);
 	return result;
 }
 
 CONFIGFS_ATTR(is_device_, backing_store);
 CONFIGFS_ATTR(is_device_, mode);
+CONFIGFS_ATTR(is_device_, acknowledgement_policy);
 CONFIGFS_ATTR(is_device_, capacity_bytes);
+CONFIGFS_ATTR(is_device_, provider_failure_deadline_ms);
+CONFIGFS_ATTR(is_device_, consumer_id);
+CONFIGFS_ATTR(is_device_, providers);
+CONFIGFS_ATTR(is_device_, swap_priority);
+CONFIGFS_ATTR_RO(is_device_, connection_state);
+CONFIGFS_ATTR_RO(is_device_, remote_capacity_bytes);
+CONFIGFS_ATTR_RO(is_device_, last_error);
 CONFIGFS_ATTR(is_device_, state);
 
 static struct configfs_attribute *is_device_attrs[] = {
 	&is_device_attr_backing_store,
 	&is_device_attr_mode,
+	&is_device_attr_acknowledgement_policy,
 	&is_device_attr_capacity_bytes,
+	&is_device_attr_provider_failure_deadline_ms,
+	&is_device_attr_consumer_id,
+	&is_device_attr_providers,
+	&is_device_attr_swap_priority,
+	&is_device_attr_connection_state,
+	&is_device_attr_remote_capacity_bytes,
+	&is_device_attr_last_error,
 	&is_device_attr_state,
 	NULL,
 };

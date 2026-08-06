@@ -17,8 +17,6 @@
 #define IS_PROTOCOL_CHUNK_ID_SIZE 4U
 #define IS_PROTOCOL_ACTIVITY_SIZE 12U
 #define IS_PROTOCOL_ERROR_SIZE 8U
-#define IS_PROTOCOL_FAILURE_DEADLINE_MIN_MS 500U
-#define IS_PROTOCOL_FAILURE_DEADLINE_MAX_MS 30000U
 
 static void is_put_u16(is_protocol_u8 *out, is_protocol_u16 value)
 {

@@ -70,6 +70,11 @@ configure_group() {
 
   create_group "$name"
   printf 'backed\n' > "$group/mode"
+  printf 'strict\n' > "$group/acknowledgement_policy"
+  printf '2000\n' > "$group/provider_failure_deadline_ms"
+  printf 'consumer-test\n' > "$group/consumer_id"
+  printf 'provider-test\n' > "$group/providers"
+  printf '100\n' > "$group/swap_priority"
   printf '%s\n' "$group_backing" > "$group/backing_store"
   printf '%s\n' "$group_capacity" > "$group/capacity_bytes"
 }
@@ -263,6 +268,20 @@ run_io_verification() {
   printf 'activate\n' > "$group/state"
   [[ $(<"$group/state") == active ]] || fail "$name did not activate"
   wait_for_path "$device" present
+
+  write_must_fail remote-first "$group/acknowledgement_policy"
+  write_must_fail 3000 "$group/provider_failure_deadline_ms"
+  write_must_fail consumer-other "$group/consumer_id"
+  write_must_fail provider-other "$group/providers"
+  write_must_fail 101 "$group/swap_priority"
+  [[ $(<"$group/acknowledgement_policy") == strict ]] || \
+    fail "online acknowledgement policy changed"
+  [[ $(<"$group/provider_failure_deadline_ms") == 2000 ]] || \
+    fail "online Provider Failure Deadline changed"
+  [[ $(<"$group/connection_state") == not-connected ]] || \
+    fail "unexpected initial connection status"
+  [[ $(<"$group/remote_capacity_bytes") == 0 ]] || \
+    fail "unexpected initial Remote Memory capacity"
 
   exec 9<>"$device"
   write_must_fail stop "$group/state"

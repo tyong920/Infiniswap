@@ -4,6 +4,7 @@
  * Copyright 2014 Oren Kishon
  * Copyright (c) 2013 Mellanox Technologies. All rights reserved.
  */
+#include <linux/ctype.h>
 #include <linux/fs.h>
 #include <linux/major.h>
 #include <linux/namei.h>
@@ -45,6 +46,10 @@ void is_device_init(struct is_device *device, const char *name)
 	atomic_set(&device->openers, 0);
 	atomic_set(&device->inflight, 0);
 	device->mode = IS_DEVICE_MODE_UNSET;
+	device->acknowledgement_policy = IS_ACKNOWLEDGEMENT_POLICY_STRICT;
+	device->provider_failure_deadline_ms =
+		IS_PROTOCOL_FAILURE_DEADLINE_DEFAULT_MS;
+	device->swap_priority = -1;
 	device->state = IS_DEVICE_CREATED;
 	device->minor = -1;
 	strscpy(device->name, name, sizeof(device->name));
@@ -74,6 +79,191 @@ int is_device_set_mode(struct is_device *device, const char *buf, size_t count)
 		device->mode = IS_DEVICE_MODE_BACKED;
 	else if (device->mode != IS_DEVICE_MODE_BACKED)
 		ret = -EINVAL;
+	mutex_unlock(&device->lifecycle_lock);
+	return ret;
+}
+
+const char *is_device_acknowledgement_policy_name(struct is_device *device)
+{
+	const char *name;
+
+	mutex_lock(&device->lifecycle_lock);
+	switch (device->acknowledgement_policy) {
+	case IS_ACKNOWLEDGEMENT_POLICY_STRICT:
+		name = "strict";
+		break;
+	case IS_ACKNOWLEDGEMENT_POLICY_REMOTE_FIRST:
+		name = "remote-first";
+		break;
+	default:
+		name = "unset";
+		break;
+	}
+	mutex_unlock(&device->lifecycle_lock);
+	return name;
+}
+
+int is_device_set_acknowledgement_policy(struct is_device *device,
+					 const char *buf, size_t count)
+{
+	enum is_acknowledgement_policy policy;
+	int ret = 0;
+
+	if (sysfs_streq(buf, "strict"))
+		policy = IS_ACKNOWLEDGEMENT_POLICY_STRICT;
+	else if (sysfs_streq(buf, "remote-first"))
+		policy = IS_ACKNOWLEDGEMENT_POLICY_REMOTE_FIRST;
+	else
+		return -EINVAL;
+
+	mutex_lock(&device->lifecycle_lock);
+	if (!is_device_configurable(device))
+		ret = -EBUSY;
+	else
+		device->acknowledgement_policy = policy;
+	mutex_unlock(&device->lifecycle_lock);
+	return ret;
+}
+
+int is_device_set_failure_deadline(struct is_device *device, const char *buf,
+				   size_t count)
+{
+	u32 deadline_ms;
+	int ret;
+
+	ret = kstrtou32(buf, 0, &deadline_ms);
+	if (ret)
+		return ret;
+	if (deadline_ms < IS_PROTOCOL_FAILURE_DEADLINE_MIN_MS ||
+	    deadline_ms > IS_PROTOCOL_FAILURE_DEADLINE_MAX_MS)
+		return -ERANGE;
+
+	mutex_lock(&device->lifecycle_lock);
+	if (!is_device_configurable(device))
+		ret = -EBUSY;
+	else {
+		device->provider_failure_deadline_ms = deadline_ms;
+		ret = 0;
+	}
+	mutex_unlock(&device->lifecycle_lock);
+	return ret;
+}
+
+static bool is_runtime_identifier_valid(const char *value)
+{
+	const unsigned char *cursor = (const unsigned char *)value;
+
+	if (!value[0] || !isalnum((unsigned char)value[0]) ||
+	    strnlen(value, IS_PROTOCOL_CONSUMER_ID_MAX + 1U) >
+		    IS_PROTOCOL_CONSUMER_ID_MAX)
+		return false;
+	for (; *cursor; cursor++) {
+		if (!isalnum(*cursor) && *cursor != '.' && *cursor != '_' &&
+		    *cursor != '-')
+			return false;
+	}
+	return true;
+}
+
+int is_device_set_consumer_id(struct is_device *device, const char *buf,
+			      size_t count)
+{
+	char *candidate;
+	char *consumer_id;
+	int ret = 0;
+
+	if (!count || count >= IS_CONSUMER_ID_SIZE)
+		return -ENAMETOOLONG;
+	candidate = kstrndup(buf, count, GFP_KERNEL);
+	if (!candidate)
+		return -ENOMEM;
+	consumer_id = strim(candidate);
+	if (!is_runtime_identifier_valid(consumer_id)) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	mutex_lock(&device->lifecycle_lock);
+	if (!is_device_configurable(device))
+		ret = -EBUSY;
+	else
+		strscpy(device->consumer_id, consumer_id,
+			sizeof(device->consumer_id));
+	mutex_unlock(&device->lifecycle_lock);
+out:
+	kfree(candidate);
+	return ret;
+}
+
+static bool is_provider_list_valid(char *providers)
+{
+	char *cursor = providers;
+	char *provider;
+
+	while ((provider = strsep(&cursor, ",")) != NULL) {
+		if (!is_runtime_identifier_valid(provider))
+			return false;
+	}
+	return true;
+}
+
+int is_device_set_providers(struct is_device *device, const char *buf,
+			    size_t count)
+{
+	char *candidate;
+	char *providers;
+	char *validation_copy;
+	int ret = 0;
+
+	if (!count || count >= IS_PROVIDER_LIST_SIZE)
+		return -ENAMETOOLONG;
+	candidate = kstrndup(buf, count, GFP_KERNEL);
+	if (!candidate)
+		return -ENOMEM;
+	providers = strim(candidate);
+	validation_copy = kstrdup(providers, GFP_KERNEL);
+	if (!validation_copy) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	if (!is_provider_list_valid(validation_copy)) {
+		ret = -EINVAL;
+		goto free_validation;
+	}
+
+	mutex_lock(&device->lifecycle_lock);
+	if (!is_device_configurable(device))
+		ret = -EBUSY;
+	else
+		strscpy(device->providers, providers, sizeof(device->providers));
+	mutex_unlock(&device->lifecycle_lock);
+
+free_validation:
+	kfree(validation_copy);
+out:
+	kfree(candidate);
+	return ret;
+}
+
+int is_device_set_swap_priority(struct is_device *device, const char *buf,
+				size_t count)
+{
+	int priority;
+	int ret;
+
+	ret = kstrtoint(buf, 0, &priority);
+	if (ret)
+		return ret;
+	if (priority < 0 || priority > 32767)
+		return -ERANGE;
+
+	mutex_lock(&device->lifecycle_lock);
+	if (!is_device_configurable(device))
+		ret = -EBUSY;
+	else {
+		device->swap_priority = priority;
+		ret = 0;
+	}
 	mutex_unlock(&device->lifecycle_lock);
 	return ret;
 }
@@ -544,7 +734,9 @@ int is_device_activate(struct is_device *device)
 		goto out;
 	}
 	if (device->mode != IS_DEVICE_MODE_BACKED ||
-	    !device->backing_path[0] || !device->capacity_sectors) {
+	    !device->backing_path[0] || !device->capacity_sectors ||
+	    !device->consumer_id[0] || !device->providers[0] ||
+	    device->swap_priority < 0) {
 		ret = -EINVAL;
 		goto out;
 	}

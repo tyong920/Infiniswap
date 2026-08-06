@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 1 || ( $1 != "bd" && $1 != "daemon" ) ]]; then
-  echo "Usage: $0 {bd|daemon}" >&2
+if [[ $# -ne 1 || ( $1 != "bd" && $1 != "daemon" && $1 != "ctl" ) ]]; then
+  echo "Usage: $0 {bd|daemon|ctl}" >&2
   exit 2
 fi
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/.." && pwd)
-
 rdma_root=${INFINISWAP_RDMA_ROOT:-}
 
 if [[ $1 == "bd" ]]; then
@@ -20,7 +19,7 @@ if [[ $1 == "bd" ]]; then
 
   make -C "$repo_root/infiniswap_bd" "${module_args[@]}" modules
   sudo make -C "$repo_root/infiniswap_bd" "${module_args[@]}" install
-else
+elif [[ $1 == "daemon" ]]; then
   build_dir=${BUILD_DIR:-$repo_root/build/daemon}
   cmake_args=(
     -S "$repo_root/infiniswap_daemon"
@@ -31,4 +30,22 @@ else
   cmake "${cmake_args[@]}"
   cmake --build "$build_dir"
   ctest --test-dir "$build_dir" --output-on-failure
+else
+  prefix=${PREFIX:-/usr/local}
+  package_root=$prefix/lib/infiniswap/infiniswapctl
+  share_root=$prefix/share/infiniswap
+  sudo install -d "$prefix/sbin" "$package_root" "$share_root"
+  sudo install -m 0755 "$repo_root/bin/infiniswapctl" \
+    "$prefix/sbin/infiniswapctl"
+  sudo install -m 0644 \
+    "$repo_root/infiniswapctl/__init__.py" \
+    "$repo_root/infiniswapctl/__main__.py" \
+    "$repo_root/infiniswapctl/cli.py" \
+    "$repo_root/infiniswapctl/config.py" \
+    "$repo_root/infiniswapctl/system.py" \
+    "$package_root/"
+  sudo install -m 0644 \
+    "$repo_root"/config/*.schema.json \
+    "$repo_root"/config/*.example.json \
+    "$share_root/"
 fi

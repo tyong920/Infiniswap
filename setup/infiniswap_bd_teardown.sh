@@ -1,30 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-  echo "run as root" >&2
+if [[ $# -lt 1 || ( $1 != disable && $1 != drain && $1 != destroy ) ]]; then
+  echo "Usage: $0 {disable|drain|destroy} [--dry-run]" >&2
   exit 2
 fi
 
+action=$1
+shift
 name=${DEVICE_NAME:-infiniswap0}
-root=/sys/kernel/config/infiniswap
-group=$root/$name
-
-if [[ ! $name =~ ^[[:alnum:]][[:alnum:]_-]*$ || ${#name} -ge 32 ]]; then
-  echo "DEVICE_NAME must be 1-31 alphanumeric, '-' or '_' characters" >&2
-  exit 2
-fi
-
-if [[ ! -d $group ]]; then
-  echo "device configuration does not exist: $group" >&2
-  exit 1
-fi
-
-# stop refuses active users, so callers must first close the device or disable
-# this specific device as swap themselves.
-printf 'stop\n' > "$group/state"
-rmdir "$group"
-
-if ! find "$root" -mindepth 1 -maxdepth 1 -type d -print -quit | grep -q .; then
-  modprobe -r infiniswap
-fi
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd -- "$script_dir/.." && pwd)
+exec "$repo_root/bin/infiniswapctl" "$action" "$name" "$@"

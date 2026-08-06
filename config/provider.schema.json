@@ -1,0 +1,161 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/tyong920/Infiniswap/config/provider.schema.json",
+  "title": "Infiniswap Memory Provider Configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "identity",
+    "listen",
+    "rdma_rail",
+    "pools",
+    "consumers"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "identity": {"$ref": "#/definitions/provider_identity"},
+    "listen": {"$ref": "#/definitions/listen"},
+    "rdma_rail": {"$ref": "#/definitions/rdma_rail"},
+    "pools": {"$ref": "#/definitions/pools"},
+    "consumers": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 64,
+      "propertyNames": {"$ref": "#/definitions/identifier"},
+      "additionalProperties": {"$ref": "#/definitions/consumer"}
+    }
+  },
+  "definitions": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 63,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "absolute_path": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 4096,
+      "pattern": "^/"
+    },
+    "key_identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 31,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "provider_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider_id"],
+      "properties": {
+        "provider_id": {"$ref": "#/definitions/identifier"}
+      }
+    },
+    "listen": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["address", "port"],
+      "properties": {
+        "address": {"type": "string", "minLength": 1, "maxLength": 253},
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+      }
+    },
+    "rdma_rail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device", "port", "numa_node"],
+      "properties": {
+        "device": {"$ref": "#/definitions/identifier"},
+        "port": {"type": "integer", "minimum": 1, "maximum": 255},
+        "numa_node": {"type": "integer", "minimum": 0, "maximum": 65535}
+      }
+    },
+    "pools": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "host_reserve_gib",
+        "max_opportunistic_gib",
+        "max_committed_gib"
+      ],
+      "properties": {
+        "host_reserve_gib": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "max_opportunistic_gib": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 128
+        },
+        "max_committed_gib": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 128
+        }
+      }
+    },
+    "quota": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_connections",
+        "max_opportunistic_gib",
+        "max_committed_gib"
+      ],
+      "properties": {
+        "max_connections": {"type": "integer", "minimum": 1, "maximum": 64},
+        "max_opportunistic_gib": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 128
+        },
+        "max_committed_gib": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 128
+        }
+      }
+    },
+    "key": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key_id", "psk_file"],
+      "properties": {
+        "key_id": {"$ref": "#/definitions/key_identifier"},
+        "psk_file": {"$ref": "#/definitions/absolute_path"}
+      }
+    },
+    "next_key": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key_id", "psk_file", "valid_until_unix"],
+      "properties": {
+        "key_id": {"$ref": "#/definitions/key_identifier"},
+        "psk_file": {"$ref": "#/definitions/absolute_path"},
+        "valid_until_unix": {"type": "integer", "minimum": 1}
+      }
+    },
+    "authentication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["current"],
+      "properties": {
+        "current": {"$ref": "#/definitions/key"},
+        "next": {"$ref": "#/definitions/next_key"}
+      }
+    },
+    "consumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["quota", "authentication"],
+      "properties": {
+        "quota": {"$ref": "#/definitions/quota"},
+        "authentication": {"$ref": "#/definitions/authentication"}
+      }
+    }
+  }
+}

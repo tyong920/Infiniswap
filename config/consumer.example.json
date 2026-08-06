@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "identity": {
+    "consumer_id": "consumer-a"
+  },
+  "device": {
+    "name": "infiniswap0",
+    "mode": "backed",
+    "acknowledgement_policy": "strict",
+    "backing_store": "/dev/disk/by-id/infiniswap-backing",
+    "capacity_bytes": 68719476736,
+    "provider_failure_deadline_ms": 2000,
+    "provider_directory": "/etc/infiniswap/provider-directory.json",
+    "providers": [
+      "provider-a"
+    ],
+    "swap_priority": 100
+  }
+}

@@ -124,12 +124,27 @@ changed keys or limits is disconnected during reload. Malformed reloads leave
 the active allowlist unchanged. Error strings and protocol error frames contain
 no PSKs or authentication tags.
 
-The versioned static Provider Directory schema and an example live at
-`config/provider-directory.schema.json` and
-`config/provider-directory.example.json`. Entries identify one RDMA Rail,
-expected capabilities, authentication key/file mapping, and placement weight per
-allowlisted Memory Provider; PSK values do not belong in the Provider Directory
-and remain in mode-0600 files.
+The versioned configuration contracts and examples live under `config/`:
+
+- `consumer.schema.json` defines identity, mode, acknowledgement policy,
+  Backing Store, capacity, Provider Failure Deadline, trusted Providers, and
+  explicit swap priority.
+- `provider.schema.json` defines Provider identity, listen address, RDMA Rail,
+  Host Reserve, Opportunistic and Committed Pool maxima, per-Consumer quotas,
+  and current/next PSK file references.
+- `provider-directory.schema.json` defines the static allowlisted Provider
+  Directory and its expected capabilities and placement weights.
+- `status.schema.json` defines the stable, secret-free JSON status contract.
+
+PSK values never belong in JSON. Each referenced PSK must be a non-symlink
+regular file owned by root with mode 0600. Validate a Provider configuration on
+its intended host so `infiniswapctl` can also verify the configured RDMA device,
+port, and NUMA node:
+
+```bash
+sudo bin/infiniswapctl validate provider \
+  --config /etc/infiniswap/provider.json
+```
 
 ## Build the Memory Consumer
 
@@ -186,58 +201,70 @@ make -C infiniswap_bd KDIR="$KDIR" \
 Kernel API differences are selected from capabilities present in the target
 headers, not from broad kernel-version conditionals.
 
-### Backed Mode Device
+### Control the Memory Consumer
 
-The module uses configfs as its lifecycle seam. Device creation, activation,
-swap formatting, and swap activation are separate operations. The module never
-runs `mkswap`, `swapon`, or `swapoff`.
+Configfs remains the kernel object-lifecycle seam, but administrators use
+`infiniswapctl` rather than writing its attributes directly. The CLI validates
+the complete Consumer configuration, Provider Directory, Backing Store, PSK
+permissions, capabilities, mode/policy combination, capacity, deadline, and
+swap priority before loading the module or creating a configfs object.
+Mutations require root; dry runs do not mutate the host.
 
-Load the module, create an inactive configuration, and activate it only after
-selecting a dedicated block device, partition, or LVM logical volume:
+Copy `config/consumer.example.json` and
+`config/provider-directory.example.json` into `/etc/infiniswap`, then adjust the
+identity, dedicated Backing Store, Providers, and key paths. Remote-Only Mode is
+represented in the versioned schema but remains rejected until the Remote-Only
+milestone is implemented.
 
-```bash
-sudo modprobe configfs
-mountpoint -q /sys/kernel/config || \
-  sudo mount -t configfs none /sys/kernel/config
-sudo insmod infiniswap_bd/infiniswap.ko
-
-sudo mkdir /sys/kernel/config/infiniswap/infiniswap0
-echo backed | \
-  sudo tee /sys/kernel/config/infiniswap/infiniswap0/mode
-echo /dev/vdb | \
-  sudo tee /sys/kernel/config/infiniswap/infiniswap0/backing_store
-echo $((64 * 1024 * 1024 * 1024)) | \
-  sudo tee /sys/kernel/config/infiniswap/infiniswap0/capacity_bytes
-echo activate | \
-  sudo tee /sys/kernel/config/infiniswap/infiniswap0/state
-cat /sys/kernel/config/infiniswap/infiniswap0/state
-```
-
-`mode` explicitly selects Backed Mode and cannot change while the device is
-active. `backing_store` rejects regular files, loop devices, read-only devices,
-and Infiniswap devices. Activation opens the Backing Store exclusively and
-rejects capacities larger than it or misaligned to its logical block size before
-`/dev/infiniswap0` is exposed. The device mirrors the Backing Store's write-cache
-and FUA capabilities and forwards flushes. Discard and write-zeroes are not
-advertised and are rejected if sent.
-
-Close every user and disable this specific device as swap, if an administrator
-enabled it separately, before draining and stopping it:
+Review the create preflight, then create and activate only that configured
+Infiniswap Device:
 
 ```bash
-echo drain | \
-  sudo tee /sys/kernel/config/infiniswap/infiniswap0/state
-echo stop | \
-  sudo tee /sys/kernel/config/infiniswap/infiniswap0/state
-sudo rmdir /sys/kernel/config/infiniswap/infiniswap0
-sudo modprobe -r infiniswap
+bin/infiniswapctl create \
+  --config /etc/infiniswap/consumer.json --dry-run
+sudo bin/infiniswapctl create \
+  --config /etc/infiniswap/consumer.json
 ```
 
-`drain` removes the block device from userspace and waits for every accepted
-request to complete. It returns `EBUSY` while the device has open users. `stop`
-releases its queue, minor, and exclusive Backing Store holder. An active or
-drained configfs item is pinned until `stop` succeeds, so it cannot be destroyed
-out from under in-flight I/O.
+Creation does not format or enable swap. Formatting is separately preflighted
+and requires explicit destructive confirmation; enabling swap requires an
+explicit priority:
+
+```bash
+bin/infiniswapctl format infiniswap0 --dry-run
+sudo bin/infiniswapctl format infiniswap0 --yes
+bin/infiniswapctl enable infiniswap0 --priority 100 --dry-run
+sudo bin/infiniswapctl enable infiniswap0 --priority 100
+```
+
+Human-readable status is the default. `--json` emits deterministic schema
+version 1 data covering lifecycle, mode, policy, swap state, Provider
+connections, local/remote capacity, and the last kernel control error. It never
+includes key identifiers, PSK paths, PSKs, or authentication tags:
+
+```bash
+bin/infiniswapctl status infiniswap0
+bin/infiniswapctl status infiniswap0 --json
+```
+
+Disable, drain, and destroy remain separate commands. Each supports `--dry-run`
+and targets only the named Infiniswap Device; no command disables or
+reprioritizes unrelated swap:
+
+```bash
+sudo bin/infiniswapctl disable infiniswap0
+sudo bin/infiniswapctl drain infiniswap0
+sudo bin/infiniswapctl destroy infiniswap0
+```
+
+The acknowledgement policy and Provider Failure Deadline are immutable while a
+device is online. `drain` removes its block device from userspace and waits for
+every accepted request to complete. It refuses an enabled swap device, while
+`destroy` refuses an active device, making the required ordering explicit.
+The Backing Store rejects regular files, loop devices, read-only devices, and
+Infiniswap devices. Activation opens it exclusively and rejects capacities
+larger than it or misaligned to its logical block size before exposing
+`/dev/infiniswap0`.
 
 For destructive verification in a disposable VM with a spare non-loop block
 device, install `fio` and run:
@@ -257,12 +284,15 @@ Backing Store.
 
 `setup/install.sh bd` only builds and installs the module. It does not load the
 module, create an Infiniswap Device, format swap, or alter active swap.
+`setup/install.sh ctl` installs the Python CLI and versioned schemas below
+`PREFIX` (default `/usr/local`).
 
 ## Continuous Integration
 
 `.github/workflows/build.yml` runs the Linux 5.15 and 6.8 module compile matrix,
 builds the Memory Provider with warnings as errors on Ubuntu 22.04 and 24.04,
-and runs the daemon tests.
+validates every JSON schema/example and the status compatibility snapshot, and
+runs the Provider and `infiniswapctl` tests.
 
 ## Research Background
 

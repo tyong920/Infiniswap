@@ -62,18 +62,37 @@ jobs:
             -o "${{ runner.temp }}/protocol-test-s390x"
           qemu-s390x "${{ runner.temp }}/protocol-test-s390x"
 
-      - name: Test Provider Directory schema files
+      - name: Test configuration and status schemas
         run: |
           python3 - <<'PY'
           import json
           import jsonschema
           from pathlib import Path
 
-          schema = json.loads(Path("config/provider-directory.schema.json").read_text())
-          example = json.loads(Path("config/provider-directory.example.json").read_text())
+          config = Path("config")
+          pairs = (
+              ("consumer.schema.json", "consumer.example.json"),
+              ("provider.schema.json", "provider.example.json"),
+              ("provider-directory.schema.json", "provider-directory.example.json"),
+          )
+          for schema_name, example_name in pairs:
+              schema = json.loads((config / schema_name).read_text())
+              example = json.loads((config / example_name).read_text())
+              jsonschema.Draft7Validator.check_schema(schema)
+              jsonschema.validate(example, schema)
+
+          schema = json.loads((config / "status.schema.json").read_text())
+          status = json.loads(
+              Path("infiniswapctl/tests/snapshots/status-v1.json").read_text())
           jsonschema.Draft7Validator.check_schema(schema)
-          jsonschema.validate(example, schema)
+          jsonschema.validate(status, schema)
           PY
+
+      - name: Test infiniswapctl
+        run: |
+          python3 -m compileall -q infiniswapctl
+          python3 -m unittest discover -s infiniswapctl/tests -v
+          bin/infiniswapctl --help >/dev/null
 
       - name: Test RDMA tuple discovery
         run: infiniswap_bd/tests/rdma-build-flags-test.sh
@@ -84,6 +103,7 @@ jobs:
           bash -n setup/infiniswap_bd_setup.sh
           bash -n setup/infiniswap_bd_teardown.sh
           bash -n setup/install.sh
+          python3 -m py_compile bin/infiniswapctl
 
       - name: Select GA kernel headers
         id: headers

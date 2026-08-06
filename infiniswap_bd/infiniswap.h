@@ -17,6 +17,8 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 
+#include "infiniswap_protocol.h"
+
 #ifdef INFINISWAP_HAVE_LINUX_GENHD_H
 #include <linux/genhd.h>
 #endif
@@ -25,10 +27,18 @@
 #define IS_QUEUE_DEPTH 128
 #define IS_BIO_POOL_SIZE 256
 #define IS_SECTOR_SIZE 512U
+#define IS_CONSUMER_ID_SIZE (IS_PROTOCOL_CONSUMER_ID_MAX + 1U)
+#define IS_PROVIDER_LIST_SIZE 4096U
 
 enum is_device_mode {
 	IS_DEVICE_MODE_UNSET = 0,
 	IS_DEVICE_MODE_BACKED,
+};
+
+enum is_acknowledgement_policy {
+	IS_ACKNOWLEDGEMENT_POLICY_UNSET = 0,
+	IS_ACKNOWLEDGEMENT_POLICY_STRICT,
+	IS_ACKNOWLEDGEMENT_POLICY_REMOTE_FIRST,
 };
 
 enum is_device_state {
@@ -45,6 +55,7 @@ struct is_device {
 	struct mutex lifecycle_lock;
 	spinlock_t io_lock;
 	enum is_device_mode mode;
+	enum is_acknowledgement_policy acknowledgement_policy;
 	enum is_device_state state;
 	bool accepting_opens;
 	bool accepting_io;
@@ -54,7 +65,13 @@ struct is_device {
 	bool bioset_initialized;
 	char name[DISK_NAME_LEN];
 	char backing_path[PATH_MAX];
+	char consumer_id[IS_CONSUMER_ID_SIZE];
+	char providers[IS_PROVIDER_LIST_SIZE];
+	u32 provider_failure_deadline_ms;
+	int swap_priority;
+	int last_error;
 	u64 capacity_bytes;
+	u64 remote_capacity_bytes;
 	sector_t capacity_sectors;
 	int minor;
 	atomic_t openers;
@@ -89,6 +106,17 @@ void is_configfs_unregister(void);
 void is_device_init(struct is_device *device, const char *name);
 const char *is_device_mode_name(struct is_device *device);
 int is_device_set_mode(struct is_device *device, const char *buf, size_t count);
+const char *is_device_acknowledgement_policy_name(struct is_device *device);
+int is_device_set_acknowledgement_policy(struct is_device *device,
+					 const char *buf, size_t count);
+int is_device_set_failure_deadline(struct is_device *device, const char *buf,
+				   size_t count);
+int is_device_set_consumer_id(struct is_device *device, const char *buf,
+			      size_t count);
+int is_device_set_providers(struct is_device *device, const char *buf,
+			    size_t count);
+int is_device_set_swap_priority(struct is_device *device, const char *buf,
+				size_t count);
 const char *is_device_state_name(struct is_device *device);
 int is_device_set_backing_store(struct is_device *device, const char *buf,
 				size_t count);

@@ -69,8 +69,13 @@ target_link_libraries(infiniswap-daemon PRIVATE infiniswap-provider-core)
 install(TARGETS infiniswap-daemon RUNTIME DESTINATION sbin)
 install(
   FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/../config/consumer.schema.json
+    ${CMAKE_CURRENT_SOURCE_DIR}/../config/consumer.example.json
+    ${CMAKE_CURRENT_SOURCE_DIR}/../config/provider.schema.json
+    ${CMAKE_CURRENT_SOURCE_DIR}/../config/provider.example.json
     ${CMAKE_CURRENT_SOURCE_DIR}/../config/provider-directory.schema.json
     ${CMAKE_CURRENT_SOURCE_DIR}/../config/provider-directory.example.json
+    ${CMAKE_CURRENT_SOURCE_DIR}/../config/status.schema.json
     ${CMAKE_CURRENT_SOURCE_DIR}/../config/provider-memory.example.conf
   DESTINATION share/infiniswap)
 

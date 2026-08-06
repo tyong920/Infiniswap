@@ -1,0 +1,122 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/tyong920/Infiniswap/config/status.schema.json",
+  "title": "Infiniswap Device Status",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "device",
+    "connection",
+    "capacity",
+    "last_error"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "infiniswap.device-status"},
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "path",
+        "lifecycle",
+        "mode",
+        "acknowledgement_policy",
+        "provider_failure_deadline_ms",
+        "swap"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 31,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+        },
+        "path": {"type": "string", "pattern": "^/dev/"},
+        "lifecycle": {
+          "enum": ["created", "active", "draining", "drained", "stopped"]
+        },
+        "mode": {"enum": ["backed", "remote-only", "unset"]},
+        "acknowledgement_policy": {
+          "enum": ["strict", "remote-first", "unset"]
+        },
+        "provider_failure_deadline_ms": {
+          "type": "integer",
+          "minimum": 500,
+          "maximum": 30000
+        },
+        "swap": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["configured_priority", "enabled", "priority"],
+          "properties": {
+            "configured_priority": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 32767
+            },
+            "enabled": {"type": "boolean"},
+            "priority": {
+              "type": ["integer", "null"],
+              "minimum": -1,
+              "maximum": 32767
+            }
+          }
+        }
+      }
+    },
+    "connection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "total_providers", "healthy_providers", "providers"],
+      "properties": {
+        "state": {
+          "enum": ["not-connected", "connecting", "connected", "degraded", "remote-lost"]
+        },
+        "total_providers": {"type": "integer", "minimum": 0, "maximum": 64},
+        "healthy_providers": {"type": "integer", "minimum": 0, "maximum": 64},
+        "providers": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["provider_id", "state"],
+            "properties": {
+              "provider_id": {"type": "string", "minLength": 1, "maxLength": 63},
+              "state": {
+                "enum": ["not-connected", "connecting", "connected", "degraded", "remote-lost"]
+              }
+            }
+          }
+        }
+      }
+    },
+    "capacity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["advertised_bytes", "backing_bytes", "remote_bytes"],
+      "properties": {
+        "advertised_bytes": {"type": "integer", "minimum": 0},
+        "backing_bytes": {"type": "integer", "minimum": 0},
+        "remote_bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "last_error": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "errno"],
+          "properties": {
+            "code": {"type": "string", "pattern": "^E[A-Z0-9_]+$"},
+            "errno": {"type": "integer", "minimum": 1}
+          }
+        }
+      ]
+    }
+  }
+}

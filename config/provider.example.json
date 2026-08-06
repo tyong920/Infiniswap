@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "identity": {
+    "provider_id": "provider-a"
+  },
+  "listen": {
+    "address": "::",
+    "port": 9400
+  },
+  "rdma_rail": {
+    "device": "mlx5_ib2",
+    "port": 1,
+    "numa_node": 0
+  },
+  "pools": {
+    "host_reserve_gib": 8,
+    "max_opportunistic_gib": 24,
+    "max_committed_gib": 8
+  },
+  "consumers": {
+    "consumer-a": {
+      "quota": {
+        "max_connections": 1,
+        "max_opportunistic_gib": 24,
+        "max_committed_gib": 8
+      },
+      "authentication": {
+        "current": {
+          "key_id": "key-2025-01",
+          "psk_file": "/etc/infiniswap/keys/consumer-a.psk"
+        }
+      }
+    }
+  }
+}
