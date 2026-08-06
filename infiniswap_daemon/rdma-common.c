@@ -7,9 +7,10 @@
 
 #include <errno.h>
 #include <openssl/rand.h>
+#include <signal.h>
 #include <time.h>
 
-extern int running;
+extern volatile sig_atomic_t running;
 
 static void build_context(struct ibv_context *verbs);
 static void build_qp_attr(struct ibv_qp_init_attr *qp_attr);
@@ -372,6 +373,37 @@ void rdma_session_init(struct rdma_session *provider_session,
   provider_session->memory_manager = memory_manager;
   for (index = 0; index < MAX_CLIENT; index++)
     provider_session->conns_state[index] = CONN_IDLE;
+}
+
+int provider_connection_count(void)
+{
+  int count;
+
+  pthread_mutex_lock(&session_lock);
+  count = session.conn_num;
+  pthread_mutex_unlock(&session_lock);
+  return count;
+}
+
+void disconnect_provider_connections(void)
+{
+  struct connection *connections[MAX_CLIENT] = {0};
+  int count = 0;
+  int index;
+
+  pthread_mutex_lock(&session_lock);
+  for (index = 0; index < MAX_CLIENT; index++) {
+    struct connection *conn = session.conns[index];
+
+    if (!conn || connection_get_reference(conn) != 0)
+      continue;
+    connections[count++] = conn;
+  }
+  pthread_mutex_unlock(&session_lock);
+  for (index = 0; index < count; index++) {
+    (void)rdma_disconnect(connections[index]->id);
+    connection_put_reference(connections[index]);
+  }
 }
 
 static int compare_activity(const void *left, const void *right)

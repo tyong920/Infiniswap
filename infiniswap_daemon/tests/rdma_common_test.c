@@ -1,10 +1,11 @@
 #include "rdma-common.h"
 
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
-int running;
+volatile sig_atomic_t running;
 
 static int test_connection_params(void)
 {

@@ -205,6 +205,8 @@ void send_evict(void *context, int n);
 void send_free_mem_size(void *context);
 void rdma_session_init(struct rdma_session *provider_session,
                        struct is_memory_manager *memory_manager);
+int provider_connection_count(void);
+void disconnect_provider_connections(void);
 void *free_mem(void *data);
 
 #endif /* RDMA_COMMON_H */

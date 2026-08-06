@@ -12,7 +12,10 @@ static int on_connect_request(struct rdma_cm_id *id);
 static int on_connection(struct rdma_cm_id *id);
 static int on_disconnect(struct rdma_cm_id *id);
 static int on_event(struct rdma_cm_event *event);
+static void request_shutdown(int signal_number);
 static void usage(const char *argv0);
+
+volatile sig_atomic_t running;
 
 struct allowlist_reloader {
   struct is_auth_registry *registry;
@@ -27,7 +30,9 @@ static void *reload_allowlist(void *context)
 
   sigemptyset(&signals);
   sigaddset(&signals, SIGHUP);
-  while (sigwait(&signals, &signal_number) == 0) {
+  while (running && sigwait(&signals, &signal_number) == 0) {
+    if (!running)
+      break;
     if (signal_number != SIGHUP)
       continue;
     if (is_auth_registry_load_file(reloader->registry, reloader->path) ==
@@ -39,7 +44,12 @@ static void *reload_allowlist(void *context)
   return NULL;
 }
 
-int running;
+static void request_shutdown(int signal_number)
+{
+  (void)signal_number;
+  running = 0;
+}
+
 int main(int argc, char **argv)
 {
   struct sockaddr_in6 addr;
@@ -52,10 +62,12 @@ int main(int argc, char **argv)
   struct is_memory_allocation_adapter memory_allocation;
   struct is_memory_manager *memory_manager;
   struct allowlist_reloader reloader;
+  struct sigaction shutdown_action;
   sigset_t blocked_signals;
   pthread_t reload_thread;
   uint16_t port = 0;
   pthread_t free_mem_thread;
+  int orderly_shutdown;
 
   if (argc != 5)
     usage(argv[0]);
@@ -75,6 +87,12 @@ int main(int argc, char **argv)
   sigemptyset(&blocked_signals);
   sigaddset(&blocked_signals, SIGHUP);
   TEST_NZ(pthread_sigmask(SIG_BLOCK, &blocked_signals, NULL));
+  memset(&shutdown_action, 0, sizeof(shutdown_action));
+  shutdown_action.sa_handler = request_shutdown;
+  sigemptyset(&shutdown_action.sa_mask);
+  TEST_NZ(sigaction(SIGINT, &shutdown_action, NULL));
+  TEST_NZ(sigaction(SIGTERM, &shutdown_action, NULL));
+  running = 1;
   is_auth_registry_init(&auth_registry);
   if (is_auth_registry_load_file(&auth_registry, argv[4]) != IS_AUTH_OK) {
     fprintf(stderr, "could not load the Memory Consumer allowlist\n");
@@ -101,11 +119,10 @@ int main(int argc, char **argv)
 
   printf("listening on port %d.\n", port);
 
-  running = 1;
   rdma_session_init(&session, memory_manager);
   TEST_NZ(pthread_create(&free_mem_thread, NULL, free_mem, &session));
 
-  while (rdma_get_cm_event(ec, &event) == 0) {
+  while (running && rdma_get_cm_event(ec, &event) == 0) {
     struct rdma_cm_event event_copy;
 
     memcpy(&event_copy, event, sizeof(*event));
@@ -115,9 +132,39 @@ int main(int argc, char **argv)
       break;
   }
 
+  orderly_shutdown = !running;
+  if (!orderly_shutdown)
+    fprintf(stderr, "RDMA event loop terminated unexpectedly\n");
   running = 0;
-  fprintf(stderr, "RDMA event loop terminated unexpectedly\n");
-  exit(EXIT_FAILURE);
+  if (listener) {
+    (void)rdma_destroy_id(listener);
+    listener = NULL;
+  }
+  disconnect_provider_connections();
+  while (provider_connection_count() != 0 &&
+         rdma_get_cm_event(ec, &event) == 0) {
+    struct rdma_cm_event event_copy;
+
+    memcpy(&event_copy, event, sizeof(*event));
+    rdma_ack_cm_event(event);
+    (void)on_event(&event_copy);
+    disconnect_provider_connections();
+  }
+  TEST_NZ(pthread_join(free_mem_thread, NULL));
+  TEST_NZ(pthread_kill(reload_thread, SIGHUP));
+  TEST_NZ(pthread_join(reload_thread, NULL));
+  if (provider_connection_count() != 0) {
+    fprintf(stderr, "could not drain Provider connections during shutdown\n");
+    return 1;
+  }
+  rdma_destroy_event_channel(ec);
+  if (is_memory_manager_destroy(memory_manager) != IS_MEMORY_OK) {
+    fprintf(stderr, "could not release Provider memory pools\n");
+    is_auth_registry_destroy(&auth_registry);
+    return 1;
+  }
+  is_auth_registry_destroy(&auth_registry);
+  return orderly_shutdown ? 0 : 1;
 }
 
 int on_connect_request(struct rdma_cm_id *id)
@@ -125,6 +172,11 @@ int on_connect_request(struct rdma_cm_id *id)
   struct rdma_conn_param cm_params;
 
   printf("received connection request.\n");
+  if (!running) {
+    (void)rdma_reject(id, NULL, 0);
+    rdma_destroy_id(id);
+    return 0;
+  }
   if (build_connection(id) != 0) {
     (void)rdma_reject(id, NULL, 0);
     rdma_destroy_id(id);

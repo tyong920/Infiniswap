@@ -114,7 +114,9 @@ build/daemon/infiniswap-daemon :: 9400 \
   /etc/infiniswap/consumers.conf
 ```
 
-Reload the allowlist with `SIGHUP`. `next_valid_until_unix` must be in the
+Reload the allowlist with `SIGHUP`. Stop the Provider with `SIGINT` or
+`SIGTERM`; it stops listening, disconnects active Consumers, and deregisters and
+frees every Remote Chunk before exit. `next_valid_until_unix` must be in the
 future and no more than 30 days from load time. Authentication must complete
 within five seconds. A next-key session is disconnected when its overlap
 expires; a Consumer removed from the file, changed to `revoked = true`, or given
