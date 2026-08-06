@@ -301,8 +301,6 @@ static void is_submit_to_backing_store(struct is_device *device,
 	struct bio *source;
 	blk_status_t status = BLK_STS_OK;
 
-	ctx->device = device;
-	ctx->request = request;
 	atomic_set(&ctx->status, BLK_STS_OK);
 	/* The sentinel keeps the request alive while clones are submitted. */
 	atomic_set(&ctx->pending_bios, 1);
@@ -346,11 +344,25 @@ static void is_issue_flush(struct is_device *device, struct request *request)
 	is_complete_accepted_request(device, request, status);
 }
 
+static void is_dispatch_backing_work(struct work_struct *work)
+{
+	struct is_request_ctx *ctx = container_of(work, struct is_request_ctx,
+						  work);
+	struct is_device *device = ctx->device;
+	struct request *request = ctx->request;
+
+	if (req_op(request) == REQ_OP_FLUSH)
+		is_issue_flush(device, request);
+	else
+		is_submit_to_backing_store(device, request);
+}
+
 static blk_status_t is_queue_rq(struct blk_mq_hw_ctx *hctx,
 				const struct blk_mq_queue_data *bd)
 {
 	struct is_device *device = hctx->driver_data;
 	struct request *request = bd->rq;
+	struct is_request_ctx *ctx = blk_mq_rq_to_pdu(request);
 
 	blk_mq_start_request(request);
 	if (req_op(request) != REQ_OP_READ &&
@@ -364,11 +376,24 @@ static blk_status_t is_queue_rq(struct blk_mq_hw_ctx *hctx,
 		return BLK_STS_OK;
 	}
 
-	if (req_op(request) == REQ_OP_FLUSH)
-		is_issue_flush(device, request);
-	else
-		is_submit_to_backing_store(device, request);
+	/*
+	 * Ordered dispatch keeps backing bios out of the caller's blk_plug and
+	 * submits every write before a later flush reaches the Backing Store.
+	 */
+	ctx->device = device;
+	ctx->request = request;
+	if (WARN_ON_ONCE(!queue_work(device->ordered_backing_wq, &ctx->work)))
+		is_complete_accepted_request(device, request, BLK_STS_IOERR);
 	return BLK_STS_OK;
+}
+
+static int is_init_request(struct blk_mq_tag_set *set, struct request *request,
+			   unsigned int hctx_idx, unsigned int numa_node)
+{
+	struct is_request_ctx *ctx = blk_mq_rq_to_pdu(request);
+
+	INIT_WORK(&ctx->work, is_dispatch_backing_work);
+	return 0;
 }
 
 static int is_init_hctx(struct blk_mq_hw_ctx *hctx, void *data,
@@ -380,6 +405,7 @@ static int is_init_hctx(struct blk_mq_hw_ctx *hctx, void *data,
 
 static const struct blk_mq_ops is_mq_ops = {
 	.queue_rq = is_queue_rq,
+	.init_request = is_init_request,
 	.init_hctx = is_init_hctx,
 };
 
@@ -459,11 +485,15 @@ static void is_configure_queue(struct is_device *device)
 
 static void is_release_resources(struct is_device *device)
 {
+	if (device->disk && device->disk_added) {
+		del_gendisk(device->disk);
+		device->disk_added = false;
+	}
+	if (device->ordered_backing_wq) {
+		destroy_workqueue(device->ordered_backing_wq);
+		device->ordered_backing_wq = NULL;
+	}
 	if (device->disk) {
-		if (device->disk_added) {
-			del_gendisk(device->disk);
-			device->disk_added = false;
-		}
 #ifdef INFINISWAP_HAVE_BLK_CLEANUP_DISK
 		blk_cleanup_disk(device->disk);
 #else
@@ -532,6 +562,13 @@ int is_device_activate(struct is_device *device)
 	if (ret)
 		goto release_resources;
 	device->bioset_initialized = true;
+
+	device->ordered_backing_wq = alloc_ordered_workqueue("infiniswap-io",
+							WQ_MEM_RECLAIM);
+	if (!device->ordered_backing_wq) {
+		ret = -ENOMEM;
+		goto release_resources;
+	}
 
 	device->minor = is_minor_alloc();
 	if (device->minor < 0) {

@@ -74,13 +74,27 @@ configure_group() {
   printf '%s\n' "$group_capacity" > "$group/capacity_bytes"
 }
 
+stop_device() {
+  local group=$1
+  local attempt
+
+  # udev may hold a short-lived opener while probing a newly exposed disk.
+  for ((attempt = 0; attempt < 200; attempt++)); do
+    if printf 'stop\n' > "$group/state" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.05
+  done
+  return 1
+}
+
 stop_and_remove() {
   local name=$1
   local group=$root/$name
 
   if [[ -d $group ]]; then
     if [[ -w $group/state ]]; then
-      printf 'stop\n' > "$group/state" 2>/dev/null || true
+      stop_device "$group" || true
     fi
     rmdir "$group" 2>/dev/null || true
   fi
@@ -102,7 +116,7 @@ cleanup() {
     losetup -d "$loop_device"
   fi
   if (( loaded_module )); then
-    modprobe -r infiniswap
+    rmmod infiniswap
   fi
   if (( mounted_configfs )); then
     umount "$configfs"
@@ -111,8 +125,8 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-for command in awk blockdev dd dmesg dmsetup findmnt fio grep insmod losetup \
-  lsblk modprobe mount mountpoint readlink tail timeout truncate umount; do
+for command in awk blockdev cmp dd dmesg dmsetup findmnt fio grep insmod losetup \
+  lsblk modprobe mount mountpoint readlink rmmod tail timeout truncate umount; do
   command -v "$command" >/dev/null || fail "missing command: $command"
 done
 dmesg_start=$(dmesg | wc -l)
@@ -198,7 +212,7 @@ case $dd_status in
   0) fail "write to an error Backing Store unexpectedly succeeded" ;;
   124) fail "write to an error Backing Store did not complete" ;;
 esac
-printf 'stop\n' > "$root/backing-error/state"
+stop_device "$root/backing-error" || fail "error Backing Store device stayed busy"
 wait_for_path /dev/backing-error absent
 rmdir "$root/backing-error"
 dmsetup remove "$dm_error_name"
@@ -220,7 +234,20 @@ set -e
   fail "concurrent activation did not produce exactly one owner"
 [[ $(<"$root/concurrent-activate/state") == active ]] || \
   fail "concurrent activation did not leave an active device"
-printf 'stop\n' > "$root/concurrent-activate/state"
+wait_for_path /dev/concurrent-activate present
+buffered_block=$((capacity_bytes / 2 / 4096))
+dd if=/dev/urandom of="$tmp/buffered-pattern" bs=4096 count=1 status=none
+dd if="$tmp/buffered-pattern" of=/dev/concurrent-activate bs=4096 count=1 \
+  seek="$buffered_block" oflag=direct conv=fsync status=none
+blockdev --flushbufs /dev/concurrent-activate
+if ! timeout 10 dd if=/dev/concurrent-activate of="$tmp/buffered-actual" \
+    bs=4096 count=1 skip="$buffered_block" status=none; then
+  fail "buffered read did not complete"
+fi
+cmp "$tmp/buffered-pattern" "$tmp/buffered-actual" || \
+  fail "buffered read returned incorrect data"
+stop_device "$root/concurrent-activate" || \
+  fail "concurrent activation device stayed busy"
 rmdir "$root/concurrent-activate"
 
 run_io_verification() {
@@ -252,6 +279,9 @@ run_io_verification() {
   fio --name=mixed-q32 --filename="$device" --direct=1 --ioengine=libaio \
     --rw=randrw --rwmixread=60 --bs=4k --iodepth=32 --size=48m \
     --verify=crc32c --do_verify=1 --verify_fatal=1 --group_reporting
+  fio --name=flush-order --filename="$device" --direct=1 --ioengine=libaio \
+    --rw=write --bs=4k --iodepth=32 --size=8m --fsync=16 \
+    --verify=crc32c --do_verify=1 --verify_fatal=1 --group_reporting
 
   logical_size=$(blockdev --getss "$device")
   fio --name=boundary --filename="$device" --direct=1 --ioengine=libaio \
@@ -277,13 +307,13 @@ for iteration in {1..10}; do
   configure_group "$name" "$backing" "$capacity_bytes"
   printf 'activate\n' > "$group/state"
   wait_for_path "/dev/$name" present
-  printf 'stop\n' > "$group/state"
+  stop_device "$group" || fail "$name stayed busy while stopping"
   wait_for_path "/dev/$name" absent
   rmdir "$group"
 done
 
 # With no devices, unload/reload must leave configfs and the major reusable.
-modprobe -r infiniswap
+rmmod infiniswap
 loaded_module=0
 if [[ -n $module ]]; then
   insmod "$module"

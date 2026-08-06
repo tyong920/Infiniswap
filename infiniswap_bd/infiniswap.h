@@ -15,6 +15,7 @@
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
 
 #ifdef INFINISWAP_HAVE_LINUX_GENHD_H
 #include <linux/genhd.h>
@@ -64,6 +65,7 @@ struct is_device {
 	struct bdev_handle *backing_handle;
 #endif
 	struct bio_set bio_set;
+	struct workqueue_struct *ordered_backing_wq;
 	struct blk_mq_tag_set tag_set;
 	struct gendisk *disk;
 };
@@ -73,6 +75,7 @@ struct is_request_ctx {
 	struct request *request;
 	atomic_t pending_bios;
 	atomic_t status;
+	struct work_struct work;
 };
 
 extern int is_major;
