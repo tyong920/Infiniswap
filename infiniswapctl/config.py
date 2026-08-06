@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 GIB = 1024 * 1024 * 1024
+CONFIGFS_VALUE_SIZE = 4096
 FAILURE_DEADLINE_MIN_MS = 500
 FAILURE_DEADLINE_MAX_MS = 30000
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
@@ -516,6 +517,10 @@ def load_consumer(path: str, system: Any) -> ConsumerConfig:
                 % (provider_name, missing_capabilities[0])
             )
         selected.append(provider)
+
+    serialized_providers = ",".join(provider.name for provider in selected)
+    if len(serialized_providers) + 1 >= CONFIGFS_VALUE_SIZE:
+        raise ConfigError("Provider selection is too large for configfs")
 
     swap_priority = _integer(device["swap_priority"], "device.swap_priority", 0, 32767)
     return ConsumerConfig(

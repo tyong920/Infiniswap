@@ -220,6 +220,24 @@ class CliValidationTest(unittest.TestCase):
                 self.assertIn(message, stderr)
                 self.assertEqual(system.mutations, [])
 
+    def test_create_rejects_provider_selection_too_large_for_configfs(self):
+        directory = json.loads(self.provider_directory_path.read_text(encoding="utf-8"))
+        template = directory["providers"]["provider-a"]
+        provider_names = ["p%062d" % index for index in range(64)]
+        directory["providers"] = {
+            name: json.loads(json.dumps(template)) for name in provider_names
+        }
+        self.provider_directory_path.write_text(json.dumps(directory), encoding="utf-8")
+
+        result, stdout, stderr, system = self.invoke_create(
+            self.write_consumer(providers=provider_names)
+        )
+
+        self.assertEqual(result, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("Provider selection is too large for configfs", stderr)
+        self.assertEqual(system.mutations, [])
+
     def test_create_dry_run_reports_validated_plan_without_mutation(self):
         path = self.write_consumer()
 

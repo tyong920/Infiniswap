@@ -88,11 +88,13 @@ def _create(config: ConsumerConfig, system: Any, stdout: IO[str]) -> None:
         )
         for attribute, value in attributes:
             system.write_attribute(config.name, attribute, value)
-    except OSError:
+    except OSError as original_error:
         try:
             system.remove_group(config.name)
-        except OSError:
-            pass
+        except OSError as rollback_error:
+            raise OSError(
+                "%s; rollback failed: %s" % (original_error, rollback_error)
+            ) from original_error
         raise
     print("Created active Infiniswap Device " + config.name, file=stdout)
 

@@ -25,11 +25,20 @@ class LocalSystem:
             return False
 
     def is_loop_device(self, path: str) -> bool:
-        try:
-            details = os.stat(path)
-            return stat.S_ISBLK(details.st_mode) and os.major(details.st_rdev) == 7
-        except OSError:
-            return False
+        details = os.stat(path)
+        if stat.S_ISBLK(details.st_mode) and os.major(details.st_rdev) == 7:
+            return True
+        result = subprocess.run(
+            ["lsblk", "--inverse", "--noheadings", "--raw", "--output", "TYPE", path],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or "could not inspect block dependencies"
+            raise OSError("lsblk %s: %s" % (path, detail))
+        return "loop" in result.stdout.split()
 
     def stat_file(self, path: str) -> Any:
         return os.stat(path, follow_symlinks=False)
@@ -87,10 +96,7 @@ class LocalSystem:
 
     def _swaps(self) -> dict:
         swaps = {}
-        try:
-            lines = Path("/proc/swaps").read_text(encoding="utf-8").splitlines()
-        except OSError:
-            return swaps
+        lines = Path("/proc/swaps").read_text(encoding="utf-8").splitlines()
         for line in lines[1:]:
             fields = line.split()
             if len(fields) >= 5:
