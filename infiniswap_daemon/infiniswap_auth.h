@@ -37,6 +37,7 @@ struct is_auth_credential {
   struct is_auth_key current;
   struct is_auth_key next;
   uint64_t next_valid_until_unix;
+  uint32_t max_connections;
   uint32_t max_opportunistic_chunks;
   uint32_t max_committed_chunks;
   uint64_t authorization_version;
@@ -88,6 +89,7 @@ is_auth_registry_revoke(struct is_auth_registry *registry,
 enum is_auth_result
 is_auth_registry_get_limits(struct is_auth_registry *registry,
                             const char *consumer_id,
+                            uint32_t *max_connections,
                             uint32_t *max_opportunistic_chunks,
                             uint32_t *max_committed_chunks);
 

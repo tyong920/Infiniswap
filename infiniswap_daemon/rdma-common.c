@@ -9,7 +9,6 @@
 #include <openssl/rand.h>
 #include <time.h>
 
-extern long page_size;
 extern int running;
 
 static void build_context(struct ibv_context *verbs);
@@ -19,12 +18,10 @@ static void on_completion(struct ibv_wc *);
 static void * poll_cq(void *);
 static void post_receives(struct connection *conn);
 static void register_memory(struct connection *conn);
-static int deregister_remote_memory(struct ibv_mr *memory_region);
 static void send_message(struct connection *conn, int repost_receive);
 
 struct rdma_session session;
 
-char free_mem_cmd[39] = "vmstat -s | awk 'FNR == 5 {printf $1}'";
 static struct context *s_ctx = NULL;
 static struct is_auth_registry *provider_auth_registry;
 static pthread_mutex_t session_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -166,36 +163,11 @@ static void deregister_memory(struct ibv_mr *memory_region)
     die("could not deregister RDMA memory");
 }
 
-void die(const char *reason)
+_Noreturn void die(const char *reason)
 {
   fprintf(stderr, "%s\n", reason);
   exit(EXIT_FAILURE);
 }
-
-long get_free_mem(void)
-{
-  char result[60];
-  FILE *fd = fopen("/proc/meminfo", "r");
-  int i;
-  long res = 0;
-
-  if (!fd)
-    return 0;
-  if (!fgets(result, sizeof(result), fd) ||
-      !fgets(result, sizeof(result), fd)) {
-    fclose(fd);
-    return 0;
-  }
-  for (i = 0; result[i] != '\0'; i++) {
-    if (result[i] >= '0' && result[i] <= '9') {
-      res *= 10;
-      res += result[i] - '0';
-    }
-  }
-  fclose(fd);
-  return res;
-}
-
 
 int build_connection(struct rdma_cm_id *id)
 {
@@ -244,12 +216,11 @@ int build_connection(struct rdma_cm_id *id)
   TEST_NZ(pthread_condattr_setclock(&condition_attributes, CLOCK_MONOTONIC));
   TEST_NZ(pthread_cond_init(&conn->lifetime_idle, &condition_attributes));
   TEST_NZ(pthread_condattr_destroy(&condition_attributes));
-  conn->free_mem_gb = 0;
 
   sem_init(&conn->stop_sem, 0, 0);
   sem_init(&conn->evict_sem, 0, 0);
   conn->sess = &session;
-  for (i = 0; i < MAX_FREE_MEM_GB; i++){
+  for (i = 0; i < MAX_MR_SIZE_GB; i++) {
     conn->sess_chunk_map[i] = -1;
   }
   conn->mapped_chunk_size = 0;
@@ -301,7 +272,8 @@ void build_context(struct ibv_context *verbs)
 
   TEST_Z(s_ctx->pd = ibv_alloc_pd(s_ctx->ctx));
   TEST_Z(s_ctx->comp_channel = ibv_create_comp_channel(s_ctx->ctx));
-  TEST_Z(s_ctx->cq = ibv_create_cq(s_ctx->ctx, 10, NULL, s_ctx->comp_channel, 0)); /* cqe=10 is arbitrary */
+  TEST_Z(s_ctx->cq = ibv_create_cq(
+      s_ctx->ctx, MAX_CLIENT * 4, NULL, s_ctx->comp_channel, 0));
   TEST_NZ(ibv_req_notify_cq(s_ctx->cq, 0));
 
   TEST_NZ(pthread_create(&s_ctx->cq_poller_thread, NULL, poll_cq, NULL));
@@ -368,18 +340,16 @@ void destroy_connection(void *context)
   free(conn->pending_send_frame);
   free(conn->recv_frame);
 
-  pthread_mutex_lock(&session_lock);
-  if (release_connection_remote_chunks(
-          conn, &session, deregister_remote_memory) != 0) {
-    pthread_mutex_unlock(&session_lock);
+  if (conn->memory_connected &&
+      is_memory_manager_disconnect(session.memory_manager, conn) !=
+          IS_MEMORY_OK)
     die("could not release registered Remote Memory");
-  }
+  conn->memory_connected = 0;
+
+  pthread_mutex_lock(&session_lock);
   session.conns[conn->conn_index] = NULL;
   session.conns_state[conn->conn_index] = CONN_IDLE;
   session.conn_num -= 1;
-  if (session.conn_num == 0){
-    running = 0;
-  }
   pthread_mutex_unlock(&session_lock);
   rdma_destroy_id(conn->id);
   sem_destroy(&conn->stop_sem);
@@ -390,372 +360,159 @@ void destroy_connection(void *context)
   pthread_cond_destroy(&conn->lifetime_idle);
   pthread_mutex_destroy(&conn->lifetime_lock);
 
-  free(conn); 
+  free(conn);
 }
 
-void * get_serving_mem_region(void *context)
+void rdma_session_init(struct rdma_session *provider_session,
+                       struct is_memory_manager *memory_manager)
 {
-  return ((struct connection *)context)->rdma_remote_region;
+  int index;
+
+  memset(provider_session, 0, sizeof(*provider_session));
+  provider_session->memory_manager = memory_manager;
+  for (index = 0; index < MAX_CLIENT; index++)
+    provider_session->conns_state[index] = CONN_IDLE;
 }
 
-void rdma_session_init(struct rdma_session *sess){
-  int free_mem_g;
-  int i;
-
-  free_mem_g = (int)(get_free_mem() / ONE_MB);
-  printf("%s, get free_mem %d\n", __func__, free_mem_g);
-  for (i=0; i<MAX_FREE_MEM_GB; i++) {
-    sess->rdma_remote.conn_map[i] = -1;
-    sess->rdma_remote.conn_chunk_map[i] = -1;
-    sess->rdma_remote.malloc_map[i] = CHUNK_EMPTY;
-  }
-
-  if (free_mem_g > FREE_MEM_EXPAND_THRESHOLD){
-    free_mem_g -= (FREE_MEM_EVICT_THRESHOLD + FREE_MEM_EXPAND_THRESHOLD) / 2;
-  } else if (free_mem_g > FREE_MEM_EVICT_THRESHOLD){
-    free_mem_g  -= FREE_MEM_EVICT_THRESHOLD;
-  }else{
-    free_mem_g = 0;
-  }
-  if (free_mem_g > MAX_FREE_MEM_GB) {
-    free_mem_g = MAX_FREE_MEM_GB;
-  }
-
-  for (i=0; i < free_mem_g; i++){
-    if (posix_memalign((void **)&(sess->rdma_remote.region_list[i]),
-                       page_size, ONE_GB) != 0)
-      die("could not allocate a Remote Memory chunk");
-    memset(sess->rdma_remote.region_list[i], 0x00, ONE_GB);
-    sess->rdma_remote.malloc_map[i] = CHUNK_MALLOCED;
-  }
-  sess->rdma_remote.size_gb = free_mem_g;
-  sess->rdma_remote.mapped_size = 0;
-
-  for (i=0; i<MAX_CLIENT; i++){
-    sess->conns[i] = NULL;
-    sess->conns_state[i] = CONN_IDLE;
-  }
-  sess->conn_num = 0;
-
-  printf("%s, allocated mem %d\n", __func__, sess->rdma_remote.size_gb);
-
-}
-
-void evict_mem(int stop_g)
+static int compare_activity(const void *left, const void *right)
 {
-  int i, j, k, n, m;
-  int freed_g = 0;
-  int evict_g = stop_g;
-  struct connection *conn;
-  int avail_chunk;
-  int random_chunk_select[MAX_FREE_MEM_GB];
-  int send_list[MAX_CLIENT];
-  int reference_held[MAX_CLIENT];
-  struct connection *held_connections[MAX_CLIENT];
-  unsigned int random_num;
-  int conn_index;
-  int session_locked = 0;
-  struct chunk_activity tmp_activity;
-  int chunk_index;
+  const struct chunk_activity *left_activity = left;
+  const struct chunk_activity *right_activity = right;
 
+  if (left_activity->activity < right_activity->activity)
+    return -1;
+  if (left_activity->activity > right_activity->activity)
+    return 1;
+  return 0;
+}
 
-  srand((unsigned)time(NULL));
+static void evict_mem(uint32_t requested_chunks)
+{
+  struct connection *held_connections[MAX_CLIENT] = {0};
+  struct chunk_activity *activities = NULL;
+  uint32_t activity_count = 0;
+  uint32_t selected_count;
+  int held_count = 0;
+  int index;
 
   pthread_mutex_lock(&session_lock);
-  session_locked = 1;
-  printf("need to evict %d GB\n", evict_g);
-  //free unmapped chunk
-  for (i = 0; i < MAX_FREE_MEM_GB ;i++) {
-    if (session.rdma_remote.malloc_map[i] == CHUNK_MALLOCED && session.rdma_remote.conn_map[i] == -1){
-      free(session.rdma_remote.region_list[i]);
-      session.rdma_remote.malloc_map[i] = CHUNK_EMPTY;
-      freed_g += 1;
-      if (freed_g == evict_g){
-        session.rdma_remote.size_gb -= evict_g;
-        printf("free unmapped chunk %d\n", freed_g);
-        pthread_mutex_unlock(&session_lock);
-        return;
-      }
-    }
-  }
-  //not enough
-  session.rdma_remote.size_gb -= freed_g;
-  evict_g -= freed_g;
+  for (index = 0; index < MAX_CLIENT; index++) {
+    struct connection *conn = session.conns[index];
 
-  //get availe_conn
-  avail_chunk = MAX_FREE_MEM_GB;
-  for (i=0; i<MAX_CLIENT; i++){
-    send_list[i] = -1;
-    reference_held[i] = 0;
-    held_connections[i] = NULL;
-  }
-  for (i = 0; i < MAX_FREE_MEM_GB; i++) {
-    if (session.rdma_remote.conn_map[i] == -1) { // unmapped chunk
-      avail_chunk -= 1;
-      random_chunk_select[i] = -1; //can't select
-    }else {
-      random_chunk_select[i] = 0; //can select
-    }
-  }
-
-  if (avail_chunk != session.rdma_remote.mapped_size){
-    printf("%s, avail_chunk %d, mapped_size %d", __func__, avail_chunk, session.rdma_remote.mapped_size);
-  }
-
-  j = 0;  
-  // evict_g += EXTRA_CHUNK_NUM;
-  if (session.rdma_remote.mapped_size < (evict_g + EXTRA_CHUNK_NUM)){ //not enough
-    if (session.rdma_remote.mapped_size < evict_g){
-      evict_g = session.rdma_remote.mapped_size;
-    }
-    //send evict to all mapped cb
-    for (i=0; i<MAX_CLIENT; i++){
-      if (session.conns_state[i] == CONN_MAPPED){
-        send_list[i] = 1; 
-        j += session.conns[i]->mapped_chunk_size;
-      }
-    }  
-
-    if (session.rdma_remote.mapped_size != j){
-      printf("%s, error j %d, total mapped_size %d\n", __func__, j, session.rdma_remote.mapped_size);
-    }
-    j = evict_g;
-  }else {
-    printf(" mapped_size %d >= evict_g %d + EXTRA_CHUNK_NUM\n", session.rdma_remote.mapped_size, evict_g);
-    for (j = 0; j < (evict_g + EXTRA_CHUNK_NUM); j++){
-      random_num = rand() % MAX_FREE_MEM_GB;
-      while (random_chunk_select[random_num] != 0){ //unmapped or selected
-        random_num += 1;
-        random_num %= MAX_FREE_MEM_GB;
-      }
-      random_chunk_select[random_num] = 1;
-      send_list[session.rdma_remote.conn_map[random_num]] = 1; //send msg to this client
-    } 
-    j = evict_g;
-    printf("evict_g %d\n", evict_g);
-  } 
-  printf("%s, selected chunk is %d\n", __func__, j);
-
-  k = 0;
-  for (i=0; i< MAX_CLIENT; i++){
-    printf("i = %d ", i);
-    if (send_list[i] == 1){
-      k += session.conns[i]->mapped_chunk_size;
-      printf("k is %d\n", k);
-    }
-  }
-  printf("%s, total selected chunk is %d\n", __func__, k);
-  session.evict_list = (struct chunk_activity *)malloc(sizeof(struct chunk_activity) * k);
-
-  for (i=0; i< MAX_CLIENT; i++){
-    if (send_list[i] == 1){
-      conn = session.conns[i];
-      if (!conn || connection_get_reference(conn) != 0)
-        goto abort_evict;
-      held_connections[i] = conn;
-      reference_held[i] = 1;
-    }
+    if (!conn || session.conns_state[index] != CONN_MAPPED ||
+        conn->protocol_session.selected_pool !=
+            IS_PROTOCOL_POOL_OPPORTUNISTIC ||
+        connection_get_reference(conn) != 0)
+      continue;
+    held_connections[held_count++] = conn;
   }
   pthread_mutex_unlock(&session_lock);
-  session_locked = 0;
-  for (i = 0; i < MAX_CLIENT; i++) {
-    if (reference_held[i]) {
-      printf("%s, send evict to conn[%d]\n", __func__, i);
-      send_evict(held_connections[i], j);
+  if (held_count == 0)
+    goto out;
+
+  activities = calloc(IS_MEMORY_MAX_RUNTIME_CHUNKS,
+                      sizeof(*activities));
+  if (!activities)
+    goto out;
+  activity_count = 0;
+  for (index = 0; index < held_count; index++)
+    send_evict(held_connections[index], held_connections[index]->mapped_chunk_size);
+  for (index = 0; index < held_count; index++) {
+    struct connection *conn = held_connections[index];
+    int chunk_index;
+
+    if (wait_for_control_response(conn, &conn->evict_sem) != 0)
+      goto out;
+    for (chunk_index = 0; chunk_index < MAX_MR_SIZE_GB; chunk_index++) {
+      if (!conn->recv_message.rkey[chunk_index])
+        continue;
+      if (activity_count == IS_MEMORY_MAX_RUNTIME_CHUNKS)
+        goto out;
+      activities[activity_count].activity =
+          conn->recv_message.buf[chunk_index];
+      activities[activity_count].provider_chunk_id = (uint32_t)chunk_index;
+      activities[activity_count].connection = conn;
+      activity_count++;
     }
+    post_receives(conn);
   }
-  n = 0;
-  for (i=0; i<MAX_CLIENT; i++){
-    if (send_list[i] == 1){
-      conn = held_connections[i];
-      if (wait_for_control_response(conn, &conn->evict_sem) != 0)
-        goto abort_evict;
-      memset(conn->release_chunks, 0, sizeof(conn->release_chunks));
-      conn->release_chunk_count = 0;
-      for (m=0; m<MAX_MR_SIZE_GB; m++){
-        if (conn->recv_message.rkey[m]){
-          session.evict_list[n].activity = conn->recv_message.buf[m];
-          session.evict_list[n].chunk_index = m;
-          n += 1;
-        }
-      }
-      post_receives(conn);
+  qsort(activities, activity_count, sizeof(*activities), compare_activity);
+  selected_count = requested_chunks < activity_count
+                       ? requested_chunks
+                       : activity_count;
+  for (index = 0; (uint32_t)index < selected_count; index++) {
+    struct connection *conn = activities[index].connection;
+    uint32_t chunk_id = activities[index].provider_chunk_id;
+
+    pthread_mutex_lock(&conn->control_lock);
+    if (!conn->release_chunks[chunk_id]) {
+      conn->release_chunks[chunk_id] = 1;
+      conn->release_chunk_count++;
     }
+    pthread_mutex_unlock(&conn->control_lock);
   }
-  if (n != k){
-    printf("%s, received bitmap_info %d is not total_chunk %d\n", __func__, n, k);
-  } 
+  for (index = 0; index < held_count; index++) {
+    struct connection *conn = held_connections[index];
 
-  for (n=0; n < j; n++){//need evict chunk
-    for (m=n+1; m < k; m++){ //total sorted chunk
-      if (session.evict_list[n].activity > session.evict_list[m].activity){
-        tmp_activity.activity = session.evict_list[n].activity; 
-        tmp_activity.chunk_index = session.evict_list[n].chunk_index; 
-        session.evict_list[n].activity = session.evict_list[m].activity;
-        session.evict_list[n].chunk_index = session.evict_list[m].chunk_index;
-        session.evict_list[m].activity = tmp_activity.activity;
-        session.evict_list[m].chunk_index = tmp_activity.chunk_index;
-      }
-    }
-    chunk_index = session.evict_list[n].chunk_index;
-    conn_index = session.rdma_remote.conn_map[chunk_index];
-    if (send_list[conn_index] == -1){
-      printf("%s, send_list[%d] is -1 \n", __func__, conn_index);
-    }
-    if (send_list[conn_index] == 1){
-      send_list[conn_index] = 2;
-    }
-    held_connections[conn_index]->release_chunks[chunk_index] = 1;
-    held_connections[conn_index]->release_chunk_count++;
-  } 
-
-  for (i=0; i<MAX_CLIENT; i++){
-    int stop_result;
-
-    if (send_list[i] == 2)
-      stop_result = send_stop(held_connections[i],
-                              held_connections[i]->release_chunk_count);
-    else if (send_list[i] == 1)
-      stop_result = send_stop(held_connections[i], 0);
-    else
-      continue;
-    if (stop_result != 0)
-      goto abort_evict;
-    connection_put_reference(held_connections[i]);
-    reference_held[i] = 0;
+    if (conn->release_chunk_count != 0 &&
+        send_stop(conn, conn->release_chunk_count) != 0)
+      goto out;
   }
-  free(session.evict_list);
-  session.evict_list = NULL;
-  return;
-
-abort_evict:
-  if (session_locked)
-    pthread_mutex_unlock(&session_lock);
-  for (i = 0; i < MAX_CLIENT; i++) {
-    if (reference_held[i])
-      connection_put_reference(held_connections[i]);
-  }
-  free(session.evict_list);
-  session.evict_list = NULL;
-
+out:
+  free(activities);
+  for (index = 0; index < held_count; index++)
+    connection_put_reference(held_connections[index]);
 }
 
 void *free_mem(void *data)
 {
-  int free_mem_g = 0;
-  int last_free_mem_g;
-  int filtered_free_mem_g = 0;
-  int evict_hit_count = 0;
-  int expand_hit_count = 0;
-  float last_free_mem_weight = 1 - CURR_FREE_MEM_WEIGHT;
-  int stop_size_g;
-  int expand_size_g;
-  int expanding_chunks[MAX_FREE_MEM_GB];
-  int expanding_count;
-  int i, j;
+  struct rdma_session *provider_session = data;
 
-  (void)data;
-  last_free_mem_g = (int)(get_free_mem() / ONE_MB);
-  printf("%s, is called, last %d GB, weight: %f, %f\n", __func__, last_free_mem_g, (float)(CURR_FREE_MEM_WEIGHT), last_free_mem_weight); 
+  while (running) {
+    struct is_memory_reconcile_result reconcile;
+    enum is_memory_result result = is_memory_manager_reconcile(
+        provider_session->memory_manager, &reconcile);
 
-  while (running) {// server is working
-    free_mem_g = (int)(get_free_mem() / ONE_MB);
-    //need a filter
-    filtered_free_mem_g = (int)(CURR_FREE_MEM_WEIGHT * free_mem_g + last_free_mem_g * last_free_mem_weight); 
-    last_free_mem_g = filtered_free_mem_g;
-    if (filtered_free_mem_g < FREE_MEM_EVICT_THRESHOLD){
-      evict_hit_count += 1;
-      expand_hit_count = 0;
-      if (evict_hit_count >= MEM_EVICT_HIT_THRESHOLD){
-        evict_hit_count = 0;
-        //evict  down_threshold - free_mem
-        stop_size_g = FREE_MEM_EVICT_THRESHOLD - last_free_mem_g;
-        printf(", evict %d GB ", stop_size_g);
-        pthread_mutex_lock(&session_lock);
-        if (session.rdma_remote.size_gb < stop_size_g)
-          stop_size_g = session.rdma_remote.size_gb;
-        pthread_mutex_unlock(&session_lock);
-        if (stop_size_g > 0){ //stop_size_g has to be meaningful.
-          evict_mem(stop_size_g);
-        }
-        last_free_mem_g += stop_size_g;
-      }
-    }else if (filtered_free_mem_g > FREE_MEM_EXPAND_THRESHOLD) {
-      expand_hit_count += 1;
-      evict_hit_count = 0;
-      if (expand_hit_count >= MEM_EXPAND_HIT_THRESHOLD){
-        expand_hit_count = 0;
-        expand_size_g =  last_free_mem_g - FREE_MEM_EXPAND_THRESHOLD;
-        expanding_count = 0;
-        pthread_mutex_lock(&session_lock);
-        if ((expand_size_g + session.rdma_remote.size_gb) > MAX_FREE_MEM_GB)
-          expand_size_g = MAX_FREE_MEM_GB - session.rdma_remote.size_gb;
-        for (i = 0; i < MAX_FREE_MEM_GB &&
-                    expanding_count < expand_size_g; i++) {
-          if (session.rdma_remote.malloc_map[i] != CHUNK_EMPTY)
-            continue;
-          session.rdma_remote.malloc_map[i] = CHUNK_ALLOCATING;
-          expanding_chunks[expanding_count++] = i;
-        }
-        pthread_mutex_unlock(&session_lock);
-
-        for (j = 0; j < expanding_count; j++) {
-          i = expanding_chunks[j];
-          if (posix_memalign((void **)&session.rdma_remote.region_list[i],
-                             page_size, ONE_GB) != 0)
-            die("could not allocate a Remote Memory chunk");
-          memset(session.rdma_remote.region_list[i], 0x00, ONE_GB);
-        }
-
-        pthread_mutex_lock(&session_lock);
-        for (j = 0; j < expanding_count; j++)
-          session.rdma_remote.malloc_map[expanding_chunks[j]] =
-              CHUNK_MALLOCED;
-        session.rdma_remote.size_gb += expanding_count;
-        pthread_mutex_unlock(&session_lock);
-        last_free_mem_g -= expanding_count;
-      }
+    if (result != IS_MEMORY_OK) {
+      fprintf(stderr, "Provider memory reconciliation failed: %s\n",
+              is_memory_result_name(result));
+    } else if (reconcile.assigned_reclaim_needed != 0) {
+      evict_mem(reconcile.assigned_reclaim_needed);
     }
-    // printf("\n"); 
-    sleep(1); 
+    sleep(1);
   }
   return NULL;
 }
 
-void recv_done(struct connection *conn)
+static void recv_done(struct connection *conn)
 {
-  int evict_g = conn->recv_message.size_gb;
-  int i;
-  int released = 0;
+  uint32_t released_chunks[MAX_MR_SIZE_GB];
+  size_t released_count = 0;
+  int index;
+
+  for (index = 0; index < MAX_MR_SIZE_GB; index++) {
+    if (!conn->recv_message.rkey[index])
+      continue;
+    if (conn->sess_chunk_map[index] != index) {
+      rdma_disconnect(conn->id);
+      sem_post(&conn->stop_sem);
+      return;
+    }
+    released_chunks[released_count++] = (uint32_t)index;
+  }
+  if (released_count != (size_t)conn->recv_message.size_gb ||
+      is_memory_manager_release(
+          session.memory_manager, conn, released_chunks, released_count,
+          IS_MEMORY_RELEASE_PRESSURE) != IS_MEMORY_OK) {
+    rdma_disconnect(conn->id);
+    sem_post(&conn->stop_sem);
+    return;
+  }
 
   pthread_mutex_lock(&session_lock);
-  for (i = 0; i < MAX_MR_SIZE_GB; i++) {
-    int index;
-
-    if (!conn->recv_message.rkey[i])
-      continue;
-    index = conn->sess_chunk_map[i];
-    if (index < 0 || index >= MAX_FREE_MEM_GB)
-      continue;
-    conn->sess_chunk_map[i] = -1;
-    if (session.rdma_remote.mr_list[index]) {
-      deregister_memory(session.rdma_remote.mr_list[index]);
-      session.rdma_remote.mr_list[index] = NULL;
-    }
-    free(session.rdma_remote.region_list[index]);
-    session.rdma_remote.region_list[index] = NULL;
-    session.rdma_remote.conn_map[index] = -1;
-    session.rdma_remote.malloc_map[index] = CHUNK_EMPTY;
-    session.rdma_remote.conn_chunk_map[index] = -1;
-    released++;
-  }
-  if (released != evict_g)
-    fprintf(stderr, "release count mismatch\n");
-  session.rdma_remote.size_gb -= released;
-  session.rdma_remote.mapped_size -= released;
-  conn->mapped_chunk_size -= released;
-  is_provider_session_release_chunks(&conn->protocol_session,
-                                     (uint32_t)released);
+  for (index = 0; (size_t)index < released_count; index++)
+    conn->sess_chunk_map[released_chunks[index]] = -1;
+  conn->mapped_chunk_size -= (int)released_count;
   if (conn->mapped_chunk_size == 0)
     session.conns_state[conn->conn_index] = CONN_CONNECTED;
   pthread_mutex_unlock(&session_lock);
@@ -800,10 +557,11 @@ static int encode_control_message(struct connection *conn,
     init_outbound_message(conn, &message, IS_PROTOCOL_MSG_STATUS_RESPONSE, 1);
     message.payload.status.available_opportunistic_chunks =
         (uint32_t)conn->send_message.size_gb;
-    message.payload.status.available_committed_chunks = 0;
+    message.payload.status.available_committed_chunks =
+        conn->send_message.committed_size_gb;
     message.payload.status.provider_failure_deadline_ms =
         conn->protocol_session.failure_deadline_ms;
-    message.payload.status.flags = 0;
+    message.payload.status.flags = conn->send_message.status_flags;
     break;
   case CONTROL_INFO:
     init_outbound_message(conn, &message, IS_PROTOCOL_MSG_CHUNK_GRANT, 1);
@@ -1003,45 +761,6 @@ static void send_protocol_error(struct connection *conn,
     rdma_disconnect(conn->id);
 }
 
-int release_connection_remote_chunks(
-    struct connection *conn, struct rdma_session *provider_session,
-    remote_memory_deregister_fn deregister_region)
-{
-  int local_chunk;
-  int released = 0;
-  int cleanup_failed = 0;
-
-  if (!conn || !provider_session || !deregister_region)
-    return -1;
-  for (local_chunk = 0; local_chunk < MAX_MR_SIZE_GB; local_chunk++) {
-    int provider_chunk = conn->sess_chunk_map[local_chunk];
-
-    if (provider_chunk == -1)
-      continue;
-    if (provider_chunk < 0 || provider_chunk >= MAX_FREE_MEM_GB) {
-      cleanup_failed = 1;
-      continue;
-    }
-    if (provider_session->rdma_remote.mr_list[provider_chunk] &&
-        deregister_region(
-            provider_session->rdma_remote.mr_list[provider_chunk]) != 0) {
-      cleanup_failed = 1;
-      continue;
-    }
-    provider_session->rdma_remote.mr_list[provider_chunk] = NULL;
-    provider_session->rdma_remote.conn_map[provider_chunk] = -1;
-    provider_session->rdma_remote.conn_chunk_map[provider_chunk] = -1;
-    conn->sess_chunk_map[local_chunk] = -1;
-    released++;
-  }
-  if (released > provider_session->rdma_remote.mapped_size ||
-      released > conn->mapped_chunk_size)
-    return -1;
-  provider_session->rdma_remote.mapped_size -= released;
-  conn->mapped_chunk_size -= released;
-  return cleanup_failed ? -1 : 0;
-}
-
 int control_chunk_set_matches(
     const uint8_t expected_chunks[MAX_MR_SIZE_GB],
     uint16_t expected_count, const uint32_t response_chunks[],
@@ -1178,9 +897,6 @@ static void handle_authenticated_request(struct connection *conn)
     atomic_set(&conn->cq_qp_state, CQ_QP_BUSY);
     conn->server_state = S_BIND;
     send_mr(conn, conn->recv_message.size_gb);
-    pthread_mutex_lock(&session_lock);
-    session.conns_state[conn->conn_index] = CONN_MAPPED;
-    pthread_mutex_unlock(&session_lock);
     break;
   case CONTROL_ACTIVITY:
     sem_post(&conn->evict_sem);
@@ -1235,16 +951,35 @@ void on_completion(struct ibv_wc *wc)
     if (outcome.response_ready) {
       if (conn->protocol_session.state == IS_PROVIDER_SESSION_READY &&
           !conn->auth_subscribed) {
-        enum is_auth_result result = is_auth_registry_subscribe(
+        enum is_auth_result result;
+        enum is_memory_rejection_reason rejection;
+        uint32_t max_connections;
+        uint32_t max_opportunistic_chunks;
+        uint32_t max_committed_chunks;
+
+        result = is_auth_registry_subscribe(
             provider_auth_registry, conn->protocol_session.consumer_id,
             conn->protocol_session.authorization_version,
             disconnect_revoked_consumer, conn);
-
-        if (result != IS_AUTH_OK) {
+        if (result != IS_AUTH_OK ||
+            is_auth_registry_get_limits(
+                provider_auth_registry,
+                conn->protocol_session.consumer_id,
+                &max_connections,
+                &max_opportunistic_chunks,
+                &max_committed_chunks) != IS_AUTH_OK ||
+            is_memory_manager_connect(
+                session.memory_manager,
+                conn->protocol_session.consumer_id, conn,
+                max_connections, max_opportunistic_chunks,
+                max_committed_chunks, &rejection) != IS_MEMORY_OK) {
+          if (result == IS_AUTH_OK)
+            is_auth_registry_unsubscribe(provider_auth_registry, conn);
           rdma_disconnect(conn->id);
           goto done;
         }
         conn->auth_subscribed = 1;
+        conn->memory_connected = 1;
         pthread_mutex_lock(&conn->lifetime_lock);
         conn->handshake_complete = 1;
         pthread_cond_broadcast(&conn->lifetime_idle);
@@ -1406,103 +1141,81 @@ void send_message(struct connection *conn, int repost_receive)
     rdma_disconnect(conn->id);
 }
 
-static struct ibv_mr *register_remote_memory(
-    struct ibv_pd *protection_domain, void *address, size_t length,
-    int access)
+static void *register_remote_memory(void *context, void *address,
+                                    size_t length)
 {
-  return ibv_reg_mr(protection_domain, address, length, access);
+  struct ibv_mr *memory_region;
+
+  memory_region = ibv_reg_mr(
+      context, address, length,
+      IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+          IBV_ACCESS_REMOTE_READ);
+  if (!memory_region)
+    return NULL;
+  if (!memory_region->addr || memory_region->rkey == 0) {
+    (void)ibv_dereg_mr(memory_region);
+    return NULL;
+  }
+  return memory_region;
 }
 
-static int deregister_remote_memory(struct ibv_mr *memory_region)
+static int deregister_remote_memory(void *context, void *registration)
 {
-  return ibv_dereg_mr(memory_region);
-}
-
-int register_remote_chunks(
-    struct connection *conn, struct rdma_session *provider_session,
-    struct ibv_pd *protection_domain, int requested_chunks,
-    remote_memory_register_fn register_region,
-    remote_memory_deregister_fn deregister_region)
-{
-  int index;
-  int granted = 0;
-  int cleanup_failed = 0;
-  uint8_t registered_chunks[MAX_FREE_MEM_GB] = {0};
-
-  if (!conn || !provider_session || !register_region ||
-      !deregister_region || requested_chunks <= 0)
-    return -1;
-  memset(&conn->send_message, 0, sizeof(conn->send_message));
-  for (index = 0;
-       index < MAX_FREE_MEM_GB && granted < requested_chunks; index++) {
-    if (provider_session->rdma_remote.malloc_map[index] != CHUNK_MALLOCED ||
-        provider_session->rdma_remote.conn_map[index] != -1)
-      continue;
-    conn->sess_chunk_map[index] = index;
-    provider_session->rdma_remote.conn_map[index] = conn->conn_index;
-    provider_session->rdma_remote.conn_chunk_map[index] = index;
-    provider_session->rdma_remote.mr_list[index] = register_region(
-        protection_domain, provider_session->rdma_remote.region_list[index],
-        ONE_GB, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-                    IBV_ACCESS_REMOTE_READ);
-    if (!provider_session->rdma_remote.mr_list[index]) {
-      provider_session->rdma_remote.conn_map[index] = -1;
-      provider_session->rdma_remote.conn_chunk_map[index] = -1;
-      conn->sess_chunk_map[index] = -1;
-      break;
-    }
-    registered_chunks[index] = 1;
-    if (!provider_session->rdma_remote.mr_list[index]->addr ||
-        provider_session->rdma_remote.mr_list[index]->rkey == 0)
-      break;
-    conn->send_message.buf[index] = (uint64_t)(uintptr_t)
-        provider_session->rdma_remote.mr_list[index]->addr;
-    conn->send_message.rkey[index] =
-        provider_session->rdma_remote.mr_list[index]->rkey;
-    granted++;
-  }
-  if (granted == requested_chunks)
-    return granted;
-
-  for (index = 0; index < MAX_FREE_MEM_GB; index++) {
-    if (!registered_chunks[index])
-      continue;
-    if (deregister_region(provider_session->rdma_remote.mr_list[index]) != 0)
-      cleanup_failed = 1;
-    provider_session->rdma_remote.mr_list[index] = NULL;
-    provider_session->rdma_remote.conn_map[index] = -1;
-    provider_session->rdma_remote.conn_chunk_map[index] = -1;
-    conn->sess_chunk_map[index] = -1;
-    conn->send_message.rkey[index] = 0;
-    conn->send_message.buf[index] = 0;
-  }
-  return cleanup_failed ? -2 : -1;
+  (void)context;
+  return ibv_dereg_mr(registration);
 }
 
 void send_mr(void *context, int size)
 {
-  struct connection *conn = (struct connection *)context;
-  int granted;
+  struct connection *conn = context;
+  struct is_memory_registration_adapter registration = {
+    .context = s_ctx->pd,
+    .register_chunk = register_remote_memory,
+    .deregister_chunk = deregister_remote_memory,
+  };
+  struct is_memory_grant grants[MAX_MR_SIZE_GB];
+  enum is_memory_rejection_reason rejection;
+  enum is_memory_result result;
+  int index;
 
   pthread_mutex_lock(&conn->control_lock);
-  pthread_mutex_lock(&session_lock);
-  granted = register_remote_chunks(
-      conn, &session, s_ctx->pd, size,
-      register_remote_memory, deregister_remote_memory);
-  if (granted < 0) {
-    pthread_mutex_unlock(&session_lock);
+  memset(&conn->send_message, 0, sizeof(conn->send_message));
+  result = is_memory_manager_acquire(
+      session.memory_manager, conn,
+      (enum is_memory_pool)conn->requested_pool, (uint32_t)size,
+      &rejection, &registration, grants, MAX_MR_SIZE_GB);
+  if (result != IS_MEMORY_OK) {
     pthread_mutex_unlock(&conn->control_lock);
-    if (granted == -2)
-      die("could not roll back Remote Memory registration");
-    send_protocol_error(conn, conn->active_request_id,
-                        IS_PROTOCOL_MSG_CHUNK_REQUEST,
-                        IS_PROTOCOL_ERROR_RESOURCE);
+    fprintf(stderr, "Remote Memory admission rejected for %s: %s\n",
+            conn->protocol_session.consumer_id,
+            is_memory_rejection_name(rejection));
+    if (result == IS_MEMORY_CLEANUP_FAILED)
+      send_protocol_error(conn, conn->active_request_id,
+                          IS_PROTOCOL_MSG_CHUNK_REQUEST,
+                          IS_PROTOCOL_ERROR_INTERNAL);
+    else
+      send_protocol_error(conn, conn->active_request_id,
+                          IS_PROTOCOL_MSG_CHUNK_REQUEST,
+                          IS_PROTOCOL_ERROR_RESOURCE);
     return;
   }
-  session.rdma_remote.mapped_size += granted;
-  conn->mapped_chunk_size += granted;
+
+  for (index = 0; index < size; index++) {
+    uint32_t chunk_id = grants[index].provider_chunk_id;
+    struct ibv_mr *memory_region = grants[index].registration;
+
+    if (chunk_id >= MAX_MR_SIZE_GB || conn->sess_chunk_map[chunk_id] != -1)
+      die("memory manager returned an invalid Remote Chunk assignment");
+    conn->sess_chunk_map[chunk_id] = (int)chunk_id;
+    conn->send_message.buf[chunk_id] =
+        (uint64_t)(uintptr_t)memory_region->addr;
+    conn->send_message.rkey[chunk_id] = memory_region->rkey;
+  }
+  conn->mapped_chunk_size += size;
+  pthread_mutex_lock(&session_lock);
+  session.conns_state[conn->conn_index] = CONN_MAPPED;
   pthread_mutex_unlock(&session_lock);
-  conn->send_message.size_gb = granted;
+  conn->send_message.size_gb = size;
   conn->send_message.type = CONTROL_INFO;
   send_message(conn, 1);
   pthread_mutex_unlock(&conn->control_lock);
@@ -1510,15 +1223,26 @@ void send_mr(void *context, int size)
 
 void send_free_mem_size(void *context)
 {
-  struct connection *conn = (struct connection *)context;
+  struct connection *conn = context;
+  struct is_memory_manager_status status;
 
   pthread_mutex_lock(&conn->control_lock);
-  pthread_mutex_lock(&session_lock);
+  if (is_memory_manager_get_status(
+          session.memory_manager, conn, &status) != IS_MEMORY_OK) {
+    pthread_mutex_unlock(&conn->control_lock);
+    send_protocol_error(conn, conn->active_request_id,
+                        IS_PROTOCOL_MSG_STATUS_REQUEST,
+                        IS_PROTOCOL_ERROR_INTERNAL);
+    return;
+  }
   memset(&conn->send_message, 0, sizeof(conn->send_message));
   conn->send_message.type = CONTROL_FREE_SIZE;
   conn->send_message.size_gb =
-      session.rdma_remote.size_gb - session.rdma_remote.mapped_size;
-  pthread_mutex_unlock(&session_lock);
+      (int)status.available_opportunistic_chunks;
+  conn->send_message.committed_size_gb =
+      status.available_committed_chunks;
+  conn->send_message.status_flags =
+      status.healthy ? IS_PROTOCOL_STATUS_HEALTHY : 0;
   send_message(conn, 1);
   pthread_mutex_unlock(&conn->control_lock);
 }

@@ -241,9 +241,6 @@ static int handle_authenticated(struct is_provider_session *session,
 {
   enum is_auth_result revoke_result;
   time_t now;
-  uint32_t max_opportunistic_chunks;
-  uint32_t max_committed_chunks;
-  uint32_t limit;
   int response_message =
       (message->header.flags & IS_PROTOCOL_FLAG_RESPONSE) != 0;
 
@@ -289,52 +286,17 @@ static int handle_authenticated(struct is_provider_session *session,
                        IS_PROTOCOL_ERROR_CAPABILITY, response,
                        response_capacity, outcome);
 
-  if (message->header.type == IS_PROTOCOL_MSG_CHUNK_REQUEST) {
-    if (message->payload.chunk_request.pool != session->selected_pool)
-      return build_error(session, message->header.request_id,
-                         message->header.type,
-                         IS_PROTOCOL_ERROR_CAPABILITY, response,
-                         response_capacity, outcome);
-    revoke_result = is_auth_registry_get_limits(
-        session->registry, session->consumer_id,
-        &max_opportunistic_chunks, &max_committed_chunks);
-    if (revoke_result != IS_AUTH_OK)
-      return build_error(session, message->header.request_id,
-                         message->header.type,
-                         revoke_result == IS_AUTH_REVOKED
-                             ? IS_PROTOCOL_ERROR_REVOKED
-                             : IS_PROTOCOL_ERROR_AUTHENTICATION,
-                         response, response_capacity, outcome);
-    limit = message->payload.chunk_request.pool ==
-                    IS_PROTOCOL_POOL_OPPORTUNISTIC
-                ? max_opportunistic_chunks
-                : max_committed_chunks;
-    if (session->granted_chunks > limit ||
-        message->payload.chunk_request.chunk_count >
-            limit - session->granted_chunks)
-      return build_error(session, message->header.request_id,
-                         message->header.type,
-                         IS_PROTOCOL_ERROR_RESOURCE, response,
-                         response_capacity, outcome);
-    session->granted_chunks +=
-        message->payload.chunk_request.chunk_count;
-  }
+  if (message->header.type == IS_PROTOCOL_MSG_CHUNK_REQUEST &&
+      message->payload.chunk_request.pool != session->selected_pool)
+    return build_error(session, message->header.request_id,
+                       message->header.type,
+                       IS_PROTOCOL_ERROR_CAPABILITY, response,
+                       response_capacity, outcome);
   if (!response_message)
     session->last_request_id = message->header.request_id;
   outcome->request = *message;
   outcome->request_ready = 1;
   return 0;
-}
-
-void is_provider_session_release_chunks(struct is_provider_session *session,
-                                        uint32_t chunk_count)
-{
-  if (!session)
-    return;
-  if (chunk_count >= session->granted_chunks)
-    session->granted_chunks = 0;
-  else
-    session->granted_chunks -= chunk_count;
 }
 
 int is_provider_session_fail(

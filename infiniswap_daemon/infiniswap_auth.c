@@ -79,6 +79,9 @@ static int credential_valid(const struct is_auth_credential *credential)
   if (credential->next.secret_size == 0 &&
       credential->next_valid_until_unix != 0)
     return 0;
+  if (credential->max_connections == 0 ||
+      credential->max_connections > IS_AUTH_MAX_CONSUMERS)
+    return 0;
   return credential->max_opportunistic_chunks != 0 ||
          credential->max_committed_chunks != 0;
 }
@@ -191,8 +194,7 @@ is_auth_registry_subscribe(struct is_auth_registry *registry,
     result = IS_AUTH_FULL;
   for (index = 0; result == IS_AUTH_OK &&
                   index < registry->listener_count; index++) {
-    if (registry->listeners[index].context == context ||
-        strcmp(registry->listeners[index].consumer_id, consumer_id) == 0)
+    if (registry->listeners[index].context == context)
       result = IS_AUTH_DUPLICATE;
   }
   if (result == IS_AUTH_OK) {
@@ -254,14 +256,15 @@ is_auth_registry_revoke(struct is_auth_registry *registry,
 enum is_auth_result
 is_auth_registry_get_limits(struct is_auth_registry *registry,
                             const char *consumer_id,
+                            uint32_t *max_connections,
                             uint32_t *max_opportunistic_chunks,
                             uint32_t *max_committed_chunks)
 {
   struct is_auth_credential *credential;
   enum is_auth_result result;
 
-  if (!registry || !consumer_id || !max_opportunistic_chunks ||
-      !max_committed_chunks)
+  if (!registry || !consumer_id || !max_connections ||
+      !max_opportunistic_chunks || !max_committed_chunks)
     return IS_AUTH_INVALID_ARGUMENT;
   (void)pthread_mutex_lock(&registry->lock);
   credential = find_credential(registry, consumer_id);
@@ -270,6 +273,7 @@ is_auth_registry_get_limits(struct is_auth_registry *registry,
   else if (credential->revoked)
     result = IS_AUTH_REVOKED;
   else {
+    *max_connections = credential->max_connections;
     *max_opportunistic_chunks = credential->max_opportunistic_chunks;
     *max_committed_chunks = credential->max_committed_chunks;
     result = IS_AUTH_OK;
@@ -595,12 +599,16 @@ static int parse_credential_value(struct is_auth_credential *credential,
     field = 1U << 3;
   else if (strcmp(key, "next_valid_until_unix") == 0)
     field = 1U << 4;
-  else if (strcmp(key, "max_opportunistic_chunks") == 0)
+  else if (strcmp(key, "max_connections") == 0)
     field = 1U << 5;
-  else if (strcmp(key, "max_committed_chunks") == 0)
+  else if (strcmp(key, "max_opportunistic_gib") == 0 ||
+           strcmp(key, "max_opportunistic_chunks") == 0)
     field = 1U << 6;
-  else if (strcmp(key, "revoked") == 0)
+  else if (strcmp(key, "max_committed_gib") == 0 ||
+           strcmp(key, "max_committed_chunks") == 0)
     field = 1U << 7;
+  else if (strcmp(key, "revoked") == 0)
+    field = 1U << 8;
   else
     return 0;
   if (*seen & field)
@@ -626,8 +634,10 @@ static int parse_credential_value(struct is_auth_credential *credential,
   if (field == (1U << 4))
     return parse_u64(value, &credential->next_valid_until_unix);
   if (field == (1U << 5))
-    return parse_u32(value, &credential->max_opportunistic_chunks);
+    return parse_u32(value, &credential->max_connections);
   if (field == (1U << 6))
+    return parse_u32(value, &credential->max_opportunistic_chunks);
+  if (field == (1U << 7))
     return parse_u32(value, &credential->max_committed_chunks);
   if (strcmp(value, "true") == 0)
     credential->revoked = 1;
@@ -667,6 +677,7 @@ static int authorization_equal(const struct is_auth_credential *left,
          key_equal(&left->current, &right->current) &&
          key_equal(&left->next, &right->next) &&
          left->next_valid_until_unix == right->next_valid_until_unix &&
+         left->max_connections == right->max_connections &&
          left->max_opportunistic_chunks == right->max_opportunistic_chunks &&
          left->max_committed_chunks == right->max_committed_chunks;
 }

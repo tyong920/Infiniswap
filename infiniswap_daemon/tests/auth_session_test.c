@@ -27,6 +27,7 @@ static void set_credential(struct is_auth_credential *credential)
   memcpy(credential->next.secret, next_secret, sizeof(next_secret) - 1U);
   credential->next.secret_size = sizeof(next_secret) - 1U;
   credential->next_valid_until_unix = (uint64_t)time(NULL) + 3600U;
+  credential->max_connections = 1;
   credential->max_opportunistic_chunks = 32;
   credential->max_committed_chunks = 16;
 }
@@ -464,7 +465,7 @@ static int test_out_of_order_and_failed_authentication(void)
   return 0;
 }
 
-static int test_pool_and_cumulative_quota_authorization(void)
+static int test_pool_selection_and_authorization(void)
 {
   struct is_auth_credential credential;
   struct is_auth_registry registry;
@@ -528,11 +529,8 @@ static int test_pool_and_cumulative_quota_authorization(void)
   if (encode_message(&request, frame, &frame_size) ||
       is_provider_session_handle(&session, frame, frame_size,
                                  response, sizeof(response), &outcome) != 0 ||
-      !outcome.response_ready || !outcome.close_after_response ||
-      is_protocol_decode(response, outcome.response_size, &error) !=
-          IS_PROTOCOL_OK ||
-      error.payload.error.code != IS_PROTOCOL_ERROR_RESOURCE) {
-    fprintf(stderr, "cumulative quota was bypassed\n");
+      !outcome.request_ready || outcome.response_ready) {
+    fprintf(stderr, "authenticated chunk request did not reach admission control\n");
     return 1;
   }
 
@@ -614,23 +612,26 @@ static int test_allowlist_loader(void)
       "next_psk_hex = "
       "6e6578742d7365637265742d33322d62797465732d3030303030303030303030\n"
       "next_valid_until_unix = %llu\n"
-      "max_opportunistic_chunks = 32\n"
-      "max_committed_chunks = 16\n"
+      "max_connections = 1\n"
+      "max_opportunistic_gib = 32\n"
+      "max_committed_gib = 16\n"
       "revoked = false\n"
       "[consumer:consumer-b]\n"
       "current_key_id = key-b\n"
       "current_psk_hex = "
       "3031323334353637383961626364656630313233343536373839616263646566\n"
-      "max_opportunistic_chunks = 1\n"
-      "max_committed_chunks = 0\n"
+      "max_connections = 1\n"
+      "max_opportunistic_gib = 1\n"
+      "max_committed_gib = 0\n"
       "revoked = true\n";
   static const char invalid_config[] =
       "version = 1\n"
       "[consumer:consumer-a]\n"
       "current_key_id = key-current\n"
       "current_psk_hex = not-a-secret\n"
-      "max_opportunistic_chunks = 32\n"
-      "max_committed_chunks = 0\n"
+      "max_connections = 1\n"
+      "max_opportunistic_gib = 32\n"
+      "max_committed_gib = 0\n"
       "revoked = false\n";
   static const char empty_config[] = "version = 1\n";
   struct is_auth_registry registry;
@@ -642,6 +643,9 @@ static int test_allowlist_loader(void)
   char changed_path[] = "/tmp/infiniswap-allowlist-changed-XXXXXX";
   char empty_path[] = "/tmp/infiniswap-allowlist-empty-XXXXXX";
   uint64_t original_authorization_version = 0;
+  uint32_t max_connections = 0;
+  uint32_t max_opportunistic_chunks = 0;
+  uint32_t max_committed_chunks = 0;
   int revocations = 0;
   int failure = 0;
 
@@ -655,6 +659,11 @@ static int test_allowlist_loader(void)
   if (write_config(valid_path, valid_config, S_IRUSR | S_IWUSR) ||
       is_auth_registry_load_file(&registry, valid_path) != IS_AUTH_OK ||
       registry.count != 2 ||
+      is_auth_registry_get_limits(
+          &registry, "consumer-a", &max_connections,
+          &max_opportunistic_chunks, &max_committed_chunks) != IS_AUTH_OK ||
+      max_connections != 1 || max_opportunistic_chunks != 32 ||
+      max_committed_chunks != 16 ||
       is_auth_registry_is_revoked(&registry, "consumer-a") != IS_AUTH_OK ||
       is_auth_registry_is_revoked(&registry, "consumer-b") !=
           IS_AUTH_REVOKED) {
@@ -732,7 +741,7 @@ int main(void)
   failures += test_hmac_rotation_and_revocation();
   failures += test_handshake_order_replay_and_minor_compatibility();
   failures += test_out_of_order_and_failed_authentication();
-  failures += test_pool_and_cumulative_quota_authorization();
+  failures += test_pool_selection_and_authorization();
   failures += test_allowlist_loader();
   return failures == 0 ? 0 : 1;
 }

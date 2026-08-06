@@ -62,17 +62,6 @@ jobs:
             -o "${{ runner.temp }}/protocol-test-s390x"
           qemu-s390x "${{ runner.temp }}/protocol-test-s390x"
 
-      - name: Test wire size independence from capacity
-        if: matrix.ubuntu == '24.04'
-        run: |
-          cmake -S infiniswap_daemon \
-            -B "${{ runner.temp }}/infiniswap-daemon-capacity" \
-            -G Ninja -DINFINISWAP_MAX_REMOTE_MEMORY_GB=7
-          cmake --build "${{ runner.temp }}/infiniswap-daemon-capacity" \
-            --target protocol-test
-          ctest --test-dir "${{ runner.temp }}/infiniswap-daemon-capacity" \
-            -R '^protocol$' --output-on-failure
-
       - name: Test Provider Directory schema files
         run: |
           python3 - <<'PY'

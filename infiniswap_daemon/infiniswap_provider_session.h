@@ -26,7 +26,6 @@ struct is_provider_session {
   uint64_t last_request_id;
   uint64_t authenticated_until_unix;
   uint64_t authorization_version;
-  uint32_t granted_chunks;
   uint32_t failure_deadline_ms;
   uint8_t selected_mode;
   uint8_t selected_pool;
@@ -62,8 +61,5 @@ int is_provider_session_fail(
     struct is_provider_session *session, uint64_t request_id,
     uint16_t offending_type, enum is_protocol_error_code code,
     uint8_t *response, size_t response_capacity, size_t *response_size);
-
-void is_provider_session_release_chunks(struct is_provider_session *session,
-                                        uint32_t chunk_count);
 
 #endif /* INFINISWAP_PROVIDER_SESSION_H */

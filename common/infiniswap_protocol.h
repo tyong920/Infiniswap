@@ -40,6 +40,7 @@ typedef uint64_t is_protocol_u64;
 #define IS_PROTOCOL_FLAG_ERROR (1U << 1)
 #define IS_PROTOCOL_FLAGS_KNOWN                                             \
   (IS_PROTOCOL_FLAG_RESPONSE | IS_PROTOCOL_FLAG_ERROR)
+#define IS_PROTOCOL_STATUS_HEALTHY (1U << 0)
 
 #define IS_PROTOCOL_CAP_BACKED (1ULL << 0)
 #define IS_PROTOCOL_CAP_REMOTE_ONLY (1ULL << 1)

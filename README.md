@@ -51,16 +51,30 @@ The executable is `build/daemon/infiniswap-daemon`.
 
 ### Memory Provider Configuration
 
-Pass these cache variables to the CMake configure command with `-D`:
+Memory capacity is configured at runtime rather than compiled into the daemon.
+Copy `config/provider-memory.example.conf` and set all values explicitly:
 
-| Variable | Default | Meaning |
-| --- | ---: | --- |
-| `INFINISWAP_MAX_REMOTE_MEMORY_GB` | `32` | Maximum contributed Remote Memory |
-| `INFINISWAP_REMOTE_MEMORY_EVICT_GB` | `8` | Eviction threshold |
-| `INFINISWAP_EVICT_HIT_LIMIT` | `1` | Low-memory samples before eviction |
-| `INFINISWAP_REMOTE_MEMORY_EXPAND_GB` | `16` | Expansion threshold |
-| `INFINISWAP_EXPAND_HIT_LIMIT` | `20` | High-memory samples before expansion |
-| `INFINISWAP_MEASURED_FREE_MEM_WEIGHT` | `0.7` | Current free-memory sample weight |
+```ini
+version = 1
+host_reserve_gib = 8
+max_opportunistic_gib = 24
+max_committed_gib = 8
+```
+
+A Remote Chunk is exactly 1 GiB. The two pool maxima may total at most 128 GiB,
+the control protocol's per-Provider limit. The Provider reads Linux
+`MemAvailable` directly from `/proc/meminfo`; it grows the Opportunistic Pool
+only from memory above Host Reserve and reclaims opportunistic capacity when
+Provider-local pressure crosses that reserve. Committed assignments are not
+reclaimed under local pressure. Allocation, page touching, and RDMA registration
+are transactional, so a partial failure does not publish a grant or change pool
+accounting.
+
+Authenticated status responses report the capacity currently admissible from
+each pool and set the stable `IS_PROTOCOL_STATUS_HEALTHY` flag while the memory
+manager is healthy. Pool counters, per-Consumer assignments, rejection reasons,
+and cumulative admission/reclaim metrics are also exposed by the memory-manager
+interface in `infiniswap_daemon/infiniswap_memory_manager.h`.
 
 ### Authenticated Control Protocol
 
@@ -73,10 +87,9 @@ structured error followed by connection teardown. Unversioned native C-struct
 messages are intentionally unsupported.
 
 Each Memory Consumer authenticates with an identifier, key identifier, fresh
-nonce, and HMAC-SHA256. The allowlist may hold credentials for multiple
-Consumer identities, while the Phase 0 Provider accepts exactly one active
-Consumer connection. The PSK is never transmitted. Configure the Provider with
-a root-owned mode-0600 allowlist:
+nonce, and HMAC-SHA256. The allowlist may hold credentials and runtime resource
+limits for multiple Consumer identities. The PSK is never transmitted.
+Configure the Provider with a root-owned mode-0600 allowlist:
 
 ```ini
 version = 1
@@ -87,15 +100,18 @@ current_psk_hex = <32-to-64-byte-PSK-as-hex>
 next_key_id = key-2025-02
 next_psk_hex = <optional-rotation-PSK-as-hex>
 next_valid_until_unix = <required-expiry-for-next-key>
-max_opportunistic_chunks = 32
-max_committed_chunks = 0
+max_connections = 1
+max_opportunistic_gib = 32
+max_committed_gib = 0
 revoked = false
 ```
 
-Start the Provider with the allowlist as its third argument:
+Start the Provider with the memory configuration and allowlist:
 
 ```bash
-build/daemon/infiniswap-daemon :: 9400 /etc/infiniswap/consumers.conf
+build/daemon/infiniswap-daemon :: 9400 \
+  /etc/infiniswap/provider-memory.conf \
+  /etc/infiniswap/consumers.conf
 ```
 
 Reload the allowlist with `SIGHUP`. `next_valid_until_unix` must be in the

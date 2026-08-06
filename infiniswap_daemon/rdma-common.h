@@ -6,85 +6,52 @@
 #ifndef RDMA_COMMON_H
 #define RDMA_COMMON_H
 
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <linux/kernel.h>
 #include <netdb.h>
+#include <netinet/in.h>
+#include <rdma/rdma_cma.h>
+#include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
 #include <unistd.h>
-#include <rdma/rdma_cma.h>
-#include <semaphore.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <linux/kernel.h>
 
+#include "infiniswap_memory_manager.h"
 #include "infiniswap_provider_session.h"
 
-#define TEST_NZ(x) do { if ( (x)) die("error: " #x " failed (returned non-zero)." ); } while (0)
-#define TEST_Z(x)  do { if (!(x)) die("error: " #x " failed (returned zero/null)."); } while (0)
+#define TEST_NZ(x)                                                            \
+  do {                                                                        \
+    if ((x))                                                                  \
+      die("error: " #x " failed (returned non-zero).");                       \
+  } while (0)
+#define TEST_Z(x)                                                             \
+  do {                                                                        \
+    if (!(x))                                                                 \
+      die("error: " #x " failed (returned zero/null).");                      \
+  } while (0)
 
 #define CQ_QP_BUSY 1
 #define CQ_QP_IDLE 0
 #define CQ_QP_DOWN 2
-
-
-#ifdef USER_MAX_CLIENT
-  #define MAX_CLIENT	USER_MAX_CLIENT
-#else
-  #define MAX_CLIENT	1
-#endif
-
-#define EXTRA_CHUNK_NUM 2
+#define MAX_CLIENT 64
+#define MAX_MR_SIZE_GB 128
+_Static_assert(MAX_CLIENT == IS_AUTH_MAX_CONSUMERS,
+               "connection slots must match the authenticated identity limit");
+_Static_assert(MAX_MR_SIZE_GB == IS_PROTOCOL_MAX_CHUNKS_PER_FRAME,
+               "Remote Chunk slots must match the protocol limit");
+_Static_assert((int)IS_MEMORY_POOL_OPPORTUNISTIC ==
+                   (int)IS_PROTOCOL_POOL_OPPORTUNISTIC &&
+               (int)IS_MEMORY_POOL_COMMITTED ==
+                   (int)IS_PROTOCOL_POOL_COMMITTED,
+               "memory-manager pools must match the control protocol");
 #define PROVIDER_HANDSHAKE_TIMEOUT_MS 5000U
-
-
-#ifdef USER_MAX_REMOTE_MEMORY
-  #define MAX_FREE_MEM_GB USER_MAX_REMOTE_MEMORY //for local memory management
-  #define MAX_MR_SIZE_GB MAX_FREE_MEM_GB //for msg passing
-#else
-  #define MAX_FREE_MEM_GB 32 //for local memory management
-  #define MAX_MR_SIZE_GB 32 //for msg passing
-#endif
-
-
-#define ONE_MB 1048576
-#define ONE_GB 1073741824
-
-#ifdef USER_REMOTE_MEMORY_EVICT
-  #define FREE_MEM_EVICT_THRESHOLD USER_REMOTE_MEMORY_EVICT //in GB
-#else
-  #define FREE_MEM_EVICT_THRESHOLD 8 //in GB
-#endif
-
-#ifdef USER_REMOTE_MEMORY_EXPAND
-  #define FREE_MEM_EXPAND_THRESHOLD USER_REMOTE_MEMORY_EXPAND //in GB
-#else
-  #define FREE_MEM_EXPAND_THRESHOLD 16 // in GB
-#endif
-
-#ifdef USER_EVICT_HIT_LIMIT
-  #define MEM_EVICT_HIT_THRESHOLD USER_EVICT_HIT_LIMIT
-#else
-  #define MEM_EVICT_HIT_THRESHOLD 1 
-#endif
-
-#ifdef USER_EXPAND_HIT_LIMIT
-  #define MEM_EXPAND_HIT_THRESHOLD USER_EXPAND_HIT_LIMIT
-#else
-  #define MEM_EXPAND_HIT_THRESHOLD 20
-#endif
-
-#ifdef USER_MEASURED_FREE_MEM_WEIGHT
-  #define CURR_FREE_MEM_WEIGHT USER_MEASURED_FREE_MEM_WEIGHT
-#else
-  #define CURR_FREE_MEM_WEIGHT 0.7
-#endif
 
 enum mode {
   M_WRITE,
   M_READ
 };
-
 
 enum control_message_type {
   CONTROL_DONE = 1,
@@ -102,6 +69,8 @@ struct control_message {
   uint64_t buf[MAX_MR_SIZE_GB];
   uint32_t rkey[MAX_MR_SIZE_GB];
   int size_gb;
+  uint32_t committed_size_gb;
+  uint32_t status_flags;
   enum control_message_type type;
 };
 
@@ -110,19 +79,19 @@ struct context {
   struct ibv_pd *pd;
   struct ibv_cq *cq;
   struct ibv_comp_channel *comp_channel;
-
   pthread_t cq_poller_thread;
 };
 
-struct atomic_t{
+struct atomic_t {
   int value;
   pthread_mutex_t mutex;
 };
 
-struct connection {
+struct rdma_session;
 
+struct connection {
   struct rdma_session *sess;
-  int conn_index; //conn index in sess->conns
+  int conn_index;
   int sess_chunk_map[MAX_MR_SIZE_GB];
   int mapped_chunk_size;
 
@@ -131,13 +100,10 @@ struct connection {
 
   struct rdma_cm_id *id;
   struct ibv_qp *qp;
-
   int connected;
 
   struct ibv_mr *recv_mr;
   struct ibv_mr *send_mr;
-  struct ibv_mr *rdma_remote_mr;
-
   struct ibv_mr peer_mr;
 
   uint8_t *recv_frame;
@@ -166,9 +132,7 @@ struct connection {
   int pending_close_after_send;
   int pending_repost_after_send;
   int auth_subscribed;
-
-  char *rdma_remote_region;
-  //struct rdma_remote_mem rdma_remote;
+  int memory_connected;
 
   struct atomic_t cq_qp_state;
   pthread_mutex_t send_lock;
@@ -181,10 +145,6 @@ struct connection {
   int send_inflight;
   int closing;
 
-  pthread_t free_mem_thread;
-  long free_mem_gb;
-  unsigned long rdma_buf_size;
-
   enum {
     S_WAIT,
     S_BIND,
@@ -193,7 +153,7 @@ struct connection {
 
   enum {
     SS_INIT,
-    SS_MR_SENT, 
+    SS_MR_SENT,
     SS_STOP_SENT,
     SS_DONE_SENT
   } send_state;
@@ -205,75 +165,46 @@ struct connection {
   } recv_state;
 };
 
-#define CHUNK_MALLOCED 1
-#define CHUNK_ALLOCATING 2
-#define CHUNK_EMPTY	0
-struct rdma_remote_mem{
-  char* region_list[MAX_FREE_MEM_GB];
-  struct ibv_mr* mr_list[MAX_FREE_MEM_GB]; 
-  int size_gb; 
-  int mapped_size;
-  int conn_map[MAX_FREE_MEM_GB]; //chunk is used by which connection, or -1
-  int malloc_map[MAX_FREE_MEM_GB];
-  int conn_chunk_map[MAX_FREE_MEM_GB]; //session_chunk 
-};
-
-enum conn_state{
+enum conn_state {
   CONN_IDLE,
   CONN_CONNECTED,
   CONN_MAPPED,
   CONN_FAILED
 };
 
-struct chunk_activity{
+struct chunk_activity {
   uint64_t activity;
-  int chunk_index;
+  uint32_t provider_chunk_id;
+  struct connection *connection;
 };
+
 struct rdma_session {
-	struct connection* conns[MAX_CLIENT]; // need to init NULL
+  struct connection *conns[MAX_CLIENT];
   enum conn_state conns_state[MAX_CLIENT];
-	int conn_num;	
-
-	struct rdma_remote_mem rdma_remote;		
-  struct chunk_activity *evict_list;
-
+  int conn_num;
+  struct is_memory_manager *memory_manager;
 };
 
 extern struct rdma_session session;
-
-typedef struct ibv_mr *(*remote_memory_register_fn)(
-    struct ibv_pd *protection_domain, void *address, size_t length,
-    int access);
-typedef int (*remote_memory_deregister_fn)(struct ibv_mr *memory_region);
-
-int register_remote_chunks(
-    struct connection *conn, struct rdma_session *provider_session,
-    struct ibv_pd *protection_domain, int requested_chunks,
-    remote_memory_register_fn register_region,
-    remote_memory_deregister_fn deregister_region);
-
-int release_connection_remote_chunks(
-    struct connection *conn, struct rdma_session *provider_session,
-    remote_memory_deregister_fn deregister_region);
 
 int control_chunk_set_matches(
     const uint8_t expected_chunks[MAX_MR_SIZE_GB],
     uint16_t expected_count, const uint32_t response_chunks[],
     uint16_t response_count);
 
-void die(const char *reason);
+_Noreturn void die(const char *reason);
 void set_provider_auth_registry(struct is_auth_registry *registry);
 
 int build_connection(struct rdma_cm_id *id);
 void build_params(struct rdma_conn_param *params);
 void destroy_connection(void *context);
-void * get_serving_mem_region(void *context);
 void on_connect(void *context);
 void send_mr(void *context, int n);
 int send_stop(void *context, int n);
 void send_evict(void *context, int n);
 void send_free_mem_size(void *context);
-void rdma_session_init(struct rdma_session *sess);
+void rdma_session_init(struct rdma_session *provider_session,
+                       struct is_memory_manager *memory_manager);
 void *free_mem(void *data);
 
-#endif
+#endif /* RDMA_COMMON_H */
