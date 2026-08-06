@@ -54,6 +54,13 @@ jobs:
       - name: Test RDMA tuple discovery
         run: infiniswap_bd/tests/rdma-build-flags-test.sh
 
+      - name: Check Memory Consumer helper syntax
+        run: |
+          bash -n infiniswap_bd/tests/local-backing-test.sh
+          bash -n setup/infiniswap_bd_setup.sh
+          bash -n setup/infiniswap_bd_teardown.sh
+          bash -n setup/install.sh
+
       - name: Select GA kernel headers
         id: headers
         shell: bash

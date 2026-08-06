@@ -9,13 +9,8 @@ fi
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/.." && pwd)
 
-max_page_num=${MAX_PAGE_NUM:-32}
-bio_page_cap=${BIO_PAGE_CAP:-32}
 max_remote_memory=${MAX_REMOTE_MEMORY_GB:-32}
-stackbd_size=${DEVICE_SIZE_GB:-12}
-stackbd_name=${DEVICE_NAME:-stackbd}
-backing_store=${BACKING_STORE:-/dev/sda4}
-provider_sample_size=${PROVIDER_SAMPLE_SIZE:-1}
+rdma_root=${INFINISWAP_RDMA_ROOT:-}
 
 max_client=${MAX_CLIENT:-32}
 remote_memory_evict=${REMOTE_MEMORY_EVICT_GB:-8}
@@ -26,21 +21,13 @@ measured_free_mem_weight=${MEASURED_FREE_MEM_WEIGHT:-0.7}
 
 if [[ $1 == "bd" ]]; then
   kdir=${KDIR:-/lib/modules/$(uname -r)/build}
-  module_args=(
-    "KDIR=$kdir"
-    "INFINISWAP_MAX_PAGES_PER_REQUEST=$max_page_num"
-    "INFINISWAP_BIO_PAGE_CAP=$bio_page_cap"
-    "INFINISWAP_MAX_REMOTE_MEMORY_GB=$max_remote_memory"
-    "INFINISWAP_DEVICE_SIZE_GB=$stackbd_size"
-    "INFINISWAP_DEVICE_NAME=$stackbd_name"
-    "INFINISWAP_BACKING_STORE=$backing_store"
-    "INFINISWAP_PROVIDER_SAMPLE_SIZE=$provider_sample_size"
-  )
+  module_args=("KDIR=$kdir")
+  if [[ -n $rdma_root ]]; then
+    module_args+=("INFINISWAP_RDMA_ROOT=$rdma_root")
+  fi
 
   make -C "$repo_root/infiniswap_bd" "${module_args[@]}" modules
   sudo make -C "$repo_root/infiniswap_bd" "${module_args[@]}" install
-  sudo install -D -m 0755 "$repo_root/infiniswap_bd/nbdxadm/nbdxadm" \
-    /usr/local/bin/nbdxadm
 else
   build_dir=${BUILD_DIR:-$repo_root/build/daemon}
   cmake_args=(

@@ -10,10 +10,12 @@ The current supported build targets are:
   MLNX_OFED 5.8.
 - Ubuntu 24.04 with the Linux 6.8 GA kernel and inbox RDMA.
 
-The modernization is incremental. The builds described here do not imply that
-the module is ready to load or that an Infiniswap Device is ready to use as
-swap. Runtime validation and production operations are tracked separately in
-`docs/modernization-plan.md`.
+The modernization is incremental. The current Memory Consumer milestone exposes
+a Backed Mode Infiniswap Device that routes all I/O to a dedicated Backing Store;
+its Remote Memory data path is disabled until the later Backed Mode RDMA
+milestone. It is suitable for the privileged block verification described here,
+not production swap activation. Runtime validation and production operations
+are tracked separately in `docs/modernization-plan.md`.
 
 ## Build Dependencies
 
@@ -116,29 +118,77 @@ make -C infiniswap_bd KDIR="$KDIR" \
 Kernel API differences are selected from capabilities present in the target
 headers, not from broad kernel-version conditionals.
 
-### Memory Consumer Configuration
+### Backed Mode Device
 
-Pass these variables to `make`:
+The module uses configfs as its lifecycle seam. Device creation, activation,
+swap formatting, and swap activation are separate operations. The module never
+runs `mkswap`, `swapon`, or `swapoff`.
 
-| Variable | Default | Meaning |
-| --- | ---: | --- |
-| `INFINISWAP_MAX_PAGES_PER_REQUEST` | `32` | Maximum pages in one swap request |
-| `INFINISWAP_BIO_PAGE_CAP` | `32` | Maximum pages in one bio |
-| `INFINISWAP_MAX_REMOTE_MEMORY_GB` | `32` | Maximum Remote Memory per Provider |
-| `INFINISWAP_DEVICE_SIZE_GB` | `12` | Infiniswap Device capacity |
-| `INFINISWAP_DEVICE_NAME` | `stackbd` | Internal backing device name |
-| `INFINISWAP_BACKING_STORE` | `/dev/sda4` | Backing Store path |
-| `INFINISWAP_PROVIDER_SAMPLE_SIZE` | `1` | Providers sampled for placement |
+Load the module, create an inactive configuration, and activate it only after
+selecting a dedicated block device, partition, or LVM logical volume:
 
-Multi-page swap-in requests map their page segments directly for RDMA. If a
-request needs more scatter/gather entries than its Memory Provider supports, or
-if any requested page lacks a valid Remote Memory copy, the complete request is
-read from the Backing Store. Merged writes larger than one page also use the
-Backing Store because the RDMA write-mirroring path remains single-page.
+```bash
+sudo modprobe configfs
+mountpoint -q /sys/kernel/config || \
+  sudo mount -t configfs none /sys/kernel/config
+sudo insmod infiniswap_bd/infiniswap.ko
 
-`setup/install.sh` maps the same settings from environment variables for legacy
-lab installation workflows. It builds and installs artifacts but does not load
-the module, create an Infiniswap Device, format swap, or alter active swap.
+sudo mkdir /sys/kernel/config/infiniswap/infiniswap0
+echo backed | \
+  sudo tee /sys/kernel/config/infiniswap/infiniswap0/mode
+echo /dev/vdb | \
+  sudo tee /sys/kernel/config/infiniswap/infiniswap0/backing_store
+echo $((64 * 1024 * 1024 * 1024)) | \
+  sudo tee /sys/kernel/config/infiniswap/infiniswap0/capacity_bytes
+echo activate | \
+  sudo tee /sys/kernel/config/infiniswap/infiniswap0/state
+cat /sys/kernel/config/infiniswap/infiniswap0/state
+```
+
+`mode` explicitly selects Backed Mode and cannot change while the device is
+active. `backing_store` rejects regular files, loop devices, read-only devices,
+and Infiniswap devices. Activation opens the Backing Store exclusively and
+rejects capacities larger than it or misaligned to its logical block size before
+`/dev/infiniswap0` is exposed. The device mirrors the Backing Store's write-cache
+and FUA capabilities and forwards flushes. Discard and write-zeroes are not
+advertised and are rejected if sent.
+
+Close every user and disable this specific device as swap, if an administrator
+enabled it separately, before draining and stopping it:
+
+```bash
+echo drain | \
+  sudo tee /sys/kernel/config/infiniswap/infiniswap0/state
+echo stop | \
+  sudo tee /sys/kernel/config/infiniswap/infiniswap0/state
+sudo rmdir /sys/kernel/config/infiniswap/infiniswap0
+sudo modprobe -r infiniswap
+```
+
+`drain` removes the block device from userspace and waits for every accepted
+request to complete. It returns `EBUSY` while the device has open users. `stop`
+releases its queue, minor, and exclusive Backing Store holder. An active or
+drained configfs item is pinned until `stop` succeeds, so it cannot be destroyed
+out from under in-flight I/O.
+
+For destructive verification in a disposable VM with a spare non-loop block
+device, install `fio` and run:
+
+```bash
+sudo INFINISWAP_TEST_DESTRUCTIVE=yes \
+  INFINISWAP_TEST_BACKING=/dev/vdb \
+  INFINISWAP_TEST_MODULE="$PWD/infiniswap_bd/infiniswap.ko" \
+  infiniswap_bd/tests/local-backing-test.sh
+```
+
+The test rejects unsafe Backing Stores, checks undersized activation and
+accepted backing-error completion, runs verified mixed, boundary, buffered, and
+flush I/O at multiple queue depths, repeats lifecycle teardown, and
+unloads/reloads the empty module. It overwrites the first 64 MiB of the supplied
+Backing Store.
+
+`setup/install.sh bd` only builds and installs the module. It does not load the
+module, create an Infiniswap Device, format swap, or alter active swap.
 
 ## Continuous Integration
 
