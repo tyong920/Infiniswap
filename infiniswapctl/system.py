@@ -1,6 +1,7 @@
 """Operating-system adapter used by the administration application."""
 
 import os
+import socket
 import stat
 import subprocess
 from pathlib import Path
@@ -43,11 +44,21 @@ class LocalSystem:
     def stat_file(self, path: str) -> Any:
         return os.stat(path, follow_symlinks=False)
 
+    def read_secret(self, path: str) -> bytes:
+        return Path(path).read_bytes()
+
     def rdma_rail_numa_node(self, device: str, port: int) -> int:
         rail = Path("/sys/class/infiniband") / device
         if not (rail / "ports" / str(port)).is_dir():
             raise OSError("RDMA port does not exist")
         return int((rail / "device" / "numa_node").read_text(encoding="ascii").strip())
+
+    def resolve_network_address(self, address: str, port: int) -> str:
+        results = socket.getaddrinfo(address, port, type=socket.SOCK_STREAM)
+        addresses = sorted({result[4][0] for result in results})
+        if len(addresses) != 1:
+            raise OSError("Provider address did not resolve uniquely")
+        return addresses[0]
 
     def _run(self, command: List[str]) -> None:
         try:

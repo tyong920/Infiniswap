@@ -1,12 +1,12 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/tyong920/Infiniswap/config/consumer.schema.json",
+  "$id": "https://github.com/tyong920/Infiniswap/config/consumer-v1.schema.json",
   "title": "Infiniswap Memory Consumer Configuration",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "identity", "device"],
   "properties": {
-    "schema_version": {"const": 2},
+    "schema_version": {"const": 1},
     "identity": {"$ref": "#/definitions/consumer_identity"},
     "device": {"$ref": "#/definitions/device"}
   },
@@ -37,28 +37,6 @@
         "consumer_id": {"$ref": "#/definitions/identifier"}
       }
     },
-    "hot_range": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["mapping_threshold", "read_weight", "write_weight"],
-      "properties": {
-        "mapping_threshold": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 9223372036854775807
-        },
-        "read_weight": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 1000000
-        },
-        "write_weight": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 1000000
-        }
-      }
-    },
     "device": {
       "type": "object",
       "additionalProperties": false,
@@ -67,7 +45,6 @@
         "mode",
         "capacity_bytes",
         "provider_failure_deadline_ms",
-        "hot_range",
         "provider_directory",
         "providers",
         "swap_priority"
@@ -88,7 +65,6 @@
           "minimum": 500,
           "maximum": 30000
         },
-        "hot_range": {"$ref": "#/definitions/hot_range"},
         "provider_directory": {"$ref": "#/definitions/absolute_path"},
         "providers": {
           "type": "array",

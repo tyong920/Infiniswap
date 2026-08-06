@@ -29,6 +29,18 @@
 #define IS_SECTOR_SIZE 512U
 #define IS_CONSUMER_ID_SIZE (IS_PROTOCOL_CONSUMER_ID_MAX + 1U)
 #define IS_PROVIDER_LIST_SIZE 4096U
+#define IS_PROVIDER_ADDRESS_SIZE 64U
+#define IS_RDMA_DEVICE_SIZE 64U
+#define IS_PROVIDER_KEY_ID_SIZE (IS_PROTOCOL_KEY_ID_MAX + 1U)
+#define IS_PSK_MIN_SIZE 32U
+#define IS_PSK_MAX_SIZE 64U
+#define IS_HOT_RANGE_THRESHOLD_DEFAULT 8U
+#define IS_HOT_RANGE_READ_WEIGHT_DEFAULT 1U
+#define IS_HOT_RANGE_WRITE_WEIGHT_DEFAULT 4U
+#define IS_REMOTE_CHUNK_BYTES (1ULL << 30)
+#define IS_MAX_REMOTE_CHUNKS IS_PROTOCOL_MAX_CHUNKS_PER_FRAME
+
+struct is_rdma_session;
 
 enum is_device_mode {
 	IS_DEVICE_MODE_UNSET = 0,
@@ -49,6 +61,13 @@ enum is_device_state {
 	IS_DEVICE_STOPPED,
 };
 
+enum is_connection_state {
+	IS_CONNECTION_NOT_CONNECTED = 0,
+	IS_CONNECTION_CONNECTING,
+	IS_CONNECTION_CONNECTED,
+	IS_CONNECTION_DEGRADED,
+};
+
 struct is_device {
 	struct config_group group;
 	struct mutex configfs_lock;
@@ -67,7 +86,18 @@ struct is_device {
 	char backing_path[PATH_MAX];
 	char consumer_id[IS_CONSUMER_ID_SIZE];
 	char providers[IS_PROVIDER_LIST_SIZE];
+	char provider_address[IS_PROVIDER_ADDRESS_SIZE];
+	char rdma_device[IS_RDMA_DEVICE_SIZE];
+	char provider_key_id[IS_PROVIDER_KEY_ID_SIZE];
+	u8 provider_psk[IS_PSK_MAX_SIZE];
+	u8 provider_psk_size;
+	u16 provider_port;
+	u8 rdma_port;
+	int rdma_numa_node;
 	u32 provider_failure_deadline_ms;
+	u64 hot_range_threshold;
+	u32 hot_range_read_weight;
+	u32 hot_range_write_weight;
 	int swap_priority;
 	int last_error;
 	u64 capacity_bytes;
@@ -76,6 +106,8 @@ struct is_device {
 	int minor;
 	atomic_t openers;
 	atomic_t inflight;
+	atomic_t connection_state;
+	atomic_t mapped_hot_ranges;
 	wait_queue_head_t drain_wait;
 	struct block_device *backing_bdev;
 #ifdef INFINISWAP_HAVE_BDEV_HANDLE
@@ -85,6 +117,7 @@ struct is_device {
 	struct workqueue_struct *ordered_backing_wq;
 	struct blk_mq_tag_set tag_set;
 	struct gendisk *disk;
+	struct is_rdma_session *rdma;
 };
 
 struct is_request_ctx {
@@ -111,10 +144,30 @@ int is_device_set_acknowledgement_policy(struct is_device *device,
 					 const char *buf, size_t count);
 int is_device_set_failure_deadline(struct is_device *device, const char *buf,
 				   size_t count);
+int is_device_set_hot_range_threshold(struct is_device *device, const char *buf,
+				      size_t count);
+int is_device_set_hot_range_read_weight(struct is_device *device,
+					const char *buf, size_t count);
+int is_device_set_hot_range_write_weight(struct is_device *device,
+					 const char *buf, size_t count);
 int is_device_set_consumer_id(struct is_device *device, const char *buf,
 			      size_t count);
 int is_device_set_providers(struct is_device *device, const char *buf,
 			    size_t count);
+int is_device_set_provider_address(struct is_device *device, const char *buf,
+				   size_t count);
+int is_device_set_provider_port(struct is_device *device, const char *buf,
+				size_t count);
+int is_device_set_rdma_device(struct is_device *device, const char *buf,
+			      size_t count);
+int is_device_set_rdma_port(struct is_device *device, const char *buf,
+			    size_t count);
+int is_device_set_rdma_numa_node(struct is_device *device, const char *buf,
+				 size_t count);
+int is_device_set_provider_key_id(struct is_device *device, const char *buf,
+				  size_t count);
+int is_device_set_provider_psk(struct is_device *device, const char *buf,
+			       size_t count);
 int is_device_set_swap_priority(struct is_device *device, const char *buf,
 				size_t count);
 const char *is_device_state_name(struct is_device *device);

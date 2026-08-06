@@ -274,6 +274,7 @@ run_io_verification() {
   write_must_fail consumer-other "$group/consumer_id"
   write_must_fail provider-other "$group/providers"
   write_must_fail 101 "$group/swap_priority"
+  write_must_fail 192.0.2.10 "$group/provider_address"
   [[ $(<"$group/acknowledgement_policy") == strict ]] || \
     fail "online acknowledgement policy changed"
   [[ $(<"$group/provider_failure_deadline_ms") == 2000 ]] || \
@@ -282,6 +283,15 @@ run_io_verification() {
     fail "unexpected initial connection status"
   [[ $(<"$group/remote_capacity_bytes") == 0 ]] || \
     fail "unexpected initial Remote Memory capacity"
+  printf '16\n' > "$group/hot_range_threshold"
+  printf '2\n' > "$group/hot_range_read_weight"
+  printf '6\n' > "$group/hot_range_write_weight"
+  [[ $(<"$group/hot_range_threshold") == 16 ]] || \
+    fail "runtime Hot Range threshold did not change"
+  [[ $(<"$group/hot_range_read_weight") == 2 ]] || \
+    fail "runtime read weight did not change"
+  [[ $(<"$group/hot_range_write_weight") == 6 ]] || \
+    fail "runtime write weight did not change"
 
   exec 9<>"$device"
   write_must_fail stop "$group/state"

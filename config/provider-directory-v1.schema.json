@@ -1,13 +1,13 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/tyong920/Infiniswap/provider-directory.schema.json",
+  "$id": "https://github.com/tyong920/Infiniswap/provider-directory-v1.schema.json",
   "title": "Infiniswap Provider Directory",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "providers"],
   "properties": {
     "schema_version": {
-      "const": 2
+      "const": 1
     },
     "providers": {
       "type": "object",
@@ -82,7 +82,7 @@
             },
             "numa_node": {
               "type": "integer",
-              "minimum": -1,
+              "minimum": 0,
               "maximum": 65535
             }
           }

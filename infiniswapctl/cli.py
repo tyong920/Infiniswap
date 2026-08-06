@@ -9,6 +9,7 @@ from typing import IO, Any, Dict, List, Optional, Tuple
 from .config import (
     ConfigError,
     ConsumerConfig,
+    GIB,
     load_consumer,
     load_provider,
     load_provider_directory,
@@ -53,16 +54,32 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _print_create_preflight(config: ConsumerConfig, stdout: IO[str]) -> None:
-    providers = ", ".join(provider.name for provider in config.providers)
+    provider = config.providers[0]
+    providers = ", ".join(entry.name for entry in config.providers)
     print("Preflight create " + config.name, file=stdout)
     print("  mode: " + config.mode, file=stdout)
     print("  acknowledgement policy: " + config.acknowledgement_policy, file=stdout)
     print("  capacity bytes: " + str(config.capacity_bytes), file=stdout)
     print("  Backing Store: " + config.backing_store, file=stdout)
     print("  Providers: " + providers, file=stdout)
+    print("  Provider endpoint: %s:%d" % (provider.address, provider.port), file=stdout)
+    print(
+        "  RDMA Rail: %s port %d, NUMA node %d"
+        % (provider.rail_device, provider.rail_port, provider.numa_node),
+        file=stdout,
+    )
     print("  explicit swap priority: " + str(config.swap_priority), file=stdout)
     print(
         "  Provider Failure Deadline: %d ms" % config.provider_failure_deadline_ms,
+        file=stdout,
+    )
+    print(
+        "  Hot Range scoring: threshold %d, read weight %d, write weight %d"
+        % (
+            config.hot_range_threshold,
+            config.hot_range_read_weight,
+            config.hot_range_write_weight,
+        ),
         file=stdout,
     )
 
@@ -75,14 +92,25 @@ def _create(config: ConsumerConfig, system: Any, stdout: IO[str]) -> None:
 
     system.create_group(config.name)
     try:
+        provider = config.providers[0]
         attributes = (
             ("mode", config.mode),
             ("acknowledgement_policy", config.acknowledgement_policy),
             ("backing_store", config.backing_store),
             ("capacity_bytes", str(config.capacity_bytes)),
             ("provider_failure_deadline_ms", str(config.provider_failure_deadline_ms)),
+            ("hot_range_threshold", str(config.hot_range_threshold)),
+            ("hot_range_read_weight", str(config.hot_range_read_weight)),
+            ("hot_range_write_weight", str(config.hot_range_write_weight)),
             ("consumer_id", config.consumer_id),
-            ("providers", ",".join(provider.name for provider in config.providers)),
+            ("providers", provider.name),
+            ("provider_address", provider.address),
+            ("provider_port", str(provider.port)),
+            ("rdma_device", provider.rail_device),
+            ("rdma_port", str(provider.rail_port)),
+            ("rdma_numa_node", str(provider.numa_node)),
+            ("provider_key_id", provider.key_id),
+            ("provider_psk", provider.psk.hex()),
             ("swap_priority", str(config.swap_priority)),
             ("state", "activate"),
         )
@@ -188,6 +216,10 @@ def _device_status(name: str, system: Any) -> Dict[str, Any]:
     policy = system.read_attribute(name, "acknowledgement_policy")
     capacity_bytes = int(system.read_attribute(name, "capacity_bytes"))
     deadline_ms = int(system.read_attribute(name, "provider_failure_deadline_ms"))
+    mapping_threshold = int(system.read_attribute(name, "hot_range_threshold"))
+    read_weight = int(system.read_attribute(name, "hot_range_read_weight"))
+    write_weight = int(system.read_attribute(name, "hot_range_write_weight"))
+    mapped_hot_ranges = int(system.read_attribute(name, "mapped_hot_ranges"))
     connection_state = system.read_attribute(name, "connection_state")
     remote_capacity_bytes = int(system.read_attribute(name, "remote_capacity_bytes"))
     provider_names = sorted(
@@ -207,7 +239,7 @@ def _device_status(name: str, system: Any) -> Dict[str, Any]:
         }
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "infiniswap.device-status",
         "device": {
             "name": name,
@@ -236,6 +268,13 @@ def _device_status(name: str, system: Any) -> Dict[str, Any]:
             "backing_bytes": capacity_bytes if mode == "backed" else 0,
             "remote_bytes": remote_capacity_bytes,
         },
+        "mapping": {
+            "chunk_size_bytes": GIB,
+            "threshold": mapping_threshold,
+            "read_weight": read_weight,
+            "write_weight": write_weight,
+            "mapped_hot_ranges": mapped_hot_ranges,
+        },
         "last_error": last_error,
     }
 
@@ -261,6 +300,16 @@ def _print_status(status: Dict[str, Any], json_output: bool, stdout: IO[str]) ->
     print(
         "  capacity: %d bytes advertised, %d bytes remote"
         % (capacity["advertised_bytes"], capacity["remote_bytes"]),
+        file=stdout,
+    )
+    print(
+        "  Hot Ranges: %d mapped (threshold %d, read/write weights %d/%d)"
+        % (
+            status["mapping"]["mapped_hot_ranges"],
+            status["mapping"]["threshold"],
+            status["mapping"]["read_weight"],
+            status["mapping"]["write_weight"],
+        ),
         file=stdout,
     )
     if device["swap"]["enabled"]:

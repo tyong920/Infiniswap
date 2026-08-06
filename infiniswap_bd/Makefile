@@ -1,7 +1,7 @@
 ifneq ($(KERNELRELEASE),)
 
 obj-m := infiniswap.o
-infiniswap-y := is_configfs.o is_mq.o is_main.o is_protocol.o
+infiniswap-y := is_configfs.o is_mq.o is_main.o is_protocol.o is_rdma.o
 ccflags-y += -I$(src)/../common
 
 kernel_include_dirs := $(srctree)/include $(objtree)/include

@@ -32,6 +32,13 @@ class FakeSystem:
             ),
         }
         self.rdma_rails = {("mlx5_ib2", 1): 0}
+        self.secrets = {
+            "/etc/infiniswap/keys/provider-a.psk": b"p" * 32,
+            "/etc/infiniswap/keys/consumer-a.psk": b"c" * 32,
+        }
+
+    def read_secret(self, path):
+        return self.secrets[path]
 
     def is_block_device(self, path):
         return path in self.block_devices
@@ -47,6 +54,11 @@ class FakeSystem:
 
     def rdma_rail_numa_node(self, device, port):
         return self.rdma_rails[(device, port)]
+
+    def resolve_network_address(self, address, port):
+        if address == "provider.example.test":
+            raise OSError("injected ambiguous address")
+        return address
 
     def is_root(self):
         return self.root
@@ -113,7 +125,7 @@ class CliValidationTest(unittest.TestCase):
         self.provider_directory_path.write_text(
             json.dumps(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "providers": {
                         "provider-a": {
                             "address": "192.0.2.10",
@@ -154,13 +166,18 @@ class CliValidationTest(unittest.TestCase):
             "backing_store": "/dev/vdb",
             "capacity_bytes": 8 * GIB,
             "provider_failure_deadline_ms": 2000,
+            "hot_range": {
+                "mapping_threshold": 8,
+                "read_weight": 1,
+                "write_weight": 4,
+            },
             "provider_directory": str(self.provider_directory_path),
             "providers": ["provider-a"],
             "swap_priority": 100,
         }
         device.update(device_overrides)
         config = {
-            "schema_version": 1,
+            "schema_version": 2,
             "identity": {"consumer_id": "consumer-a"},
             "device": device,
         }
@@ -180,6 +197,20 @@ class CliValidationTest(unittest.TestCase):
         )
         return result, stdout.getvalue(), stderr.getvalue(), system
 
+    def test_version_one_consumer_config_keeps_legacy_hot_range_defaults(self):
+        path = self.write_consumer()
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["schema_version"] = 1
+        del document["device"]["hot_range"]
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+        result, stdout, stderr, system = self.invoke_create(path)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("threshold 8, read weight 1, write weight 4", stdout)
+        self.assertEqual(system.mutations, [])
+
     def test_create_rejects_missing_capacity_before_system_mutation(self):
         path = self.write_consumer()
         document = json.loads(path.read_text(encoding="utf-8"))
@@ -194,7 +225,7 @@ class CliValidationTest(unittest.TestCase):
         self.assertEqual(stdout, "")
 
     def test_create_rejects_untrusted_provider_before_system_mutation(self):
-        path = self.write_consumer(providers=["provider-a", "provider-z"])
+        path = self.write_consumer(providers=["provider-z"])
 
         result, stdout, stderr, system = self.invoke_create(path)
 
@@ -220,7 +251,86 @@ class CliValidationTest(unittest.TestCase):
                 self.assertIn(message, stderr)
                 self.assertEqual(system.mutations, [])
 
-    def test_create_rejects_provider_selection_too_large_for_configfs(self):
+    def test_create_rejects_multiple_providers_before_system_mutation(self):
+        directory = json.loads(self.provider_directory_path.read_text(encoding="utf-8"))
+        directory["providers"]["provider-b"] = json.loads(
+            json.dumps(directory["providers"]["provider-a"])
+        )
+        self.provider_directory_path.write_text(json.dumps(directory), encoding="utf-8")
+
+        result, stdout, stderr, system = self.invoke_create(
+            self.write_consumer(providers=["provider-a", "provider-b"])
+        )
+
+        self.assertEqual(result, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("exactly one Provider", stderr)
+        self.assertEqual(system.mutations, [])
+
+    def test_create_rejects_invalid_hot_range_scoring(self):
+        cases = (
+            (
+                {"mapping_threshold": 0, "read_weight": 1, "write_weight": 4},
+                "mapping_threshold",
+            ),
+            (
+                {"mapping_threshold": 8, "read_weight": 0, "write_weight": 4},
+                "read_weight",
+            ),
+            (
+                {"mapping_threshold": 8, "read_weight": 1, "write_weight": 0},
+                "write_weight",
+            ),
+        )
+        for hot_range, message in cases:
+            with self.subTest(message=message):
+                result, stdout, stderr, system = self.invoke_create(
+                    self.write_consumer(hot_range=hot_range)
+                )
+                self.assertEqual(result, 2)
+                self.assertEqual(stdout, "")
+                self.assertIn(message, stderr)
+                self.assertEqual(system.mutations, [])
+
+    def test_soft_roce_rail_without_numa_node_is_supported(self):
+        directory = json.loads(self.provider_directory_path.read_text(encoding="utf-8"))
+        directory["providers"]["provider-a"]["rdma_rail"]["numa_node"] = -1
+        self.provider_directory_path.write_text(json.dumps(directory), encoding="utf-8")
+        system = FakeSystem()
+        system.rdma_rails[("mlx5_ib2", 1)] = -1
+
+        result, stdout, stderr, used_system = self.invoke_create(
+            self.write_consumer(), system
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("Dry run: no changes made", stdout)
+        self.assertEqual(used_system.mutations, [])
+
+    def test_create_rejects_invalid_provider_address_and_psk(self):
+        directory = json.loads(self.provider_directory_path.read_text(encoding="utf-8"))
+        directory["providers"]["provider-a"]["address"] = "provider.example.test"
+        self.provider_directory_path.write_text(json.dumps(directory), encoding="utf-8")
+        result, stdout, stderr, system = self.invoke_create(self.write_consumer())
+        self.assertEqual(result, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("resolve to exactly one network address", stderr)
+        self.assertEqual(system.mutations, [])
+
+        directory["providers"]["provider-a"]["address"] = "192.0.2.10"
+        self.provider_directory_path.write_text(json.dumps(directory), encoding="utf-8")
+        system = FakeSystem()
+        system.secrets["/etc/infiniswap/keys/provider-a.psk"] = b"too-short"
+        result, stdout, stderr, system = self.invoke_create(
+            self.write_consumer(), system
+        )
+        self.assertEqual(result, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("32-64 byte PSK", stderr)
+        self.assertEqual(system.mutations, [])
+
+    def test_create_rejects_provider_selection_beyond_single_provider_scope(self):
         directory = json.loads(self.provider_directory_path.read_text(encoding="utf-8"))
         template = directory["providers"]["provider-a"]
         provider_names = ["p%062d" % index for index in range(64)]
@@ -235,7 +345,7 @@ class CliValidationTest(unittest.TestCase):
 
         self.assertEqual(result, 2)
         self.assertEqual(stdout, "")
-        self.assertIn("Provider selection is too large for configfs", stderr)
+        self.assertIn("exactly one Provider", stderr)
         self.assertEqual(system.mutations, [])
 
     def test_create_dry_run_reports_validated_plan_without_mutation(self):
@@ -284,8 +394,23 @@ class CliValidationTest(unittest.TestCase):
                     "provider_failure_deadline_ms",
                     "2000",
                 ),
+                ("write_attribute", "infiniswap0", "hot_range_threshold", "8"),
+                ("write_attribute", "infiniswap0", "hot_range_read_weight", "1"),
+                ("write_attribute", "infiniswap0", "hot_range_write_weight", "4"),
                 ("write_attribute", "infiniswap0", "consumer_id", "consumer-a"),
                 ("write_attribute", "infiniswap0", "providers", "provider-a"),
+                ("write_attribute", "infiniswap0", "provider_address", "192.0.2.10"),
+                ("write_attribute", "infiniswap0", "provider_port", "9400"),
+                ("write_attribute", "infiniswap0", "rdma_device", "mlx5_ib2"),
+                ("write_attribute", "infiniswap0", "rdma_port", "1"),
+                ("write_attribute", "infiniswap0", "rdma_numa_node", "0"),
+                ("write_attribute", "infiniswap0", "provider_key_id", "key-current"),
+                (
+                    "write_attribute",
+                    "infiniswap0",
+                    "provider_psk",
+                    (b"p" * 32).hex(),
+                ),
                 ("write_attribute", "infiniswap0", "swap_priority", "100"),
                 ("write_attribute", "infiniswap0", "state", "activate"),
             ],
@@ -329,7 +454,7 @@ class ProviderValidationTest(unittest.TestCase):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.path = Path(self.temporary_directory.name) / "provider.json"
         self.provider = {
-            "schema_version": 1,
+            "schema_version": 2,
             "identity": {"provider_id": "provider-a"},
             "listen": {"address": "::", "port": 9400},
             "rdma_rail": {
@@ -436,6 +561,10 @@ class LifecycleCommandTest(unittest.TestCase):
             "backing_store": "/dev/vdb",
             "capacity_bytes": str(8 * GIB),
             "provider_failure_deadline_ms": "2000",
+            "hot_range_threshold": "8",
+            "hot_range_read_weight": "1",
+            "hot_range_write_weight": "4",
+            "mapped_hot_ranges": "1",
             "consumer_id": "consumer-a",
             "providers": "provider-a",
             "swap_priority": "100",
@@ -530,13 +659,24 @@ class LifecycleCommandTest(unittest.TestCase):
             stderr=stderr,
         )
 
-        snapshot = (Path(__file__).parent / "snapshots" / "status-v1.json").read_text(
+        snapshot = (Path(__file__).parent / "snapshots" / "status-v2.json").read_text(
             encoding="utf-8"
         )
         self.assertEqual((result, stderr.getvalue()), (0, ""))
         self.assertEqual(stdout.getvalue(), snapshot)
         self.assertNotIn("psk", stdout.getvalue().lower())
         self.assertNotIn("key-current", stdout.getvalue())
+        status = json.loads(stdout.getvalue())
+        self.assertEqual(
+            status["mapping"],
+            {
+                "chunk_size_bytes": GIB,
+                "mapped_hot_ranges": 1,
+                "read_weight": 1,
+                "threshold": 8,
+                "write_weight": 4,
+            },
+        )
 
         result, human, error = self.invoke("status", "infiniswap0")
         self.assertEqual((result, error), (0, ""))

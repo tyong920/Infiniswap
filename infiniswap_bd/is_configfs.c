@@ -122,6 +122,57 @@ static ssize_t is_device_provider_failure_deadline_ms_store(
 	return is_store_result(device, ret, count);
 }
 
+static ssize_t is_device_hot_range_threshold_show(struct config_item *item,
+						   char *page)
+{
+	return sysfs_emit(page, "%llu\n",
+		READ_ONCE(to_is_device(item)->hot_range_threshold));
+}
+
+static ssize_t is_device_hot_range_threshold_store(struct config_item *item,
+						    const char *page,
+						    size_t count)
+{
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_hot_range_threshold(device, page, count);
+
+	return is_store_result(device, ret, count);
+}
+
+static ssize_t is_device_hot_range_read_weight_show(struct config_item *item,
+						     char *page)
+{
+	return sysfs_emit(page, "%u\n",
+		READ_ONCE(to_is_device(item)->hot_range_read_weight));
+}
+
+static ssize_t is_device_hot_range_read_weight_store(struct config_item *item,
+						      const char *page,
+						      size_t count)
+{
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_hot_range_read_weight(device, page, count);
+
+	return is_store_result(device, ret, count);
+}
+
+static ssize_t is_device_hot_range_write_weight_show(struct config_item *item,
+						      char *page)
+{
+	return sysfs_emit(page, "%u\n",
+		READ_ONCE(to_is_device(item)->hot_range_write_weight));
+}
+
+static ssize_t is_device_hot_range_write_weight_store(struct config_item *item,
+						       const char *page,
+						       size_t count)
+{
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_hot_range_write_weight(device, page, count);
+
+	return is_store_result(device, ret, count);
+}
+
 static ssize_t is_device_consumer_id_show(struct config_item *item, char *page)
 {
 	struct is_device *device = to_is_device(item);
@@ -162,6 +213,105 @@ static ssize_t is_device_providers_store(struct config_item *item,
 	return is_store_result(device, ret, count);
 }
 
+static ssize_t is_device_provider_address_show(struct config_item *item,
+						char *page)
+{
+	struct is_device *device = to_is_device(item);
+
+	return sysfs_emit(page, "%s\n", device->provider_address);
+}
+
+static ssize_t is_device_provider_address_store(struct config_item *item,
+						 const char *page,
+						 size_t count)
+{
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_provider_address(device, page, count);
+
+	return is_store_result(device, ret, count);
+}
+
+static ssize_t is_device_provider_port_show(struct config_item *item, char *page)
+{
+	return sysfs_emit(page, "%u\n", to_is_device(item)->provider_port);
+}
+
+static ssize_t is_device_provider_port_store(struct config_item *item,
+					      const char *page, size_t count)
+{
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_provider_port(device, page, count);
+
+	return is_store_result(device, ret, count);
+}
+
+static ssize_t is_device_rdma_device_show(struct config_item *item, char *page)
+{
+	return sysfs_emit(page, "%s\n", to_is_device(item)->rdma_device);
+}
+
+static ssize_t is_device_rdma_device_store(struct config_item *item,
+					    const char *page, size_t count)
+{
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_rdma_device(device, page, count);
+
+	return is_store_result(device, ret, count);
+}
+
+static ssize_t is_device_rdma_port_show(struct config_item *item, char *page)
+{
+	return sysfs_emit(page, "%u\n", to_is_device(item)->rdma_port);
+}
+
+static ssize_t is_device_rdma_port_store(struct config_item *item,
+					  const char *page, size_t count)
+{
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_rdma_port(device, page, count);
+
+	return is_store_result(device, ret, count);
+}
+
+static ssize_t is_device_rdma_numa_node_show(struct config_item *item,
+					      char *page)
+{
+	return sysfs_emit(page, "%d\n", to_is_device(item)->rdma_numa_node);
+}
+
+static ssize_t is_device_rdma_numa_node_store(struct config_item *item,
+					       const char *page, size_t count)
+{
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_rdma_numa_node(device, page, count);
+
+	return is_store_result(device, ret, count);
+}
+
+static ssize_t is_device_provider_key_id_show(struct config_item *item,
+					       char *page)
+{
+	return sysfs_emit(page, "%s\n", to_is_device(item)->provider_key_id);
+}
+
+static ssize_t is_device_provider_key_id_store(struct config_item *item,
+						const char *page, size_t count)
+{
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_provider_key_id(device, page, count);
+
+	return is_store_result(device, ret, count);
+}
+
+static ssize_t is_device_provider_psk_store(struct config_item *item,
+					     const char *page, size_t count)
+{
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_provider_psk(device, page, count);
+
+	return is_store_result(device, ret, count);
+}
+
 static ssize_t is_device_swap_priority_show(struct config_item *item,
 					    char *page)
 {
@@ -186,7 +336,23 @@ static ssize_t is_device_swap_priority_store(struct config_item *item,
 static ssize_t is_device_connection_state_show(struct config_item *item,
 						char *page)
 {
-	return sysfs_emit(page, "not-connected\n");
+	const char *name;
+
+	switch (atomic_read(&to_is_device(item)->connection_state)) {
+	case IS_CONNECTION_CONNECTING:
+		name = "connecting";
+		break;
+	case IS_CONNECTION_CONNECTED:
+		name = "connected";
+		break;
+	case IS_CONNECTION_DEGRADED:
+		name = "degraded";
+		break;
+	default:
+		name = "not-connected";
+		break;
+	}
+	return sysfs_emit(page, "%s\n", name);
 }
 
 static ssize_t is_device_remote_capacity_bytes_show(struct config_item *item,
@@ -199,6 +365,13 @@ static ssize_t is_device_remote_capacity_bytes_show(struct config_item *item,
 	count = sysfs_emit(page, "%llu\n", device->remote_capacity_bytes);
 	mutex_unlock(&device->lifecycle_lock);
 	return count;
+}
+
+static ssize_t is_device_mapped_hot_ranges_show(struct config_item *item,
+						 char *page)
+{
+	return sysfs_emit(page, "%d\n",
+		atomic_read(&to_is_device(item)->mapped_hot_ranges));
 }
 
 static ssize_t is_device_last_error_show(struct config_item *item, char *page)
@@ -260,11 +433,22 @@ CONFIGFS_ATTR(is_device_, mode);
 CONFIGFS_ATTR(is_device_, acknowledgement_policy);
 CONFIGFS_ATTR(is_device_, capacity_bytes);
 CONFIGFS_ATTR(is_device_, provider_failure_deadline_ms);
+CONFIGFS_ATTR(is_device_, hot_range_threshold);
+CONFIGFS_ATTR(is_device_, hot_range_read_weight);
+CONFIGFS_ATTR(is_device_, hot_range_write_weight);
 CONFIGFS_ATTR(is_device_, consumer_id);
 CONFIGFS_ATTR(is_device_, providers);
+CONFIGFS_ATTR(is_device_, provider_address);
+CONFIGFS_ATTR(is_device_, provider_port);
+CONFIGFS_ATTR(is_device_, rdma_device);
+CONFIGFS_ATTR(is_device_, rdma_port);
+CONFIGFS_ATTR(is_device_, rdma_numa_node);
+CONFIGFS_ATTR(is_device_, provider_key_id);
+CONFIGFS_ATTR_WO(is_device_, provider_psk);
 CONFIGFS_ATTR(is_device_, swap_priority);
 CONFIGFS_ATTR_RO(is_device_, connection_state);
 CONFIGFS_ATTR_RO(is_device_, remote_capacity_bytes);
+CONFIGFS_ATTR_RO(is_device_, mapped_hot_ranges);
 CONFIGFS_ATTR_RO(is_device_, last_error);
 CONFIGFS_ATTR(is_device_, state);
 
@@ -274,11 +458,22 @@ static struct configfs_attribute *is_device_attrs[] = {
 	&is_device_attr_acknowledgement_policy,
 	&is_device_attr_capacity_bytes,
 	&is_device_attr_provider_failure_deadline_ms,
+	&is_device_attr_hot_range_threshold,
+	&is_device_attr_hot_range_read_weight,
+	&is_device_attr_hot_range_write_weight,
 	&is_device_attr_consumer_id,
 	&is_device_attr_providers,
+	&is_device_attr_provider_address,
+	&is_device_attr_provider_port,
+	&is_device_attr_rdma_device,
+	&is_device_attr_rdma_port,
+	&is_device_attr_rdma_numa_node,
+	&is_device_attr_provider_key_id,
+	&is_device_attr_provider_psk,
 	&is_device_attr_swap_priority,
 	&is_device_attr_connection_state,
 	&is_device_attr_remote_capacity_bytes,
+	&is_device_attr_mapped_hot_ranges,
 	&is_device_attr_last_error,
 	&is_device_attr_state,
 	NULL,
@@ -291,6 +486,7 @@ static void is_device_release(struct config_item *item)
 	WARN_ON(device->configfs_dependent);
 	WARN_ON(device->disk);
 	WARN_ON(device->backing_bdev);
+	memzero_explicit(device->provider_psk, sizeof(device->provider_psk));
 	kfree(device);
 }
 

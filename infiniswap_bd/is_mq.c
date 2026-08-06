@@ -6,12 +6,16 @@
  */
 #include <linux/ctype.h>
 #include <linux/fs.h>
+#include <linux/highmem.h>
 #include <linux/major.h>
 #include <linux/namei.h>
+#include <linux/refcount.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 
 #include "infiniswap.h"
+#include "is_io_policy.h"
+#include "is_rdma.h"
 
 #ifdef INFINISWAP_HAVE_BDEV_HANDLE
 #define IS_BACKING_MODE (BLK_OPEN_READ | BLK_OPEN_WRITE | BLK_OPEN_EXCL)
@@ -45,10 +49,16 @@ void is_device_init(struct is_device *device, const char *name)
 	init_waitqueue_head(&device->drain_wait);
 	atomic_set(&device->openers, 0);
 	atomic_set(&device->inflight, 0);
+	atomic_set(&device->connection_state, IS_CONNECTION_NOT_CONNECTED);
+	atomic_set(&device->mapped_hot_ranges, 0);
 	device->mode = IS_DEVICE_MODE_UNSET;
 	device->acknowledgement_policy = IS_ACKNOWLEDGEMENT_POLICY_STRICT;
 	device->provider_failure_deadline_ms =
 		IS_PROTOCOL_FAILURE_DEADLINE_DEFAULT_MS;
+	device->hot_range_threshold = IS_HOT_RANGE_THRESHOLD_DEFAULT;
+	device->hot_range_read_weight = IS_HOT_RANGE_READ_WEIGHT_DEFAULT;
+	device->hot_range_write_weight = IS_HOT_RANGE_WRITE_WEIGHT_DEFAULT;
+	device->rdma_numa_node = NUMA_NO_NODE;
 	device->swap_priority = -1;
 	device->state = IS_DEVICE_CREATED;
 	device->minor = -1;
@@ -149,6 +159,50 @@ int is_device_set_failure_deadline(struct is_device *device, const char *buf,
 	return ret;
 }
 
+int is_device_set_hot_range_threshold(struct is_device *device, const char *buf,
+				      size_t count)
+{
+	u64 threshold;
+	int ret;
+
+	(void)count;
+	ret = kstrtoull(buf, 0, &threshold);
+	if (ret)
+		return ret;
+	if (!threshold || threshold > S64_MAX)
+		return -ERANGE;
+	WRITE_ONCE(device->hot_range_threshold, threshold);
+	is_rdma_mapping_parameters_changed(device);
+	return 0;
+}
+
+static int is_device_set_hot_range_weight(u32 *target, const char *buf)
+{
+	u32 weight;
+	int ret = kstrtou32(buf, 0, &weight);
+
+	if (ret)
+		return ret;
+	if (!weight || weight > 1000000U)
+		return -ERANGE;
+	WRITE_ONCE(*target, weight);
+	return 0;
+}
+
+int is_device_set_hot_range_read_weight(struct is_device *device,
+					const char *buf, size_t count)
+{
+	(void)count;
+	return is_device_set_hot_range_weight(&device->hot_range_read_weight, buf);
+}
+
+int is_device_set_hot_range_write_weight(struct is_device *device,
+					 const char *buf, size_t count)
+{
+	(void)count;
+	return is_device_set_hot_range_weight(&device->hot_range_write_weight, buf);
+}
+
 static bool is_runtime_identifier_valid(const char *value)
 {
 	const unsigned char *cursor = (const unsigned char *)value;
@@ -221,6 +275,10 @@ int is_device_set_providers(struct is_device *device, const char *buf,
 	if (!candidate)
 		return -ENOMEM;
 	providers = strim(candidate);
+	if (strchr(providers, ',')) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
 	validation_copy = kstrdup(providers, GFP_KERNEL);
 	if (!validation_copy) {
 		ret = -ENOMEM;
@@ -241,6 +299,168 @@ int is_device_set_providers(struct is_device *device, const char *buf,
 free_validation:
 	kfree(validation_copy);
 out:
+	kfree(candidate);
+	return ret;
+}
+
+static int is_device_set_config_string(struct is_device *device,
+				       const char *buf, size_t count,
+				       char *target, size_t target_size,
+				       bool identifier)
+{
+	char *candidate;
+	char *value;
+	int ret = 0;
+
+	if (!count || count > target_size)
+		return -ENAMETOOLONG;
+	candidate = kstrndup(buf, count, GFP_KERNEL);
+	if (!candidate)
+		return -ENOMEM;
+	value = strim(candidate);
+	if (!value[0] || strlen(value) >= target_size ||
+	    (identifier && !is_runtime_identifier_valid(value))) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	mutex_lock(&device->lifecycle_lock);
+	if (!is_device_configurable(device))
+		ret = -EBUSY;
+	else
+		strscpy(target, value, target_size);
+	mutex_unlock(&device->lifecycle_lock);
+out:
+	kfree(candidate);
+	return ret;
+}
+
+int is_device_set_provider_address(struct is_device *device, const char *buf,
+				   size_t count)
+{
+	return is_device_set_config_string(device, buf, count,
+		device->provider_address, sizeof(device->provider_address), false);
+}
+
+int is_device_set_rdma_device(struct is_device *device, const char *buf,
+			      size_t count)
+{
+	return is_device_set_config_string(device, buf, count,
+		device->rdma_device, sizeof(device->rdma_device), true);
+}
+
+int is_device_set_provider_key_id(struct is_device *device, const char *buf,
+				  size_t count)
+{
+	return is_device_set_config_string(device, buf, count,
+		device->provider_key_id, sizeof(device->provider_key_id), true);
+}
+
+int is_device_set_provider_port(struct is_device *device, const char *buf,
+				size_t count)
+{
+	u16 port;
+	int ret;
+
+	(void)count;
+	ret = kstrtou16(buf, 0, &port);
+	if (ret)
+		return ret;
+	if (!port)
+		return -ERANGE;
+	mutex_lock(&device->lifecycle_lock);
+	if (!is_device_configurable(device))
+		ret = -EBUSY;
+	else {
+		device->provider_port = port;
+		ret = 0;
+	}
+	mutex_unlock(&device->lifecycle_lock);
+	return ret;
+}
+
+int is_device_set_rdma_port(struct is_device *device, const char *buf,
+			    size_t count)
+{
+	u8 port;
+	int ret;
+
+	(void)count;
+	ret = kstrtou8(buf, 0, &port);
+	if (ret)
+		return ret;
+	if (!port)
+		return -ERANGE;
+	mutex_lock(&device->lifecycle_lock);
+	if (!is_device_configurable(device))
+		ret = -EBUSY;
+	else {
+		device->rdma_port = port;
+		ret = 0;
+	}
+	mutex_unlock(&device->lifecycle_lock);
+	return ret;
+}
+
+int is_device_set_rdma_numa_node(struct is_device *device, const char *buf,
+				 size_t count)
+{
+	int numa_node;
+	int ret;
+
+	(void)count;
+	ret = kstrtoint(buf, 0, &numa_node);
+	if (ret)
+		return ret;
+	if (numa_node < NUMA_NO_NODE || numa_node > 65535)
+		return -ERANGE;
+	mutex_lock(&device->lifecycle_lock);
+	if (!is_device_configurable(device))
+		ret = -EBUSY;
+	else {
+		device->rdma_numa_node = numa_node;
+		ret = 0;
+	}
+	mutex_unlock(&device->lifecycle_lock);
+	return ret;
+}
+
+int is_device_set_provider_psk(struct is_device *device, const char *buf,
+			       size_t count)
+{
+	u8 secret[IS_PSK_MAX_SIZE];
+	char *candidate;
+	char *encoded;
+	size_t encoded_size;
+	int ret = 0;
+
+	if (!count || count > IS_PSK_MAX_SIZE * 2U + 1U)
+		return -E2BIG;
+	candidate = kstrndup(buf, count, GFP_KERNEL);
+	if (!candidate)
+		return -ENOMEM;
+	encoded = strim(candidate);
+	encoded_size = strlen(encoded);
+	if (encoded_size < IS_PSK_MIN_SIZE * 2U ||
+	    encoded_size > IS_PSK_MAX_SIZE * 2U || (encoded_size & 1U) ||
+	    hex2bin(secret, encoded, encoded_size / 2U)) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	mutex_lock(&device->lifecycle_lock);
+	if (!is_device_configurable(device)) {
+		ret = -EBUSY;
+	} else {
+		memzero_explicit(device->provider_psk,
+				 sizeof(device->provider_psk));
+		memcpy(device->provider_psk, secret, encoded_size / 2U);
+		device->provider_psk_size = encoded_size / 2U;
+	}
+	mutex_unlock(&device->lifecycle_lock);
+out:
+	memzero_explicit(secret, sizeof(secret));
+	memzero_explicit(candidate, count);
 	kfree(candidate);
 	return ret;
 }
@@ -476,6 +696,336 @@ static struct bio *is_clone_bio(struct is_device *device, struct bio *source)
 	return clone;
 }
 
+struct is_remote_request {
+	struct is_device *device;
+	struct request *request;
+	spinlock_t policy_lock;
+	refcount_t references;
+	struct is_io_policy policy;
+	atomic_t pending_bios;
+	atomic_t local_status;
+	struct work_struct fallback_work;
+	struct is_rdma_io rdma_io;
+	struct page *owned_pages[IS_RDMA_MAX_SEGMENTS];
+	unsigned int owned_page_count;
+};
+
+static void is_remote_request_put(struct is_remote_request *remote)
+{
+	unsigned int index;
+
+	if (!refcount_dec_and_test(&remote->references))
+		return;
+	WARN_ON_ONCE(!remote->policy.request_complete);
+	WARN_ON_ONCE(!is_io_policy_releasable(&remote->policy));
+	for (index = 0; index < remote->owned_page_count; index++)
+		__free_page(remote->owned_pages[index]);
+	is_finish_inflight(remote->device);
+	kfree(remote);
+}
+
+static void is_remote_local_complete(struct is_remote_request *remote,
+				     blk_status_t status);
+static void is_remote_path_complete(struct is_remote_request *remote,
+				    bool remote_path,
+				    blk_status_t status);
+
+static void is_remote_apply_action(struct is_remote_request *remote,
+				   enum is_io_action action,
+				   blk_status_t completion_status)
+{
+	if (action == IS_IO_SUBMIT_LOCAL) {
+		refcount_inc(&remote->references);
+		if (!queue_work(remote->device->ordered_backing_wq,
+				&remote->fallback_work))
+			is_remote_path_complete(remote, false, BLK_STS_IOERR);
+	} else if (action == IS_IO_COMPLETE_SUCCESS) {
+		blk_mq_end_request(remote->request, BLK_STS_OK);
+	} else if (action == IS_IO_COMPLETE_ERROR) {
+		blk_mq_end_request(remote->request, completion_status);
+	}
+}
+
+static void is_remote_path_complete(struct is_remote_request *remote,
+				    bool remote_path,
+				    blk_status_t status)
+{
+	enum is_io_action action;
+	blk_status_t completion_status = status;
+	unsigned long flags;
+
+	spin_lock_irqsave(&remote->policy_lock, flags);
+	if (remote_path)
+		action = is_io_policy_remote_complete(&remote->policy,
+			(__force int)status);
+	else
+		action = is_io_policy_local_complete(&remote->policy,
+			(__force int)status);
+	if (action == IS_IO_COMPLETE_ERROR) {
+		if (remote->policy.local_done)
+			completion_status = (__force blk_status_t)
+				remote->policy.local_status;
+		else
+			completion_status = (__force blk_status_t)
+				remote->policy.remote_status;
+	}
+	spin_unlock_irqrestore(&remote->policy_lock, flags);
+
+	if (!remote_path && status != BLK_STS_OK)
+		WRITE_ONCE(remote->device->last_error, EIO);
+	is_remote_apply_action(remote, action, completion_status);
+	is_remote_request_put(remote);
+}
+
+static void is_remote_rdma_complete(void *context, int status)
+{
+	struct is_remote_request *remote = context;
+
+	is_remote_path_complete(remote, true,
+		status ? errno_to_blk_status(status) : BLK_STS_OK);
+}
+
+static void is_remote_local_complete(struct is_remote_request *remote,
+				     blk_status_t status)
+{
+	if (status != BLK_STS_OK)
+		atomic_cmpxchg(&remote->local_status, BLK_STS_OK,
+			       (__force int)status);
+	if (!atomic_dec_and_test(&remote->pending_bios))
+		return;
+	status = (__force blk_status_t)atomic_read(&remote->local_status);
+	is_remote_path_complete(remote, false, status);
+}
+
+static void is_remote_backing_end_io(struct bio *bio)
+{
+	struct is_remote_request *remote = bio->bi_private;
+	blk_status_t status = bio->bi_status;
+
+	bio_put(bio);
+	is_remote_local_complete(remote, status);
+}
+
+static struct bio *is_alloc_owned_bio(struct is_remote_request *remote)
+{
+	struct bio *bio;
+
+#ifdef INFINISWAP_HAVE_BIO_ALLOC_CLONE
+	bio = bio_alloc_bioset(remote->device->backing_bdev,
+		remote->owned_page_count, remote->request->cmd_flags, GFP_NOIO,
+		&remote->device->bio_set);
+#else
+	bio = bio_alloc_bioset(GFP_NOIO, remote->owned_page_count,
+		&remote->device->bio_set);
+	if (bio) {
+		bio_set_dev(bio, remote->device->backing_bdev);
+		bio->bi_opf = remote->request->cmd_flags;
+	}
+#endif
+	if (bio)
+		bio->bi_iter.bi_sector = blk_rq_pos(remote->request);
+	return bio;
+}
+
+static int is_copy_request_to_owned_pages(struct is_remote_request *remote)
+{
+	struct req_iterator iterator;
+	struct bio_vec segment;
+	unsigned int copied = 0;
+
+	rq_for_each_segment(segment, remote->request, iterator) {
+		struct page *page;
+		void *destination;
+		void *source;
+
+		if (remote->owned_page_count == IS_RDMA_MAX_SEGMENTS ||
+		    segment.bv_len > PAGE_SIZE)
+			return -E2BIG;
+		page = remote->device->rdma_numa_node == NUMA_NO_NODE ?
+			alloc_page(GFP_NOIO) :
+			alloc_pages_node(remote->device->rdma_numa_node,
+				GFP_NOIO, 0);
+		if (!page)
+			return -ENOMEM;
+		remote->owned_pages[remote->owned_page_count] = page;
+		destination = kmap_local_page(page);
+		source = kmap_local_page(segment.bv_page);
+		memcpy(destination, (u8 *)source + segment.bv_offset,
+			segment.bv_len);
+		kunmap_local(source);
+		kunmap_local(destination);
+		remote->rdma_io.segments[remote->owned_page_count].page = page;
+		remote->rdma_io.segments[remote->owned_page_count].offset = 0;
+		remote->rdma_io.segments[remote->owned_page_count].length =
+			segment.bv_len;
+		remote->owned_page_count++;
+		copied += segment.bv_len;
+	}
+	remote->rdma_io.segment_count = remote->owned_page_count;
+	return copied == blk_rq_bytes(remote->request) ? 0 : -EIO;
+}
+
+static int is_reference_request_pages(struct is_remote_request *remote)
+{
+	struct req_iterator iterator;
+	struct bio_vec segment;
+	unsigned int count = 0;
+	unsigned int bytes = 0;
+
+	rq_for_each_segment(segment, remote->request, iterator) {
+		if (count == IS_RDMA_MAX_SEGMENTS || segment.bv_len > PAGE_SIZE)
+			return -E2BIG;
+		remote->rdma_io.segments[count].page = segment.bv_page;
+		remote->rdma_io.segments[count].offset = segment.bv_offset;
+		remote->rdma_io.segments[count].length = segment.bv_len;
+		count++;
+		bytes += segment.bv_len;
+	}
+	remote->rdma_io.segment_count = count;
+	return count && bytes == blk_rq_bytes(remote->request) ? 0 : -EIO;
+}
+
+static struct is_remote_request *is_alloc_remote_request(
+	struct is_device *device, struct request *request)
+{
+	struct is_remote_request *remote;
+
+	if (device->rdma_numa_node == NUMA_NO_NODE)
+		remote = kzalloc(sizeof(*remote), GFP_NOIO);
+	else
+		remote = kzalloc_node(sizeof(*remote), GFP_NOIO,
+			device->rdma_numa_node);
+
+	if (!remote)
+		return NULL;
+	remote->device = device;
+	remote->request = request;
+	spin_lock_init(&remote->policy_lock);
+	remote->rdma_io.sector = blk_rq_pos(request);
+	remote->rdma_io.bytes = blk_rq_bytes(request);
+	remote->rdma_io.context = remote;
+	remote->rdma_io.complete = is_remote_rdma_complete;
+	return remote;
+}
+
+static void is_submit_remote_fallback_work(struct work_struct *work)
+{
+	struct is_remote_request *remote = container_of(
+		work, struct is_remote_request, fallback_work);
+	struct bio *source;
+	blk_status_t status = BLK_STS_OK;
+
+	atomic_set(&remote->local_status, BLK_STS_OK);
+	atomic_set(&remote->pending_bios, 1);
+	for (source = remote->request->bio; source; source = source->bi_next) {
+		struct bio *clone = is_clone_bio(remote->device, source);
+
+		if (!clone) {
+			status = BLK_STS_RESOURCE;
+			break;
+		}
+		clone->bi_private = remote;
+		clone->bi_end_io = is_remote_backing_end_io;
+		atomic_inc(&remote->pending_bios);
+		submit_bio_noacct(clone);
+	}
+	if (!remote->request->bio)
+		status = BLK_STS_IOERR;
+	is_remote_local_complete(remote, status);
+}
+
+static bool is_dispatch_remote_read(struct is_device *device,
+				    struct request *request)
+{
+	struct is_remote_request *remote =
+		is_alloc_remote_request(device, request);
+	int ret;
+
+	if (!remote)
+		return false;
+	INIT_WORK(&remote->fallback_work, is_submit_remote_fallback_work);
+	ret = is_reference_request_pages(remote);
+	if (ret) {
+		kfree(remote);
+		return false;
+	}
+	remote->rdma_io.write = false;
+	is_io_policy_init_remote_read(&remote->policy);
+	refcount_set(&remote->references, 2);
+	ret = is_rdma_submit(device, &remote->rdma_io);
+	if (ret)
+		is_remote_rdma_complete(remote, ret);
+	is_remote_request_put(remote);
+	return true;
+}
+
+static bool is_dispatch_remote_write(struct is_device *device,
+				     struct request *request)
+{
+	struct is_remote_request *remote =
+		is_alloc_remote_request(device, request);
+	struct bio *bio;
+	unsigned int index;
+	int ret;
+
+	if (!remote)
+		return false;
+	ret = is_copy_request_to_owned_pages(remote);
+	if (ret)
+		goto free_remote;
+	bio = is_alloc_owned_bio(remote);
+	if (!bio)
+		goto free_remote;
+	for (index = 0; index < remote->owned_page_count; index++) {
+		unsigned int length = remote->rdma_io.segments[index].length;
+
+		if (bio_add_page(bio, remote->owned_pages[index], length, 0) !=
+		    length) {
+			bio_put(bio);
+			goto free_remote;
+		}
+	}
+	bio->bi_private = remote;
+	bio->bi_end_io = is_remote_backing_end_io;
+	remote->rdma_io.write = true;
+	is_io_policy_init_remote_first_write(&remote->policy);
+	refcount_set(&remote->references, 3);
+	atomic_set(&remote->local_status, BLK_STS_OK);
+	atomic_set(&remote->pending_bios, 1);
+
+	/* Remote-First may report only after this backing write is submitted. */
+	submit_bio_noacct(bio);
+	ret = is_rdma_submit(device, &remote->rdma_io);
+	if (ret)
+		is_remote_rdma_complete(remote, ret);
+	is_remote_request_put(remote);
+	return true;
+
+free_remote:
+	for (index = 0; index < remote->owned_page_count; index++)
+		__free_page(remote->owned_pages[index]);
+	kfree(remote);
+	return false;
+}
+
+static bool is_dispatch_remote(struct is_device *device,
+			       struct request *request)
+{
+	unsigned int bytes = blk_rq_bytes(request);
+	sector_t sector = blk_rq_pos(request);
+	bool write = req_op(request) == REQ_OP_WRITE;
+
+	is_rdma_note_activity(device, sector, bytes, write);
+	if (write) {
+		if (!is_rdma_range_mapped(device, sector, bytes))
+			return false;
+		return is_dispatch_remote_write(device, request);
+	}
+	if (!is_rdma_range_valid(device, sector, bytes))
+		return false;
+	return is_dispatch_remote_read(device, request);
+}
+
 static void is_complete_accepted_request(struct is_device *device,
 					 struct request *request,
 					 blk_status_t status)
@@ -543,6 +1093,10 @@ static void is_dispatch_backing_work(struct work_struct *work)
 
 	if (req_op(request) == REQ_OP_FLUSH)
 		is_issue_flush(device, request);
+	else if (device->acknowledgement_policy ==
+			 IS_ACKNOWLEDGEMENT_POLICY_REMOTE_FIRST &&
+		 is_dispatch_remote(device, request))
+		return;
 	else
 		is_submit_to_backing_store(device, request);
 }
@@ -658,10 +1212,14 @@ static void is_configure_queue(struct is_device *device)
 				     bdev_logical_block_size(device->backing_bdev));
 	blk_queue_physical_block_size(queue,
 				      bdev_physical_block_size(device->backing_bdev));
-	blk_queue_max_hw_sectors(queue, queue_max_hw_sectors(backing_queue));
-	blk_queue_max_segments(queue, queue_max_segments(backing_queue));
+	blk_queue_max_hw_sectors(queue,
+		min_t(unsigned int, queue_max_hw_sectors(backing_queue),
+		      IS_RDMA_MAX_SEGMENTS * (PAGE_SIZE >> 9)));
+	blk_queue_max_segments(queue,
+		min_t(unsigned int, queue_max_segments(backing_queue),
+		      IS_RDMA_MAX_SEGMENTS));
 	blk_queue_max_segment_size(queue,
-				   queue_max_segment_size(backing_queue));
+		min_t(unsigned int, queue_max_segment_size(backing_queue), PAGE_SIZE));
 	blk_queue_write_cache(queue,
 			      test_bit(QUEUE_FLAG_WC,
 				       &backing_queue->queue_flags),
@@ -675,6 +1233,7 @@ static void is_configure_queue(struct is_device *device)
 
 static void is_release_resources(struct is_device *device)
 {
+	is_rdma_stop(device);
 	if (device->disk && device->disk_added) {
 		del_gendisk(device->disk);
 		device->disk_added = false;
@@ -740,6 +1299,18 @@ int is_device_activate(struct is_device *device)
 		ret = -EINVAL;
 		goto out;
 	}
+	if (device->acknowledgement_policy ==
+		    IS_ACKNOWLEDGEMENT_POLICY_REMOTE_FIRST &&
+	    ((device->capacity_bytes % IS_REMOTE_CHUNK_BYTES) ||
+	     device->capacity_bytes >
+		IS_REMOTE_CHUNK_BYTES * IS_MAX_REMOTE_CHUNKS ||
+	     !device->provider_address[0] || !device->provider_port ||
+	     !device->rdma_device[0] || !device->rdma_port ||
+	     !device->provider_key_id[0] ||
+	     device->provider_psk_size < IS_PSK_MIN_SIZE)) {
+		ret = -EINVAL;
+		goto out;
+	}
 	previous_state = device->state;
 
 	ret = is_open_backing_store(device);
@@ -762,6 +1333,12 @@ int is_device_activate(struct is_device *device)
 		goto release_resources;
 	}
 
+	ret = is_rdma_start(device);
+	if (ret) {
+		WRITE_ONCE(device->last_error, -ret);
+		ret = 0;
+	}
+
 	device->minor = is_minor_alloc();
 	if (device->minor < 0) {
 		ret = device->minor;
@@ -774,7 +1351,7 @@ int is_device_activate(struct is_device *device)
 	device->tag_set.nr_hw_queues = max_t(unsigned int, 1,
 					     num_online_cpus());
 	device->tag_set.queue_depth = IS_QUEUE_DEPTH;
-	device->tag_set.numa_node = NUMA_NO_NODE;
+	device->tag_set.numa_node = device->rdma_numa_node;
 	device->tag_set.cmd_size = sizeof(struct is_request_ctx);
 	device->tag_set.flags = BLK_MQ_F_SHOULD_MERGE |
 				BLK_MQ_F_BLOCKING | BLK_MQ_F_STACKING;

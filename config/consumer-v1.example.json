@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 1,
   "identity": {
     "consumer_id": "consumer-a"
   },
@@ -10,11 +10,6 @@
     "backing_store": "/dev/disk/by-id/infiniswap-backing",
     "capacity_bytes": 68719476736,
     "provider_failure_deadline_ms": 2000,
-    "hot_range": {
-      "mapping_threshold": 8,
-      "read_weight": 1,
-      "write_weight": 4
-    },
     "provider_directory": "/etc/infiniswap/provider-directory.json",
     "providers": [
       "provider-a"

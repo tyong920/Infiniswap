@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/tyong920/Infiniswap/config/status.schema.json",
-  "title": "Infiniswap Device Status v2",
+  "$id": "https://github.com/tyong920/Infiniswap/config/status-v1.schema.json",
+  "title": "Infiniswap Device Status",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -10,11 +10,10 @@
     "device",
     "connection",
     "capacity",
-    "mapping",
     "last_error"
   ],
   "properties": {
-    "schema_version": {"const": 2},
+    "schema_version": {"const": 1},
     "kind": {"const": "infiniswap.device-status"},
     "device": {
       "type": "object",
@@ -103,24 +102,6 @@
         "advertised_bytes": {"type": "integer", "minimum": 0},
         "backing_bytes": {"type": "integer", "minimum": 0},
         "remote_bytes": {"type": "integer", "minimum": 0}
-      }
-    },
-    "mapping": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "chunk_size_bytes",
-        "threshold",
-        "read_weight",
-        "write_weight",
-        "mapped_hot_ranges"
-      ],
-      "properties": {
-        "chunk_size_bytes": {"const": 1073741824},
-        "threshold": {"type": "integer", "minimum": 1},
-        "read_weight": {"type": "integer", "minimum": 1},
-        "write_weight": {"type": "integer", "minimum": 1},
-        "mapped_hot_ranges": {"type": "integer", "minimum": 0, "maximum": 128}
       }
     },
     "last_error": {

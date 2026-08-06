@@ -3,7 +3,7 @@
 import json
 import re
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
@@ -11,6 +11,13 @@ GIB = 1024 * 1024 * 1024
 CONFIGFS_VALUE_SIZE = 4096
 FAILURE_DEADLINE_MIN_MS = 500
 FAILURE_DEADLINE_MAX_MS = 30000
+HOT_RANGE_SCORE_MAX = (1 << 63) - 1
+HOT_RANGE_WEIGHT_MAX = 1000000
+HOT_RANGE_THRESHOLD_DEFAULT = 8
+HOT_RANGE_READ_WEIGHT_DEFAULT = 1
+HOT_RANGE_WRITE_WEIGHT_DEFAULT = 4
+PSK_MIN_BYTES = 32
+PSK_MAX_BYTES = 64
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 KEY_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,30}$")
 DEVICE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,30}$")
@@ -42,6 +49,7 @@ class ProviderDirectoryEntry:
     psk_file: str
     capabilities: Tuple[str, ...]
     placement_weight: int
+    psk: bytes = field(default=b"", repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -54,6 +62,9 @@ class ConsumerConfig:
     backing_store: str
     capacity_bytes: int
     provider_failure_deadline_ms: int
+    hot_range_threshold: int
+    hot_range_read_weight: int
+    hot_range_write_weight: int
     provider_directory: str
     providers: Tuple[ProviderDirectoryEntry, ...]
     swap_priority: int
@@ -154,13 +165,38 @@ def _secure_psk_file(path: str, system: Any, field: str) -> None:
         raise ConfigError(field + " must be owned by root with mode 0600")
 
 
+def _read_psk(path: str, system: Any, field: str) -> bytes:
+    try:
+        value = system.read_secret(path)
+    except (KeyError, OSError) as exc:
+        raise ConfigError(field + " is not readable: " + path) from exc
+    if not isinstance(value, bytes):
+        raise ConfigError(field + " must contain a binary or hexadecimal PSK")
+
+    stripped = value.strip()
+    try:
+        encoded = stripped.decode("ascii")
+    except UnicodeDecodeError:
+        encoded = ""
+    if (
+        PSK_MIN_BYTES * 2 <= len(encoded) <= PSK_MAX_BYTES * 2
+        and len(encoded) % 2 == 0
+        and re.fullmatch(r"[0-9A-Fa-f]+", encoded)
+    ):
+        value = bytes.fromhex(encoded)
+    if not PSK_MIN_BYTES <= len(value) <= PSK_MAX_BYTES:
+        raise ConfigError(field + " must contain a 32-64 byte PSK")
+    return value
+
+
 def load_provider_directory(
     path: str, system: Any
 ) -> Dict[str, ProviderDirectoryEntry]:
     document = load_json(path)
     _strict_fields(document, "provider_directory", {"schema_version", "providers"})
-    if document["schema_version"] != 1:
-        raise ConfigError("provider_directory.schema_version must be 1")
+    schema_version = document.get("schema_version")
+    if schema_version not in (1, 2):
+        raise ConfigError("provider_directory.schema_version must be 1 or 2")
     providers = _object(document["providers"], "provider_directory.providers")
     if not providers or len(providers) > 64:
         raise ConfigError("provider_directory.providers must contain 1-64 Providers")
@@ -192,7 +228,10 @@ def load_provider_directory(
         rail_device = _identifier(rail["device"], field + ".rdma_rail.device")
         rail_port = _integer(rail["port"], field + ".rdma_rail.port", 1, 255)
         numa_node = _integer(
-            rail["numa_node"], field + ".rdma_rail.numa_node", 0, 65535
+            rail["numa_node"],
+            field + ".rdma_rail.numa_node",
+            -1 if schema_version >= 2 else 0,
+            65535,
         )
 
         authentication = _object(provider["authentication"], field + ".authentication")
@@ -286,8 +325,9 @@ def load_provider(path: str, system: Any) -> ProviderConfig:
             "consumers",
         },
     )
-    if document["schema_version"] != 1:
-        raise ConfigError("schema_version must be 1")
+    schema_version = document.get("schema_version")
+    if schema_version not in (1, 2):
+        raise ConfigError("schema_version must be 1 or 2")
 
     identity = _object(document["identity"], "identity")
     _strict_fields(identity, "identity", {"provider_id"})
@@ -304,7 +344,12 @@ def load_provider(path: str, system: Any) -> ProviderConfig:
     _strict_fields(rail, "rdma_rail", {"device", "port", "numa_node"})
     rail_device = _identifier(rail["device"], "rdma_rail.device")
     rail_port = _integer(rail["port"], "rdma_rail.port", 1, 255)
-    numa_node = _integer(rail["numa_node"], "rdma_rail.numa_node", 0, 65535)
+    numa_node = _integer(
+        rail["numa_node"],
+        "rdma_rail.numa_node",
+        -1 if schema_version >= 2 else 0,
+        65535,
+    )
     try:
         actual_numa_node = system.rdma_rail_numa_node(rail_device, rail_port)
     except (KeyError, OSError) as exc:
@@ -404,8 +449,9 @@ def validate_device_name(value: Any) -> str:
 def load_consumer(path: str, system: Any) -> ConsumerConfig:
     document = load_json(path)
     _strict_fields(document, "consumer", {"schema_version", "identity", "device"})
-    if document["schema_version"] != 1:
-        raise ConfigError("schema_version must be 1")
+    schema_version = document.get("schema_version")
+    if schema_version not in (1, 2):
+        raise ConfigError("schema_version must be 1 or 2")
 
     identity = _object(document["identity"], "identity")
     _strict_fields(identity, "identity", {"consumer_id"})
@@ -421,6 +467,8 @@ def load_consumer(path: str, system: Any) -> ConsumerConfig:
         "providers",
         "swap_priority",
     }
+    if schema_version >= 2:
+        required.add("hot_range")
     _strict_fields(
         device, "device", required, {"acknowledgement_policy", "backing_store"}
     )
@@ -464,6 +512,35 @@ def load_consumer(path: str, system: Any) -> ConsumerConfig:
         FAILURE_DEADLINE_MIN_MS,
         FAILURE_DEADLINE_MAX_MS,
     )
+    if schema_version >= 2:
+        hot_range = _object(device["hot_range"], "device.hot_range")
+        _strict_fields(
+            hot_range,
+            "device.hot_range",
+            {"mapping_threshold", "read_weight", "write_weight"},
+        )
+        hot_range_threshold = _integer(
+            hot_range["mapping_threshold"],
+            "device.hot_range.mapping_threshold",
+            1,
+            HOT_RANGE_SCORE_MAX,
+        )
+        hot_range_read_weight = _integer(
+            hot_range["read_weight"],
+            "device.hot_range.read_weight",
+            1,
+            HOT_RANGE_WEIGHT_MAX,
+        )
+        hot_range_write_weight = _integer(
+            hot_range["write_weight"],
+            "device.hot_range.write_weight",
+            1,
+            HOT_RANGE_WEIGHT_MAX,
+        )
+    else:
+        hot_range_threshold = HOT_RANGE_THRESHOLD_DEFAULT
+        hot_range_read_weight = HOT_RANGE_READ_WEIGHT_DEFAULT
+        hot_range_write_weight = HOT_RANGE_WRITE_WEIGHT_DEFAULT
     directory_path = _absolute_path(
         device["provider_directory"], "device.provider_directory"
     )
@@ -478,6 +555,8 @@ def load_consumer(path: str, system: Any) -> ConsumerConfig:
         raise ConfigError("device.providers must be a non-empty list")
     if len(set(selected_value)) != len(selected_value):
         raise ConfigError("device.providers must be unique")
+    if len(selected_value) != 1:
+        raise ConfigError("this milestone requires exactly one Provider")
     selected: List[ProviderDirectoryEntry] = []
     required_capabilities = {
         "backed",
@@ -516,7 +595,21 @@ def load_consumer(path: str, system: Any) -> ConsumerConfig:
                 "Provider %s lacks required capability %s"
                 % (provider_name, missing_capabilities[0])
             )
-        selected.append(provider)
+        try:
+            resolved_address = system.resolve_network_address(
+                provider.address, provider.port
+            )
+        except (KeyError, OSError) as exc:
+            raise ConfigError(
+                "Provider %s address must resolve to exactly one network address"
+                % provider_name
+            ) from exc
+        psk = _read_psk(
+            provider.psk_file,
+            system,
+            "Provider %s authentication.psk_file" % provider_name,
+        )
+        selected.append(replace(provider, address=resolved_address, psk=psk))
 
     serialized_providers = ",".join(provider.name for provider in selected)
     if len(serialized_providers) + 1 >= CONFIGFS_VALUE_SIZE:
@@ -532,6 +625,9 @@ def load_consumer(path: str, system: Any) -> ConsumerConfig:
         backing_store=resolved_backing_store,
         capacity_bytes=capacity_bytes,
         provider_failure_deadline_ms=deadline,
+        hot_range_threshold=hot_range_threshold,
+        hot_range_read_weight=hot_range_read_weight,
+        hot_range_write_weight=hot_range_write_weight,
         provider_directory=directory_path,
         providers=tuple(selected),
         swap_priority=swap_priority,

@@ -71,8 +71,11 @@ jobs:
 
           config = Path("config")
           pairs = (
+              ("consumer-v1.schema.json", "consumer-v1.example.json"),
               ("consumer.schema.json", "consumer.example.json"),
+              ("provider-v1.schema.json", "provider-v1.example.json"),
               ("provider.schema.json", "provider.example.json"),
+              ("provider-directory-v1.schema.json", "provider-directory-v1.example.json"),
               ("provider-directory.schema.json", "provider-directory.example.json"),
           )
           for schema_name, example_name in pairs:
@@ -81,11 +84,16 @@ jobs:
               jsonschema.Draft7Validator.check_schema(schema)
               jsonschema.validate(example, schema)
 
-          schema = json.loads((config / "status.schema.json").read_text())
-          status = json.loads(
-              Path("infiniswapctl/tests/snapshots/status-v1.json").read_text())
-          jsonschema.Draft7Validator.check_schema(schema)
-          jsonschema.validate(status, schema)
+          status_pairs = (
+              ("status-v1.schema.json", "status-v1.json"),
+              ("status.schema.json", "status-v2.json"),
+          )
+          for schema_name, snapshot_name in status_pairs:
+              schema = json.loads((config / schema_name).read_text())
+              status = json.loads(
+                  (Path("infiniswapctl/tests/snapshots") / snapshot_name).read_text())
+              jsonschema.Draft7Validator.check_schema(schema)
+              jsonschema.validate(status, schema)
           PY
 
       - name: Test infiniswapctl
@@ -94,12 +102,20 @@ jobs:
           python3 -m unittest discover -s infiniswapctl/tests -v
           bin/infiniswapctl --help >/dev/null
 
+      - name: Test Memory Consumer completion policy
+        run: |
+          cc -std=c11 -Wall -Wextra -Wpedantic -Werror \
+            infiniswap_bd/tests/io-policy-test.c \
+            -o "${{ runner.temp }}/io-policy-test"
+          "${{ runner.temp }}/io-policy-test"
+
       - name: Test RDMA tuple discovery
         run: infiniswap_bd/tests/rdma-build-flags-test.sh
 
       - name: Check Memory Consumer helper syntax
         run: |
           bash -n infiniswap_bd/tests/local-backing-test.sh
+          bash -n infiniswap_bd/tests/remote-backed-test.sh
           bash -n setup/infiniswap_bd_setup.sh
           bash -n setup/infiniswap_bd_teardown.sh
           bash -n setup/install.sh

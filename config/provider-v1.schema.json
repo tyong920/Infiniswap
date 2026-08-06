@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/tyong920/Infiniswap/config/provider.schema.json",
+  "$id": "https://github.com/tyong920/Infiniswap/config/provider-v1.schema.json",
   "title": "Infiniswap Memory Provider Configuration",
   "type": "object",
   "additionalProperties": false,
@@ -13,7 +13,7 @@
     "consumers"
   ],
   "properties": {
-    "schema_version": {"const": 2},
+    "schema_version": {"const": 1},
     "identity": {"$ref": "#/definitions/provider_identity"},
     "listen": {"$ref": "#/definitions/listen"},
     "rdma_rail": {"$ref": "#/definitions/rdma_rail"},
@@ -69,7 +69,7 @@
       "properties": {
         "device": {"$ref": "#/definitions/identifier"},
         "port": {"type": "integer", "minimum": 1, "maximum": 255},
-        "numa_node": {"type": "integer", "minimum": -1, "maximum": 65535}
+        "numa_node": {"type": "integer", "minimum": 0, "maximum": 65535}
       }
     },
     "pools": {
