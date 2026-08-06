@@ -44,6 +44,9 @@
 #define DRV_NAME	"IS"
 #define PFX		DRV_NAME ": "
 #define DRV_VERSION	"0.0"
+#define IS_WR_ID_READ	1ULL
+#define IS_WR_ID_PTR_MASK	(~IS_WR_ID_READ)
+#define IS_DISCONNECT_DRAIN_TIMEOUT_MS	5000
 
 MODULE_AUTHOR("Juncheng Gu, Youngmoon Lee, from Sagi Grimberg, Max Gurtovoy");
 MODULE_DESCRIPTION("Infiniswap, remote memory paging over RDMA");
@@ -124,11 +127,111 @@ void IS_insert_ctx(struct rdma_ctx *ctx)
 	spin_unlock_irqrestore(&free_ctxs->ctx_lock, flags);
 }
 
+static void IS_reset_ctx_sge(struct rdma_ctx *ctx, struct kernel_cb *cb)
+{
+	ctx->rdma_sgl.addr = ctx->rdma_dma_addr;
+	ctx->rdma_sgl.length = cb->size;
+	ctx->rdma_sgl.lkey = cb->pd->local_dma_lkey;
+	ctx->rdma_sq_wr.wr.sg_list = &ctx->rdma_sgl;
+	ctx->rdma_sq_wr.wr.num_sge = 1;
+	ctx->rdma_sq_wr.wr.wr_id = uint64_from_ptr(ctx);
+}
+
+static void IS_unmap_read_request(struct rdma_ctx *ctx, struct kernel_cb *cb)
+{
+	struct ib_sge *rdma_sgl = ctx->rdma_sq_wr.wr.sg_list;
+	unsigned int i;
+
+	for (i = 0; i < ctx->mapped_sge; i++) {
+		ib_dma_unmap_page(cb->pd->device, rdma_sgl[i].addr,
+				  rdma_sgl[i].length, DMA_FROM_DEVICE);
+	}
+	ctx->mapped_sge = 0;
+	IS_reset_ctx_sge(ctx, cb);
+}
+
+static int IS_map_read_request(struct rdma_ctx *ctx, struct kernel_cb *cb,
+			       struct request *req)
+{
+	struct IS_request_ctx *request_ctx = blk_mq_rq_to_pdu(req);
+	struct ib_sge *rdma_sgl = request_ctx->rdma_sgl;
+	struct req_iterator iter;
+	struct bio_vec bvec;
+	unsigned int i = 0;
+
+	ctx->rdma_sq_wr.wr.sg_list = rdma_sgl;
+	rq_for_each_segment(bvec, req, iter) {
+		dma_addr_t dma_addr;
+
+		if (i >= cb->max_send_sge)
+			goto too_many_segments;
+		dma_addr = ib_dma_map_page(cb->pd->device, bvec.bv_page,
+					   bvec.bv_offset, bvec.bv_len,
+					   DMA_FROM_DEVICE);
+		if (ib_dma_mapping_error(cb->pd->device, dma_addr))
+			goto mapping_error;
+		rdma_sgl[i].addr = dma_addr;
+		rdma_sgl[i].length = bvec.bv_len;
+		rdma_sgl[i].lkey = cb->pd->local_dma_lkey;
+		i++;
+	}
+	if (!i) {
+		IS_reset_ctx_sge(ctx, cb);
+		return -EINVAL;
+	}
+
+	ctx->mapped_sge = i;
+	ctx->rdma_sq_wr.wr.num_sge = i;
+	return 0;
+
+mapping_error:
+	ctx->mapped_sge = i;
+	IS_unmap_read_request(ctx, cb);
+	return -EIO;
+too_many_segments:
+	ctx->mapped_sge = i;
+	IS_unmap_read_request(ctx, cb);
+	return -E2BIG;
+}
+
+static struct request *IS_release_read_ctx(struct rdma_ctx *ctx,
+					   struct kernel_cb *cb,
+					   int expected_state)
+{
+	struct request *req;
+	unsigned long flags;
+
+	spin_lock_irqsave(&ctx->state_lock, flags);
+	if (atomic_read(&ctx->in_flight) != expected_state) {
+		spin_unlock_irqrestore(&ctx->state_lock, flags);
+		return NULL;
+	}
+	atomic_set(&ctx->in_flight, CTX_IDLE);
+	req = ctx->req;
+	ctx->req = NULL;
+	ctx->chunk_index = -1;
+	spin_unlock_irqrestore(&ctx->state_lock, flags);
+
+	IS_unmap_read_request(ctx, cb);
+	IS_insert_ctx(ctx);
+	return req;
+}
+
+static void IS_fallback_read_ctx(struct rdma_ctx *ctx, struct kernel_cb *cb,
+				 int expected_state)
+{
+	struct request *req = IS_release_read_ctx(ctx, cb, expected_state);
+
+	if (req)
+		IS_submit_to_backing_store(req);
+}
+
 static int IS_rdma_read(struct IS_connection *IS_conn, struct kernel_cb *cb, int cb_index, int chunk_index, struct remote_chunk_g *chunk, unsigned long offset, unsigned long len, struct request *req, struct IS_queue *q)
 {
 	int ret;
 	const struct ib_send_wr *bad_wr;
 	struct rdma_ctx *ctx = NULL;
+	unsigned long flags;
 	int ctx_loop = 0;
 	
 	// get ctx_buf based on request address
@@ -146,26 +249,40 @@ static int IS_rdma_read(struct IS_connection *IS_conn, struct kernel_cb *cb, int
 		ctx = IS_get_ctx(IS_conn->ctx_pools[cb_index]);
 	}
 
+	spin_lock_irqsave(&ctx->state_lock, flags);
 	ctx->req = req;
 	ctx->chunk_index = chunk_index; //chunk_index in cb
-	atomic_set(&ctx->in_flight, CTX_R_IN_FLIGHT);  
+	atomic_set(&ctx->in_flight, CTX_R_PREPARING);
+	spin_unlock_irqrestore(&ctx->state_lock, flags);
 	if (atomic_read(&IS_conn->IS_sess->rdma_on) != DEV_RDMA_ON){	
 		pr_info("%s, rdma_off, go to disk\n", __func__);
-		atomic_set(&ctx->in_flight, CTX_IDLE);  
-		IS_insert_ctx(ctx);
-		IS_mq_request_stackbd2(req);
+		IS_fallback_read_ctx(ctx, cb, CTX_R_PREPARING);
 		return 0;
 	}
 
-	ctx->rdma_sq_wr.wr.sg_list->length = len;
+	ret = IS_map_read_request(ctx, cb, req);
+	if (ret) {
+		IS_fallback_read_ctx(ctx, cb, CTX_R_PREPARING);
+		return 0;
+	}
+	spin_lock_irqsave(&ctx->state_lock, flags);
+	if (atomic_read(&IS_conn->IS_sess->rdma_on) != DEV_RDMA_ON) {
+		spin_unlock_irqrestore(&ctx->state_lock, flags);
+		IS_fallback_read_ctx(ctx, cb, CTX_R_PREPARING);
+		return 0;
+	}
+	atomic_set(&ctx->in_flight, CTX_R_IN_FLIGHT);
+	ctx->rdma_sq_wr.wr.wr_id = uint64_from_ptr(ctx) | IS_WR_ID_READ;
 	ctx->rdma_sq_wr.rkey = chunk->remote_rkey;
 	ctx->rdma_sq_wr.remote_addr = chunk->remote_addr + offset;
 	ctx->rdma_sq_wr.wr.opcode = IB_WR_RDMA_READ;
 	ret = ib_post_send(cb->qp, &ctx->rdma_sq_wr.wr, &bad_wr);
+	spin_unlock_irqrestore(&ctx->state_lock, flags);
 
 	if (ret) {
 		printk(KERN_ALERT PFX "client post read %d, wr=%p\n", ret, &ctx->rdma_sq_wr);
-		return ret;
+		IS_fallback_read_ctx(ctx, cb, CTX_R_IN_FLIGHT);
+		return 0;
 	}	
 	return 0;
 }
@@ -236,7 +353,7 @@ static int IS_rdma_write(struct IS_connection *IS_conn, struct kernel_cb *cb, in
 		pr_info("%s, rdma_off, give up the write request\n", __func__);
 		atomic_set(&ctx->in_flight, CTX_IDLE);
 		IS_insert_ctx(ctx);
-		IS_mq_request_stackbd2(req);
+		IS_submit_to_backing_store(req);
 	
 		return 0;
 	}
@@ -350,6 +467,7 @@ int IS_transfer_chunk(struct IS_file *xdev, struct kernel_cb *cb, int cb_index, 
 	put_cpu();
 	return 0;
 err:
+	put_cpu();
 	return retval;
 }
 
@@ -401,8 +519,10 @@ static int IS_disconnect_handler(struct kernel_cb *cb)
 	int *cb_chunk_map = cb->remote_chunk.chunk_map;
 	int sess_chunk_index;
 	int err = 0;
+	int pending_reads;
+	unsigned long drain_deadline;
+	struct ib_qp_attr qp_attr = { .qp_state = IB_QPS_ERR };
 	int evict_list[STACKBD_SIZE_G];
-	struct request *req;
 
 	pr_debug("%s\n", __func__);
 
@@ -422,6 +542,9 @@ static int IS_disconnect_handler(struct kernel_cb *cb)
 	IS_sess->cb_state_list[cb->cb_index] = CB_FAIL;
 	atomic_set(&IS_sess->trigger_enable, TRIGGER_OFF);
 	atomic_set(&cb->IS_sess->rdma_on, DEV_RDMA_OFF);
+	err = ib_modify_qp(cb->qp, &qp_attr, IB_QP_STATE);
+	if (err)
+		pr_err("failed to stop disconnected QP: %d\n", err);
 
 	//disallow request to those cb chunks 
 	for (i = 0; i < MAX_MR_SIZE_GB; i++) {
@@ -438,31 +561,56 @@ static int IS_disconnect_handler(struct kernel_cb *cb)
 	pr_debug("%s, unmap %d GB in cb%d \n", __func__, cb->remote_chunk.chunk_size_g, pool_index);
 	cb->remote_chunk.chunk_size_g = 0;
 
-	msleep(10);
-
-	for (i=0; i < submit_queues; i++){
-		ctx_pool = IS_sess->IS_conns[i]->ctx_pools[pool_index]->ctx_pool;
-		for (j=0; j < IS_QUEUE_DEPTH; j++){
-			ctx = ctx_pool + j;
-			switch (atomic_read(&ctx->in_flight)){
-				case CTX_R_IN_FLIGHT:
-					req = ctx->req;
-					atomic_set(&ctx->in_flight, CTX_IDLE);
-					IS_mq_request_stackbd2(req);
-					IS_insert_ctx(ctx);
-					break;
-				case CTX_W_IN_FLIGHT:
-					atomic_set(&ctx->in_flight, CTX_IDLE);
-					if (ctx->req == NULL){ 
+	drain_deadline = jiffies +
+		msecs_to_jiffies(IS_DISCONNECT_DRAIN_TIMEOUT_MS);
+	do {
+		pending_reads = 0;
+		for (i=0; i < submit_queues; i++){
+			ctx_pool = IS_sess->IS_conns[i]->ctx_pools[pool_index]->ctx_pool;
+			for (j=0; j < IS_QUEUE_DEPTH; j++){
+				ctx = ctx_pool + j;
+				switch (atomic_read(&ctx->in_flight)){
+					case CTX_R_PREPARING:
+					case CTX_R_IN_FLIGHT:
+						pending_reads = 1;
 						break;
-					}
-					blk_mq_end_request(ctx->req, BLK_STS_OK);
-					break;
-				default:
-					;
+					case CTX_W_IN_FLIGHT:
+						atomic_set(&ctx->in_flight, CTX_IDLE);
+						if (ctx->req == NULL){
+							break;
+						}
+						blk_mq_end_request(ctx->req, BLK_STS_OK);
+						break;
+					default:
+						;
+				}
 			}
 		}
-	}	
+		if (pending_reads) {
+			if (time_after_eq(jiffies, drain_deadline))
+				break;
+			msleep(1);
+		}
+	} while (pending_reads);
+
+	if (pending_reads) {
+		pr_err("timed out draining disconnected QP\n");
+		if (cb->cm_id->qp) {
+			rdma_destroy_qp(cb->cm_id);
+			cb->qp = NULL;
+		}
+		for (i = 0; i < submit_queues; i++) {
+			ctx_pool = IS_sess->IS_conns[i]->ctx_pools[pool_index]->ctx_pool;
+			for (j = 0; j < IS_QUEUE_DEPTH; j++) {
+				ctx = ctx_pool + j;
+				if (atomic_read(&ctx->in_flight) ==
+				    CTX_R_IN_FLIGHT)
+					IS_fallback_read_ctx(ctx, cb,
+							     CTX_R_IN_FLIGHT);
+			}
+		}
+		err = -ETIMEDOUT;
+	}
 	pr_err("%s, finish handling in-flight request\n", __func__);
 
 	for (i = 0; i < MAX_MR_SIZE_GB; i++) {
@@ -473,15 +621,6 @@ static int IS_disconnect_handler(struct kernel_cb *cb)
 			IS_sess->unmapped_chunk_list[IS_sess->free_chunk_index] = sess_chunk_index;
 			cb_chunk_map[i] = -1;
 		}
-	}
-
-	//free conn->ctx_pools[cb_index]
-	for (i =0; i<submit_queues; i++){
-		kfree(IS_sess->IS_conns[i]->ctx_pools[pool_index]->ctx_pool);
-		kfree(IS_sess->IS_conns[i]->ctx_pools[pool_index]->free_ctxs->ctx_list);
-		kfree(IS_sess->IS_conns[i]->ctx_pools[pool_index]->free_ctxs);
-		kfree(IS_sess->IS_conns[i]->ctx_pools[pool_index]);
-		IS_sess->IS_conns[i]->ctx_pools[pool_index] = (struct ctx_pool_list *)kzalloc(sizeof(struct ctx_pool_list), GFP_KERNEL);
 	}
 
 	atomic_set(&cb->IS_sess->rdma_on, DEV_RDMA_ON);
@@ -558,9 +697,10 @@ static int IS_cma_event_handler(struct rdma_cm_id *cma_id,
 		IS_disconnect_handler(cb);
 		break;
 
-	case RDMA_CM_EVENT_DEVICE_REMOVAL:	//this also should be treated as disconnection, and continue disk swap
-		printk(KERN_ERR PFX "cma detected device removal!!!!\n");
-		return -1;
+	case RDMA_CM_EVENT_DEVICE_REMOVAL:
+		printk(KERN_ERR PFX "RDMA device removal detected\n");
+		cb->state = CM_DISCONNECT;
+		IS_disconnect_handler(cb);
 		break;
 
 	default:
@@ -588,6 +728,7 @@ static int IS_chunk_wait_in_flight_requests(struct kernel_cb *cb)
 			for (j=0; j < IS_QUEUE_DEPTH; j++){
 				ctx = ctx_pool + j;
 				switch (atomic_read(&ctx->in_flight)){
+					case CTX_R_PREPARING:
 					case CTX_R_IN_FLIGHT:
 					case CTX_W_IN_FLIGHT:
 						//the chunk is going to be cancelled
@@ -773,15 +914,21 @@ static int client_read_done(struct kernel_cb * cb, struct ib_wc *wc)
 	struct rdma_ctx *ctx;
 	struct request *req;
 
-	ctx = (struct rdma_ctx *)ptr_from_uint64(wc->wr_id);
-	atomic_set(&ctx->in_flight, CTX_IDLE);
-	ctx->chunk_index = -1;
-	req = ctx->req;
-	ctx->req = NULL;
-	memcpy(bio_data(req->bio), ctx->rdma_buf, IS_PAGE_SIZE);
+	ctx = (struct rdma_ctx *)ptr_from_uint64(wc->wr_id &
+						       IS_WR_ID_PTR_MASK);
+	req = IS_release_read_ctx(ctx, cb, CTX_R_IN_FLIGHT);
+	if (req)
+		blk_mq_end_request(req, BLK_STS_OK);
+	return 0;
+}
 
-	IS_insert_ctx(ctx);
-	blk_mq_end_request(req, BLK_STS_OK);
+static int client_read_failed(struct kernel_cb *cb, struct ib_wc *wc)
+{
+	struct rdma_ctx *ctx;
+
+	ctx = (struct rdma_ctx *)ptr_from_uint64(wc->wr_id &
+						       IS_WR_ID_PTR_MASK);
+	IS_fallback_read_ctx(ctx, cb, CTX_R_IN_FLIGHT);
 	return 0;
 }
 
@@ -816,23 +963,25 @@ static void rdma_cq_event_handler(struct ib_cq * cq, void *ctx)
 	const struct ib_recv_wr *bad_wr;
 	int ret;
 	BUG_ON(cb->cq != cq);
-	if (cb->state == ERROR) {
-		printk(KERN_ERR PFX "cq completion in ERROR state\n");
-		return;
-	}
 	ib_req_notify_cq(cb->cq, IB_CQ_NEXT_COMP);
 
 	while ((ret = ib_poll_cq(cb->cq, 1, &wc)) == 1) {
 		if (wc.status) {
+			if (wc.wr_id & IS_WR_ID_READ) {
+				pr_err("RDMA read failed: wr_id %llx status %d vendor_err %x\n",
+				       wc.wr_id, wc.status, wc.vendor_err);
+				client_read_failed(cb, &wc);
+				continue;
+			}
 			if (wc.status == IB_WC_WR_FLUSH_ERR) {
 				pr_info("cq flushed\n");
 				continue;
-			} else {
-				printk(KERN_ERR PFX "cq completion failed with "
-				       "wr_id %Lx status %d opcode %d vender_err %x\n",
-					wc.wr_id, wc.status, wc.opcode, wc.vendor_err);
-				goto error;
 			}
+			printk(KERN_ERR PFX "cq completion failed with "
+			       "wr_id %llx status %d opcode %d vendor_err %x\n",
+			       wc.wr_id, wc.status, wc.opcode, wc.vendor_err);
+			cb->state = ERROR;
+			continue;
 		}	
 		switch (wc.opcode){
 			case IB_WC_RECV:
@@ -945,19 +1094,28 @@ static int IS_create_qp(struct kernel_cb *cb)
 	struct ib_qp_init_attr init_attr;
 	int ret;
 
+	cb->max_send_sge = min3((unsigned int)MAX_SGL_LEN,
+				 (unsigned int)cb->cm_id->device->attrs.max_send_sge,
+				 (unsigned int)cb->cm_id->device->attrs.max_sge_rd);
+	if (!cb->max_send_sge)
+		return -EINVAL;
+
 	memset(&init_attr, 0, sizeof(init_attr));
 	init_attr.cap.max_send_wr = cb->txdepth; /*FIXME: You may need to tune the maximum work request */
 	init_attr.cap.max_recv_wr = cb->txdepth;  
 	init_attr.cap.max_recv_sge = 1;
-	init_attr.cap.max_send_sge = 1;
+	init_attr.cap.max_send_sge = cb->max_send_sge;
 	init_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
 	init_attr.qp_type = IB_QPT_RC;
 	init_attr.send_cq = cb->cq;
 	init_attr.recv_cq = cb->cq;
 
 	ret = rdma_create_qp(cb->cm_id, cb->pd, &init_attr);
-	if (!ret)
+	if (!ret) {
 		cb->qp = cb->cm_id->qp;
+		cb->max_send_sge = min(cb->max_send_sge,
+				       init_attr.cap.max_send_sge);
+	}
 	return ret;
 }
 
@@ -1254,6 +1412,7 @@ static int IS_ctx_init(struct IS_connection *IS_conn, struct kernel_cb *cb, int 
 		tmp_pool->free_ctxs->ctx_list[i] = ctx;
 
 		atomic_set(&ctx->in_flight, CTX_IDLE);
+		spin_lock_init(&ctx->state_lock);
 		ctx->chunk_index = -1;
 		ctx->req = NULL;
 		ctx->IS_conn = IS_conn;
@@ -1272,12 +1431,9 @@ static int IS_ctx_init(struct IS_connection *IS_conn, struct kernel_cb *cb, int 
 			goto bail;
 		}
 
-		// rdma_buf, peer nodes RDMA write destination
-		ctx->rdma_sgl.addr = ctx->rdma_dma_addr;
-		ctx->rdma_sgl.lkey = cb->pd->local_dma_lkey;
+		ctx->mapped_sge = 0;
+		IS_reset_ctx_sge(ctx, cb);
 		ctx->rdma_sq_wr.wr.send_flags = IB_SEND_SIGNALED;
-		ctx->rdma_sq_wr.wr.sg_list = &ctx->rdma_sgl;
-		ctx->rdma_sq_wr.wr.num_sge = 1;
 		ctx->rdma_sq_wr.wr.wr_id = uint64_from_ptr(ctx);
 	}
 	return 0;
@@ -1395,7 +1551,7 @@ static int kernel_cb_init(struct kernel_cb *cb, struct IS_session *IS_session)
 	cb->addr_type = AF_INET;
 	cb->mem = DMA;
 	cb->txdepth = IS_QUEUE_DEPTH * submit_queues + 1;
-	cb->size = IS_PAGE_SIZE * MAX_SGL_LEN; 
+	cb->size = IS_PAGE_SIZE;
 	cb->state = IDLE;
 
 	cb->remote_chunk.chunk_size_g = 0;

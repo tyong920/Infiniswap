@@ -149,6 +149,19 @@ struct raio_iocb {
 #else
 	#define MAX_SGL_LEN 1
 #endif
+
+/* Preallocated per request so swap dispatch never allocates completion state. */
+struct stackbd_request {
+	struct request *req;
+	atomic_t pending;
+	atomic_t status;
+};
+
+struct IS_request_ctx {
+	struct stackbd_request backing;
+	struct ib_sge rdma_sgl[MAX_SGL_LEN];
+};
+
 struct raio_io_u {
 	struct scatterlist  sgl[MAX_SGL_LEN];
 	struct raio_iocb		iocb;
@@ -401,7 +414,8 @@ struct kernel_cb {
 	char *addr_str;			/* dst addr string */
 	uint8_t addr_type;		/* ADDR_FAMILY - IPv4/V6 */
 	int verbose;			/* verbose logging */
-	int size;			/* ping data size */
+	int size;			/* per-context write bounce buffer size */
+	unsigned int max_send_sge;	/* HCA limit for direct multi-page reads */
 	int txdepth;			/* SQ depth */
 	int local_dma_lkey;		/* use 0 for lkey */
 
@@ -423,14 +437,17 @@ enum IS_dev_state {
 #define CTX_IDLE		0
 #define CTX_R_IN_FLIGHT	1
 #define CTX_W_IN_FLIGHT	2
+#define CTX_R_PREPARING	3
 
 struct rdma_ctx {
 	struct IS_connection *IS_conn;
 	struct free_ctx_pool *free_ctxs;  //or this one
 	//struct mutex ctx_lock;
 	struct ib_rdma_wr rdma_sq_wr;	/* RDMA work request record */
-	struct ib_sge rdma_sgl;		/* rdma single SGE */
-	char *rdma_buf;			/* used as rdma sink */
+	struct ib_sge rdma_sgl;		/* single-page write bounce SGE */
+	unsigned int mapped_sge;
+	spinlock_t state_lock;
+	char *rdma_buf;			/* single-page write bounce buffer */
 	u64  rdma_dma_addr;
 	struct ib_mr *rdma_mr;
 	struct request *req;
@@ -620,12 +637,8 @@ void stackbd_make_request(struct bio *bio);
 #else
 blk_qc_t stackbd_make_request(struct bio *bio);
 #endif
-void stackbd_make_request2(struct request_queue *q, struct request *req);
-void stackbd_make_request3(struct request_queue *q, struct request *req);
-void stackbd_make_request4(struct request_queue *q, struct request *req);
 void stackbd_make_request5(struct bio *b);
-void IS_mq_request_stackbd(struct request *req);
-void IS_mq_request_stackbd2(struct request *req);
+void IS_submit_to_backing_store(struct request *req);
 void IS_single_chunk_init(struct kernel_cb *cb);
 void IS_chunk_list_init(struct kernel_cb *cb);
 void IS_bitmap_set(int *bitmap, int i);

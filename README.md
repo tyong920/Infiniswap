@@ -122,13 +122,19 @@ Pass these variables to `make`:
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |
-| `INFINISWAP_MAX_PAGES_PER_REQUEST` | `1` | Maximum pages in one swap request |
+| `INFINISWAP_MAX_PAGES_PER_REQUEST` | `32` | Maximum pages in one swap request |
 | `INFINISWAP_BIO_PAGE_CAP` | `32` | Maximum pages in one bio |
 | `INFINISWAP_MAX_REMOTE_MEMORY_GB` | `32` | Maximum Remote Memory per Provider |
 | `INFINISWAP_DEVICE_SIZE_GB` | `12` | Infiniswap Device capacity |
 | `INFINISWAP_DEVICE_NAME` | `stackbd` | Internal backing device name |
 | `INFINISWAP_BACKING_STORE` | `/dev/sda4` | Backing Store path |
 | `INFINISWAP_PROVIDER_SAMPLE_SIZE` | `1` | Providers sampled for placement |
+
+Multi-page swap-in requests map their page segments directly for RDMA. If a
+request needs more scatter/gather entries than its Memory Provider supports, or
+if any requested page lacks a valid Remote Memory copy, the complete request is
+read from the Backing Store. Merged writes larger than one page also use the
+Backing Store because the RDMA write-mirroring path remains single-page.
 
 `setup/install.sh` maps the same settings from environment variables for legacy
 lab installation workflows. It builds and installs artifacts but does not load

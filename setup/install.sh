@@ -9,7 +9,7 @@ fi
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/.." && pwd)
 
-max_page_num=${MAX_PAGE_NUM:-1}
+max_page_num=${MAX_PAGE_NUM:-32}
 bio_page_cap=${BIO_PAGE_CAP:-32}
 max_remote_memory=${MAX_REMOTE_MEMORY_GB:-32}
 stackbd_size=${DEVICE_SIZE_GB:-12}

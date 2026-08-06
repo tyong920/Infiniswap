@@ -66,19 +66,15 @@ struct bio *IS_bio_clone(struct bio *source, gfp_t gfp)
 
 static void IS_stackbd_end_io(struct bio *bio)
 {
-	struct request *req = ptr_from_uint64((uint64_t)bio->bi_private);
+	struct stackbd_request *stack_req = bio->bi_private;
+	blk_status_t status = bio->bi_status;
 
-	blk_mq_end_request(req, bio->bi_status);
 	bio_put(bio);
-}
-static void IS_stackbd_end_io2(struct bio *bio)
-{
-	struct request *req = ptr_from_uint64((uint64_t)bio->bi_private);
-
-	pr_info("%s is called, req=%p, status=%d\n", __func__, req,
-		bio->bi_status);
-	blk_mq_end_request(req, bio->bi_status);
-	bio_put(bio);
+	if (status != BLK_STS_OK)
+		atomic_cmpxchg(&stack_req->status, BLK_STS_OK, status);
+	if (atomic_dec_and_test(&stack_req->pending))
+		blk_mq_end_request(stack_req->req,
+				   atomic_read(&stack_req->status));
 }
 
 static void IS_stackbd_end_io3(struct bio *bio)
@@ -144,109 +140,49 @@ abort:
     bio_io_error(bio);
 }
 
-void stackbd_make_request4(struct request_queue *q, struct request *req)
+void IS_submit_to_backing_store(struct request *req)
 {
-    struct bio *bio = NULL;
-    struct bio *b = req->bio;
-    int i;
-    int len = req->nr_phys_segments;
-    spin_lock_irq(&stackbd.lock);
-    if (!stackbd.bdev_raw)
-    {
-        printk("stackbd: Request before bdev_raw is ready, aborting\n");
-        goto abort;
-    }
-    if (!stackbd.is_active)
-    {
-        printk("stackbd: Device not active yet, aborting\n");
-        goto abort;
-    }
-    for (i=0; i<len -1; i++){
-		bio = IS_bio_clone(b, GFP_ATOMIC);
-		bio_list_add(&stackbd.bio_list, bio);
-		b = b->bi_next;
+	struct IS_request_ctx *request_ctx;
+	struct stackbd_request *stack_req;
+	struct bio_list cloned_bios;
+	struct bio *source;
+	struct bio *clone;
+
+	request_ctx = blk_mq_rq_to_pdu(req);
+	stack_req = &request_ctx->backing;
+	stack_req->req = req;
+	atomic_set(&stack_req->pending, 0);
+	atomic_set(&stack_req->status, BLK_STS_OK);
+	bio_list_init(&cloned_bios);
+
+	spin_lock_irq(&stackbd.lock);
+	if (!stackbd.bdev_raw || !stackbd.is_active)
+		goto abort;
+
+	for (source = req->bio; source; source = source->bi_next) {
+		clone = IS_bio_clone(source, GFP_ATOMIC);
+		if (!clone)
+			goto abort;
+		clone->bi_end_io = IS_stackbd_end_io;
+		clone->bi_private = stack_req;
+		bio_list_add(&cloned_bios, clone);
+		atomic_inc(&stack_req->pending);
 	}
-    bio = IS_bio_clone(b, GFP_ATOMIC);
-	bio->bi_end_io = IS_stackbd_end_io2;
-	bio->bi_private = (void*) uint64_from_ptr(req);
-    bio_list_add(&stackbd.bio_list, bio);
+	if (!atomic_read(&stack_req->pending))
+		goto abort;
 
-    wake_up(&req_event);
-    spin_unlock_irq(&stackbd.lock);
-    return;
+	while ((clone = bio_list_pop(&cloned_bios)))
+		bio_list_add(&stackbd.bio_list, clone);
+
+	wake_up(&req_event);
+	spin_unlock_irq(&stackbd.lock);
+	return;
+
 abort:
-    spin_unlock_irq(&stackbd.lock);
-    printk("<%p> Abort request\n\n", bio);
-    bio_io_error(bio);
-}
-
-
-void stackbd_make_request3(struct request_queue *q, struct request *req)
-{
-    struct bio *bio = NULL;
-    struct bio *b = req->bio;
-    int i;
-    int len = req->nr_phys_segments;
-    spin_lock_irq(&stackbd.lock);
-    if (!stackbd.bdev_raw)
-    {
-        printk("stackbd: Request before bdev_raw is ready, aborting\n");
-        goto abort;
-    }
-    if (!stackbd.is_active)
-    {
-        printk("stackbd: Device not active yet, aborting\n");
-        goto abort;
-    }
-    for (i=0; i<len; i++){
-		bio = IS_bio_clone(b, GFP_ATOMIC);
-		bio_list_add(&stackbd.bio_list, bio);
-		b = b->bi_next;
-	}
-    wake_up(&req_event);
-    spin_unlock_irq(&stackbd.lock);
-    return;
-abort:
-    spin_unlock_irq(&stackbd.lock);
-    printk("<%p> Abort request\n\n", bio);
-    bio_io_error(bio);
-}
-
-void stackbd_make_request2(struct request_queue *q, struct request *req)
-{
-    struct bio *bio = NULL;
-    struct bio *b = req->bio;
-    int i;
-    int len = req->nr_phys_segments;
-
-    spin_lock_irq(&stackbd.lock);
-    if (!stackbd.bdev_raw)
-    {
-        printk("stackbd: Request before bdev_raw is ready, aborting\n");
-        goto abort;
-    }
-    if (!stackbd.is_active)
-    {
-        printk("stackbd: Device not active yet, aborting\n");
-        goto abort;
-    }
-    for (i=0; i<len -1; i++){
-		bio = IS_bio_clone(b, GFP_ATOMIC);
-		bio_list_add(&stackbd.bio_list, bio);
-		b = b->bi_next;
-	}
-    bio = IS_bio_clone(b, GFP_ATOMIC);
-	bio->bi_end_io = IS_stackbd_end_io;
-	bio->bi_private = (void*) uint64_from_ptr(req);
-    bio_list_add(&stackbd.bio_list, bio);
-
-    wake_up(&req_event);
-    spin_unlock_irq(&stackbd.lock);
-    return;
-abort:
-    spin_unlock_irq(&stackbd.lock);
-    printk("<%p> Abort request\n\n", bio);
-    bio_io_error(bio);
+	spin_unlock_irq(&stackbd.lock);
+	while ((clone = bio_list_pop(&cloned_bios)))
+		bio_put(clone);
+	blk_mq_end_request(req, BLK_STS_IOERR);
 }
 
 // from original stackbd
@@ -366,13 +302,18 @@ static int stackbd_getgeo(struct block_device * block_device, struct hd_geometry
         return 0;
 }
 
-void IS_mq_request_stackbd(struct request *req)
+static bool IS_bitmap_group_test(int *bitmap, unsigned long offset,
+				 unsigned long len)
 {
-    stackbd_make_request2(stackbd.queue, req);
-}
-void IS_mq_request_stackbd2(struct request *req)
-{
-    stackbd_make_request4(stackbd.queue, req);
+	unsigned long first_page = offset / IS_PAGE_SIZE;
+	unsigned long last_page = (offset + len - 1) / IS_PAGE_SIZE;
+	unsigned long page;
+
+	for (page = first_page; page <= last_page; page++) {
+		if (!IS_bitmap_test(bitmap, page))
+			return false;
+	}
+	return true;
 }
 
 static int IS_request(struct request *req, struct IS_queue *xq)
@@ -393,12 +334,16 @@ static int IS_request(struct request *req, struct IS_queue *xq)
 	int chunk_index, chunk2_index;
 	struct remote_chunk_g *chunk;
 	struct remote_chunk_g *chunk2;
-	int bitmap_i;
-	int status = -1;
+
+	if (!len || !IS_ALIGNED(start, IS_PAGE_SIZE) ||
+	    !IS_ALIGNED(len, IS_PAGE_SIZE)) {
+		IS_submit_to_backing_store(req);
+		return 0;
+	}
 
 	// pr_info("%s called and req=%p, start=0x%lx, len=%lu\n", __func__, req, start, len);
 	gb_index = start >> ONE_GB_SHIFT;
-	end_index = (start + len - IS_PAGE_SIZE) >> ONE_GB_SHIFT;
+	end_index = (start + len - 1) >> ONE_GB_SHIFT;
 
 	//count
 	if (write) {
@@ -415,7 +360,7 @@ static int IS_request(struct request *req, struct IS_queue *xq)
 		cb_index = atomic_read(IS_sess->cb_index_map + gb_index);	
 		if (cb_index == NO_CB_MAPPED){
 			//go to disk	
-			IS_mq_request_stackbd(req);
+			IS_submit_to_backing_store(req);
 			return err;
 		}
 		//find cb and chunk
@@ -423,11 +368,10 @@ static int IS_request(struct request *req, struct IS_queue *xq)
 		cb = IS_sess->cb_list[cb_index];
 		chunk_index = IS_sess->chunk_map_cb_chunk[gb_index];
 		if (chunk_index == -1){
-			IS_mq_request_stackbd(req);
+			IS_submit_to_backing_store(req);
 			return err;
 		}
 		chunk = cb->remote_chunk.chunk_list[chunk_index];
-		status = 1;
 	}else {	//two chunks
 		cb_index = atomic_read(IS_sess->cb_index_map + gb_index);	
 		cb2_index = atomic_read(IS_sess->cb_index_map + end_index);	
@@ -436,52 +380,62 @@ static int IS_request(struct request *req, struct IS_queue *xq)
 		if (cb_index != NO_CB_MAPPED){
 			cb = IS_sess->cb_list[cb_index];
 		 	chunk_index = IS_sess->chunk_map_cb_chunk[gb_index];
-			chunk = cb->remote_chunk.chunk_list[chunk_index];
-			len1 = ONE_GB - chunk_offset;
-            pr_err("%s, clear chunk1[%d], start=0x%lx, len1=%lu\n", __func__, gb_index, chunk_offset, len1);
-            if (write){
-				//update bitmap
-                IS_bitmap_group_clear(chunk->bitmap_g, chunk_offset, len1);
-            }
+			if (chunk_index != -1) {
+				chunk = cb->remote_chunk.chunk_list[chunk_index];
+				len1 = ONE_GB - chunk_offset;
+				pr_err("%s, clear chunk1[%d], start=0x%lx, len1=%lu\n",
+				       __func__, gb_index, chunk_offset, len1);
+				if (write)
+					IS_bitmap_group_clear(chunk->bitmap_g,
+							      chunk_offset, len1);
+			}
 		}
 		if (cb2_index != NO_CB_MAPPED){
 			chunk2_offset = 0;
 			cb2 = IS_sess->cb_list[cb2_index];	
 			chunk2_index = IS_sess->chunk_map_cb_chunk[end_index];
-			chunk2 = cb2->remote_chunk.chunk_list[chunk2_index];
-			len2 = chunk_offset + len - ONE_GB;
-            pr_err("%s, clear chunk2[%d], start=0x%lx, len2=%lu\n", __func__, end_index, chunk2_offset, len2);
-            if (write){
-                IS_bitmap_group_clear(chunk2->bitmap_g, chunk2_offset, len2);
-            }
+			if (chunk2_index != -1) {
+				chunk2 = cb2->remote_chunk.chunk_list[chunk2_index];
+				len2 = chunk_offset + len - ONE_GB;
+				pr_err("%s, clear chunk2[%d], start=0x%lx, len2=%lu\n",
+				       __func__, end_index, chunk2_offset, len2);
+				if (write)
+					IS_bitmap_group_clear(chunk2->bitmap_g,
+							      chunk2_offset, len2);
+			}
 		}
         
-		IS_mq_request_stackbd(req);
+		IS_submit_to_backing_store(req);
 		return err;
 	}
 
+	if (write && len > IS_PAGE_SIZE) {
+		/* The RDMA write mirror still handles one page at a time. */
+		IS_bitmap_group_clear(chunk->bitmap_g, chunk_offset, len);
+		IS_submit_to_backing_store(req);
+		return 0;
+	}
+
 	if (write){
-		// if rdma_dev_off, go to disk
 		if (atomic_read(&IS_sess->rdma_on) == DEV_RDMA_ON){
-		
-			if (status == 1){//single chunk
-				err = IS_transfer_chunk(xdev, cb, cb_index, chunk_index, chunk, chunk_offset, len, write, req, xq);
-			}else{//two chunks (won't be executed)
-				IS_mq_request_stackbd(req);
-			}
+			err = IS_transfer_chunk(xdev, cb, cb_index, chunk_index,
+						chunk, chunk_offset, len, write, req,
+						xq);
 		}else{
-			IS_mq_request_stackbd(req);	
+			IS_submit_to_backing_store(req);
 		}
-	}else{	//read is always single page
+	}else{
 		if (atomic_read(&IS_sess->rdma_on) == DEV_RDMA_ON){
-			bitmap_i = (int)(chunk_offset / IS_PAGE_SIZE);
-			if (IS_bitmap_test(chunk->bitmap_g, bitmap_i)){ //remote recorded
-				err = IS_transfer_chunk(xdev, cb, cb_index, chunk_index, chunk, chunk_offset, len, write, req, xq);
+			if (IS_bitmap_group_test(chunk->bitmap_g, chunk_offset,
+						 len)) {
+				err = IS_transfer_chunk(xdev, cb, cb_index, chunk_index,
+							chunk, chunk_offset, len, write,
+							req, xq);
 			}else {
-				IS_mq_request_stackbd(req);	
+				IS_submit_to_backing_store(req);
 			}
 		}else{
-			IS_mq_request_stackbd(req);
+			IS_submit_to_backing_store(req);
 		}
 	}
 	if (unlikely(err))
@@ -606,7 +560,7 @@ int IS_register_block_device(struct IS_file *IS_file)
 	IS_file->tag_set.nr_hw_queues = submit_queues;
 	IS_file->tag_set.queue_depth = IS_QUEUE_DEPTH;
 	IS_file->tag_set.numa_node = NUMA_NO_NODE;
-	IS_file->tag_set.cmd_size = sizeof(struct raio_io_u);
+	IS_file->tag_set.cmd_size = sizeof(struct IS_request_ctx);
 	IS_file->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
 	IS_file->tag_set.driver_data = IS_file;
 
