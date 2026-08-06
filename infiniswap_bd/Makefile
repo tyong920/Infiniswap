@@ -1,7 +1,8 @@
 ifneq ($(KERNELRELEASE),)
 
 obj-m := infiniswap.o
-infiniswap-y := is_configfs.o is_mq.o is_main.o
+infiniswap-y := is_configfs.o is_mq.o is_main.o is_protocol.o
+ccflags-y += -I$(src)/../common
 
 kernel_include_dirs := $(srctree)/include $(objtree)/include
 ifneq ($(wildcard $(srctree)/include/linux/genhd.h),)

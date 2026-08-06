@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "providers": {
+    "provider-a": {
+      "address": "192.0.2.10",
+      "port": 9400,
+      "rdma_rail": {
+        "device": "mlx5_ib2",
+        "port": 1,
+        "numa_node": 0
+      },
+      "authentication": {
+        "consumer_id": "consumer-a",
+        "key_id": "key-2025-01",
+        "psk_file": "/etc/infiniswap/keys/provider-a.psk"
+      },
+      "expected_capabilities": [
+        "backed",
+        "opportunistic_pool",
+        "provider_failure_deadline",
+        "status",
+        "auth_hmac_sha256"
+      ],
+      "placement_weight": 100
+    }
+  }
+}

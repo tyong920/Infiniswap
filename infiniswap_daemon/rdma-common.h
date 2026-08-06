@@ -18,6 +18,8 @@
 #include <netinet/in.h>
 #include <linux/kernel.h>
 
+#include "infiniswap_provider_session.h"
+
 #define TEST_NZ(x) do { if ( (x)) die("error: " #x " failed (returned non-zero)." ); } while (0)
 #define TEST_Z(x)  do { if (!(x)) die("error: " #x " failed (returned zero/null)."); } while (0)
 
@@ -29,10 +31,11 @@
 #ifdef USER_MAX_CLIENT
   #define MAX_CLIENT	USER_MAX_CLIENT
 #else
-  #define MAX_CLIENT	32
+  #define MAX_CLIENT	1
 #endif
 
 #define EXTRA_CHUNK_NUM 2
+#define PROVIDER_HANDSHAKE_TIMEOUT_MS 5000U
 
 
 #ifdef USER_MAX_REMOTE_MEMORY
@@ -77,32 +80,29 @@
   #define CURR_FREE_MEM_WEIGHT 0.7
 #endif
 
-#define ntohll(x) (((uint64_t)(ntohl((int)((x << 32) >> 32))) << 32) | \
-        (unsigned int)ntohl(((int)(x >> 32))))
-
 enum mode {
   M_WRITE,
   M_READ
 };
 
 
-struct message {
+enum control_message_type {
+  CONTROL_DONE = 1,
+  CONTROL_INFO,
+  CONTROL_FREE_SIZE,
+  CONTROL_EVICT,
+  CONTROL_ACTIVITY,
+  CONTROL_RELEASE,
+  CONTROL_PEER_ERROR,
+  CONTROL_QUERY,
+  CONTROL_BIND
+};
+
+struct control_message {
   uint64_t buf[MAX_MR_SIZE_GB];
   uint32_t rkey[MAX_MR_SIZE_GB];
   int size_gb;
-  //uint64_t size;
-  enum {
-    DONE = 1, //C
-    INFO, //S
-    INFO_SINGLE,
-    FREE_SIZE, //S
-    EVICT,
-    ACTIVITY,
-    STOP, //S
-    BIND, //C
-    BIND_SINGLE,
-    QUERY //C
-  } type;
+  enum control_message_type type;
 };
 
 struct context {
@@ -140,13 +140,46 @@ struct connection {
 
   struct ibv_mr peer_mr;
 
-  struct message *recv_msg;
-  struct message *send_msg;
+  uint8_t *recv_frame;
+  uint8_t *send_frame;
+  uint8_t *pending_send_frame;
+  size_t send_frame_size;
+  size_t pending_send_frame_size;
+  struct control_message recv_message;
+  struct control_message send_message;
+  struct is_provider_session protocol_session;
+  uint64_t active_request_id;
+  uint64_t next_provider_request_id;
+  uint64_t pending_evict_request_id;
+  uint64_t pending_release_request_id;
+  uint8_t pending_evict_chunks[MAX_MR_SIZE_GB];
+  uint8_t pending_release_chunks[MAX_MR_SIZE_GB];
+  uint8_t release_chunks[MAX_MR_SIZE_GB];
+  uint16_t pending_evict_chunk_count;
+  uint16_t pending_release_chunk_count;
+  uint16_t release_chunk_count;
+  uint32_t requested_logical_start;
+  uint8_t requested_pool;
+  int close_after_send;
+  int repost_after_send;
+  int pending_send;
+  int pending_close_after_send;
+  int pending_repost_after_send;
+  int auth_subscribed;
 
   char *rdma_remote_region;
   //struct rdma_remote_mem rdma_remote;
 
   struct atomic_t cq_qp_state;
+  pthread_mutex_t send_lock;
+  pthread_mutex_t control_lock;
+  pthread_mutex_t lifetime_lock;
+  pthread_cond_t lifetime_idle;
+  pthread_t deadline_thread;
+  unsigned int references;
+  int handshake_complete;
+  int send_inflight;
+  int closing;
 
   pthread_t free_mem_thread;
   long free_mem_gb;
@@ -173,6 +206,7 @@ struct connection {
 };
 
 #define CHUNK_MALLOCED 1
+#define CHUNK_ALLOCATING 2
 #define CHUNK_EMPTY	0
 struct rdma_remote_mem{
   char* region_list[MAX_FREE_MEM_GB];
@@ -205,19 +239,41 @@ struct rdma_session {
 
 };
 
-void die(const char *reason);
-uint64_t infiniswap_htonll(uint64_t value);
+extern struct rdma_session session;
 
-void build_connection(struct rdma_cm_id *id);
+typedef struct ibv_mr *(*remote_memory_register_fn)(
+    struct ibv_pd *protection_domain, void *address, size_t length,
+    int access);
+typedef int (*remote_memory_deregister_fn)(struct ibv_mr *memory_region);
+
+int register_remote_chunks(
+    struct connection *conn, struct rdma_session *provider_session,
+    struct ibv_pd *protection_domain, int requested_chunks,
+    remote_memory_register_fn register_region,
+    remote_memory_deregister_fn deregister_region);
+
+int release_connection_remote_chunks(
+    struct connection *conn, struct rdma_session *provider_session,
+    remote_memory_deregister_fn deregister_region);
+
+int control_chunk_set_matches(
+    const uint8_t expected_chunks[MAX_MR_SIZE_GB],
+    uint16_t expected_count, const uint32_t response_chunks[],
+    uint16_t response_count);
+
+void die(const char *reason);
+void set_provider_auth_registry(struct is_auth_registry *registry);
+
+int build_connection(struct rdma_cm_id *id);
 void build_params(struct rdma_conn_param *params);
 void destroy_connection(void *context);
 void * get_serving_mem_region(void *context);
 void on_connect(void *context);
-void send_single_mr(void *context, int n);
 void send_mr(void *context, int n);
-void send_stop(void *context, int n);
+int send_stop(void *context, int n);
 void send_evict(void *context, int n);
 void send_free_mem_size(void *context);
+void rdma_session_init(struct rdma_session *sess);
 void *free_mem(void *data);
 
 #endif

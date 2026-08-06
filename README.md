@@ -55,13 +55,63 @@ Pass these cache variables to the CMake configure command with `-D`:
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |
-| `INFINISWAP_MAX_CLIENT` | `32` | Maximum connected Memory Consumers |
 | `INFINISWAP_MAX_REMOTE_MEMORY_GB` | `32` | Maximum contributed Remote Memory |
 | `INFINISWAP_REMOTE_MEMORY_EVICT_GB` | `8` | Eviction threshold |
 | `INFINISWAP_EVICT_HIT_LIMIT` | `1` | Low-memory samples before eviction |
 | `INFINISWAP_REMOTE_MEMORY_EXPAND_GB` | `16` | Expansion threshold |
 | `INFINISWAP_EXPAND_HIT_LIMIT` | `20` | High-memory samples before expansion |
 | `INFINISWAP_MEASURED_FREE_MEM_WEIGHT` | `0.7` | Current free-memory sample weight |
+
+### Authenticated Control Protocol
+
+The Memory Provider now accepts only the bounded, endian-stable control frames
+specified by `common/infiniswap_protocol.h`. Protocol 1.1 interoperates with
+protocol 1.0 by negotiating the lower minor version and their shared optional
+capabilities. Major-version mismatches, unknown required capabilities, malformed
+lengths, replayed request identifiers, and out-of-order messages produce a
+structured error followed by connection teardown. Unversioned native C-struct
+messages are intentionally unsupported.
+
+Each Memory Consumer authenticates with an identifier, key identifier, fresh
+nonce, and HMAC-SHA256. The allowlist may hold credentials for multiple
+Consumer identities, while the Phase 0 Provider accepts exactly one active
+Consumer connection. The PSK is never transmitted. Configure the Provider with
+a root-owned mode-0600 allowlist:
+
+```ini
+version = 1
+
+[consumer:consumer-a]
+current_key_id = key-2025-01
+current_psk_hex = <32-to-64-byte-PSK-as-hex>
+next_key_id = key-2025-02
+next_psk_hex = <optional-rotation-PSK-as-hex>
+next_valid_until_unix = <required-expiry-for-next-key>
+max_opportunistic_chunks = 32
+max_committed_chunks = 0
+revoked = false
+```
+
+Start the Provider with the allowlist as its third argument:
+
+```bash
+build/daemon/infiniswap-daemon :: 9400 /etc/infiniswap/consumers.conf
+```
+
+Reload the allowlist with `SIGHUP`. `next_valid_until_unix` must be in the
+future and no more than 30 days from load time. Authentication must complete
+within five seconds. A next-key session is disconnected when its overlap
+expires; a Consumer removed from the file, changed to `revoked = true`, or given
+changed keys or limits is disconnected during reload. Malformed reloads leave
+the active allowlist unchanged. Error strings and protocol error frames contain
+no PSKs or authentication tags.
+
+The versioned static Provider Directory schema and an example live at
+`config/provider-directory.schema.json` and
+`config/provider-directory.example.json`. Entries identify one RDMA Rail,
+expected capabilities, authentication key/file mapping, and placement weight per
+allowlisted Memory Provider; PSK values do not belong in the Provider Directory
+and remain in mode-0600 files.
 
 ## Build the Memory Consumer
 

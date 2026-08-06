@@ -34,6 +34,7 @@ jobs:
             libibverbs-dev \
             librdmacm-dev \
             libssl-dev \
+            python3-jsonschema \
             linux-headers-generic
 
       - name: Configure Memory Provider
@@ -50,6 +51,40 @@ jobs:
         run: >-
           ctest --test-dir "${{ runner.temp }}/infiniswap-daemon"
           --output-on-failure
+
+      - name: Test endian-stable protocol vectors
+        if: matrix.ubuntu == '24.04'
+        run: |
+          sudo apt-get install -y gcc-s390x-linux-gnu qemu-user
+          s390x-linux-gnu-gcc -std=c11 -Wall -Wextra -Wpedantic -Werror \
+            -static -Icommon common/infiniswap_protocol.c \
+            infiniswap_daemon/tests/protocol_test.c \
+            -o "${{ runner.temp }}/protocol-test-s390x"
+          qemu-s390x "${{ runner.temp }}/protocol-test-s390x"
+
+      - name: Test wire size independence from capacity
+        if: matrix.ubuntu == '24.04'
+        run: |
+          cmake -S infiniswap_daemon \
+            -B "${{ runner.temp }}/infiniswap-daemon-capacity" \
+            -G Ninja -DINFINISWAP_MAX_REMOTE_MEMORY_GB=7
+          cmake --build "${{ runner.temp }}/infiniswap-daemon-capacity" \
+            --target protocol-test
+          ctest --test-dir "${{ runner.temp }}/infiniswap-daemon-capacity" \
+            -R '^protocol$' --output-on-failure
+
+      - name: Test Provider Directory schema files
+        run: |
+          python3 - <<'PY'
+          import json
+          import jsonschema
+          from pathlib import Path
+
+          schema = json.loads(Path("config/provider-directory.schema.json").read_text())
+          example = json.loads(Path("config/provider-directory.example.json").read_text())
+          jsonschema.Draft7Validator.check_schema(schema)
+          jsonschema.validate(example, schema)
+          PY
 
       - name: Test RDMA tuple discovery
         run: infiniswap_bd/tests/rdma-build-flags-test.sh
