@@ -15,6 +15,8 @@ fi
 backing=${INFINISWAP_TEST_BACKING:-}
 module=${INFINISWAP_TEST_MODULE:-}
 provider=${INFINISWAP_TEST_PROVIDER:-}
+external_provider=${INFINISWAP_TEST_EXTERNAL_PROVIDER:-no}
+fault_mode=${INFINISWAP_TEST_FAULT_MODE:-roce-iptables}
 rail=${INFINISWAP_TEST_RDMA_DEVICE:-rxe0}
 address=${INFINISWAP_TEST_RDMA_ADDRESS:-}
 netdev=${INFINISWAP_TEST_RDMA_NETDEV:-}
@@ -31,6 +33,7 @@ dm_delay_name=
 loaded_module=0
 mounted_configfs=0
 network_fault_active=0
+fault_tag="infiniswap-backed-test-$$"
 backing_fault_active=0
 declare -a created_groups=()
 
@@ -154,12 +157,36 @@ restore_delayed_backing() {
   backing_fault_active=0
 }
 
+clear_network_fault() {
+  case $fault_mode in
+    netem)
+      tc qdisc del dev "$netdev" root 2>/dev/null
+      ;;
+    roce-iptables)
+      iptables -w -D OUTPUT -p udp -d "$address" --dport 4791 \
+        -m comment --comment "$fault_tag" -j DROP 2>/dev/null
+      ;;
+  esac
+}
+
+inject_network_fault() {
+  case $fault_mode in
+    netem)
+      tc qdisc replace dev "$netdev" root netem loss 100%
+      ;;
+    roce-iptables)
+      iptables -w -I OUTPUT -p udp -d "$address" --dport 4791 \
+        -m comment --comment "$fault_tag" -j DROP
+      ;;
+  esac
+}
+
 cleanup() {
   local index
 
   set +e
-  if ((network_fault_active)) && [[ -n $netdev ]]; then
-    tc qdisc del dev "$netdev" root 2>/dev/null
+  if ((network_fault_active)); then
+    clear_network_fault
   fi
   restore_delayed_backing
   for ((index = ${#created_groups[@]} - 1; index >= 0; index--)); do
@@ -183,19 +210,46 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 case $test_case in
-  all | remote-first-backing-failure) ;;
+  all | remote-first-backing-failure | network-fault) ;;
   *)
-    fail "INFINISWAP_TEST_CASE must be all or remote-first-backing-failure"
+    fail "INFINISWAP_TEST_CASE must be all, remote-first-backing-failure, or network-fault"
     ;;
 esac
 
+case $external_provider in
+  yes | no) ;;
+  *) fail "INFINISWAP_TEST_EXTERNAL_PROVIDER must be yes or no" ;;
+esac
+if [[ $test_case == network-fault ]]; then
+  [[ $external_provider == yes ]] || \
+    fail "network-fault requires INFINISWAP_TEST_EXTERNAL_PROVIDER=yes"
+  [[ -n ${INFINISWAP_TEST_PSK_HEX:-} ]] || \
+    fail "set INFINISWAP_TEST_PSK_HEX for the external Provider"
+  case $fault_mode in
+    netem)
+      command -v tc >/dev/null || fail "missing command: tc"
+      ;;
+    roce-iptables)
+      command -v iptables >/dev/null || fail "missing command: iptables"
+      [[ $address != *:* ]] || \
+        fail "roce-iptables fault injection requires an IPv4 Provider address"
+      ;;
+    *) fail "INFINISWAP_TEST_FAULT_MODE must be netem or roce-iptables" ;;
+  esac
+elif [[ $external_provider == yes ]]; then
+  fail "external Provider mode is only supported by the network-fault test case"
+fi
+
 for command in awk blockdev cmp date dd dmesg dmsetup fio grep insmod kill modprobe \
-  mount mountpoint openssl rdma readlink rmmod sort tail tc timeout; do
+  mount mountpoint openssl rdma readlink rmmod sort tail timeout; do
   command -v "$command" >/dev/null || fail "missing command: $command"
 done
-[[ -n $backing && -n $provider && -n $address ]] || \
-  fail "set INFINISWAP_TEST_BACKING, INFINISWAP_TEST_PROVIDER, and INFINISWAP_TEST_RDMA_ADDRESS"
-[[ -x $provider ]] || fail "Provider executable is not executable: $provider"
+[[ -n $backing && -n $address ]] || \
+  fail "set INFINISWAP_TEST_BACKING and INFINISWAP_TEST_RDMA_ADDRESS"
+if [[ $external_provider == no ]]; then
+  [[ -n $provider ]] || fail "set INFINISWAP_TEST_PROVIDER"
+  [[ -x $provider ]] || fail "Provider executable is not executable: $provider"
+fi
 [[ -f $module ]] || fail "Memory Consumer module does not exist: $module"
 rdma link show "$rail/1" >/dev/null 2>&1 || fail "RDMA Rail is unavailable: $rail"
 if [[ -z $netdev ]]; then
@@ -227,14 +281,17 @@ if [[ -d /sys/module/infiniswap ]]; then
 fi
 
 dmesg_start=$(dmesg | wc -l)
-psk_hex=$(openssl rand -hex 32)
-cat > "$tmp/provider-memory.conf" <<EOF
+if [[ $external_provider == yes ]]; then
+  psk_hex=$INFINISWAP_TEST_PSK_HEX
+else
+  psk_hex=$(openssl rand -hex 32)
+  cat > "$tmp/provider-memory.conf" <<EOF
 version = 1
 host_reserve_gib = 1
 max_opportunistic_gib = 1
 max_committed_gib = 0
 EOF
-cat > "$tmp/consumers.conf" <<EOF
+  cat > "$tmp/consumers.conf" <<EOF
 version = 1
 
 [consumer:consumer-test]
@@ -245,13 +302,14 @@ max_opportunistic_gib = 1
 max_committed_gib = 0
 revoked = false
 EOF
-chmod 0600 "$tmp/consumers.conf"
-ulimit -l unlimited 2>/dev/null || fail "could not raise the Provider memlock limit"
-"$provider" :: "$port" "$tmp/provider-memory.conf" \
-  "$tmp/consumers.conf" >"$tmp/provider.log" 2>&1 &
-provider_pid=$!
-sleep 1
-kill -0 "$provider_pid" 2>/dev/null || fail "Provider did not start"
+  chmod 0600 "$tmp/consumers.conf"
+  ulimit -l unlimited 2>/dev/null || fail "could not raise the Provider memlock limit"
+  "$provider" :: "$port" "$tmp/provider-memory.conf" \
+    "$tmp/consumers.conf" >"$tmp/provider.log" 2>&1 &
+  provider_pid=$!
+  sleep 1
+  kill -0 "$provider_pid" 2>/dev/null || fail "Provider did not start"
+fi
 
 if ! mountpoint -q "$configfs"; then
   mount -t configfs none "$configfs"
@@ -355,6 +413,53 @@ test_remote_first_backing_failure() {
   echo "focused Remote-First backing failure verification passed"
 }
 
+test_network_fault() {
+  local name=infiniswap-network-fault
+  local group=$root/$name
+  local write_started write_elapsed write_status state timeouts transition_budget
+
+  configure_group "$name" "$psk_hex" strict
+  wait_for_value "$group/connection_state" connected
+  dd if=/dev/urandom of="$tmp/network-seed" bs=4096 count=1 status=none
+  dd if="$tmp/network-seed" of="/dev/$name" bs=4096 count=1 \
+    oflag=direct conv=fsync status=none
+  wait_for_value "$group/mapped_hot_ranges" 1
+  dd if=/dev/urandom of="$tmp/network-pattern" bs=4096 count=1 status=none
+
+  inject_network_fault
+  network_fault_active=1
+  write_started=$(date +%s%3N)
+  set +e
+  timeout 5 dd if="$tmp/network-pattern" of="/dev/$name" bs=4096 \
+    count=1 oflag=direct status=none
+  write_status=$?
+  set -e
+  write_elapsed=$(($(date +%s%3N) - write_started))
+  state=$(<"$group/connection_state")
+  timeouts=$(<"$group/provider_timeouts_total")
+  printf 'network fault write_status=%s elapsed_ms=%s state=%s timeouts=%s\n' \
+    "$write_status" "$write_elapsed" "$state" "$timeouts"
+
+  ((write_status == 0)) || \
+    fail "silent network fallback returned an application-visible write error"
+  ((timeouts >= 1)) || \
+    fail "network fault injection did not produce a Provider timeout"
+  ((write_elapsed <= failure_deadline_ms + 500)) || \
+    fail "silent network fallback took ${write_elapsed} ms"
+  transition_budget=$((failure_deadline_ms + 500 - write_elapsed))
+  wait_for_value_deadline "$group/connection_state" degraded \
+    "$transition_budget"
+
+  clear_network_fault
+  network_fault_active=0
+  dd if="/dev/$name" of="$tmp/network-actual" bs=4096 count=1 \
+    iflag=direct status=none
+  cmp "$tmp/network-pattern" "$tmp/network-actual" || \
+    fail "silent network fallback did not preserve Backing Store data"
+  stop_group "$name" || fail "network fault device did not tear down"
+  echo "focused silent network interruption verification passed"
+}
+
 check_kernel_diagnostics() {
   dmesg | tail -n "+$((dmesg_start + 1))" > "$tmp/kernel.log"
   if grep -Eiq 'BUG:|WARNING:|Oops:|kernel panic|use-after-free|refcount.*underflow' \
@@ -366,6 +471,12 @@ check_kernel_diagnostics() {
 
 if [[ $test_case == remote-first-backing-failure ]]; then
   test_remote_first_backing_failure
+  check_kernel_diagnostics
+  exit 0
+fi
+
+if [[ $test_case == network-fault ]]; then
+  test_network_fault
   check_kernel_diagnostics
   exit 0
 fi
@@ -445,37 +556,6 @@ for iteration in 1 2 3; do
   stop_group "$name" || fail "$name did not tear down"
   sleep 1
 done
-
-# A silent network interruption exercises the per-operation watchdog. The
-# timed-out Strict write succeeds from its valid Backing Store copy, and the
-# late RDMA completion cannot overwrite the later Backing Store read.
-configure_group infiniswap-network-fault "$psk_hex" strict
-wait_for_value "$root/infiniswap-network-fault/connection_state" connected
-dd if=/dev/urandom of="$tmp/network-seed" bs=4096 count=1 status=none
-dd if="$tmp/network-seed" of=/dev/infiniswap-network-fault bs=4096 count=1 \
-  oflag=direct conv=fsync status=none
-wait_for_value "$root/infiniswap-network-fault/mapped_hot_ranges" 1
-dd if=/dev/urandom of="$tmp/network-pattern" bs=4096 count=100 status=none
-tc qdisc replace dev "$netdev" root netem loss 100%
-network_fault_active=1
-measure_parallel_write_p99 /dev/infiniswap-network-fault \
-  "$tmp/network-pattern" "$tmp/network-latency"
-((measured_p99_ms <= failure_deadline_ms + 500)) || \
-  fail "network fallback p99 was ${measured_p99_ms} ms"
-echo "network fallback p99: ${measured_p99_ms} ms"
-wait_for_value "$root/infiniswap-network-fault/connection_state" degraded
-tc qdisc del dev "$netdev" root
-network_fault_active=0
-dd if=/dev/infiniswap-network-fault of="$tmp/network-actual" bs=4096 \
-  count=100 iflag=direct status=none
-cmp "$tmp/network-pattern" "$tmp/network-actual" || \
-  fail "late RDMA completion caused a stale read"
-[[ $(<"$root/infiniswap-network-fault/provider_timeouts_total") -ge 1 ]] || \
-  fail "Provider timeout was not counted"
-[[ $(<"$root/infiniswap-network-fault/late_rdma_completions_total") -ge 1 ]] || \
-  fail "late RDMA completion was not ignored and counted"
-stop_group infiniswap-network-fault || fail "network fault device did not tear down"
-sleep 1
 
 # Provider process death transitions promptly and leaves the valid Backing
 # Store available without an application-visible read error.

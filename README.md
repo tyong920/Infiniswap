@@ -330,7 +330,7 @@ Store and a Soft-RoCE Rail, then build both the Provider and Consumer. The test
 performs authenticated RC setup, verified random and mixed one-sided I/O,
 Strict and Remote-First completion with independent backing-buffer lifetimes,
 cold Local-Only readback, rejected-authentication fallback, runtime threshold
-changes, bounded Provider-death/network fallback, delayed completion safety,
+changes, bounded Provider-death fallback, delayed completion safety,
 Backing-Degraded write rejection, and repeated teardown:
 
 ```bash
@@ -350,6 +350,30 @@ the Backing Store. Set
 Remote-First fault case. That case reads the written payload back from Remote
 Memory. This distinguishes an application-visible write error with the payload
 present in Remote Memory from a failure where the remote payload is absent.
+
+A silent-network fault needs an external Provider because self-SoftRoCE traffic
+never reaches the local netdev's qdisc or firewall. Start the external Provider
+with the two-VM configuration shown below, changing both Opportunistic Pool
+limits to 1 GiB and both Committed Pool limits to zero. Then run this focused
+case on the Consumer, replacing the PSK and Provider address:
+
+```bash
+sudo INFINISWAP_TEST_DESTRUCTIVE=yes \
+  INFINISWAP_TEST_CASE=network-fault \
+  INFINISWAP_TEST_EXTERNAL_PROVIDER=yes \
+  INFINISWAP_TEST_PSK_HEX="<PSK printed by Provider setup>" \
+  INFINISWAP_TEST_FAULT_MODE=roce-iptables \
+  INFINISWAP_TEST_BACKING=/dev/vdb \
+  INFINISWAP_TEST_MODULE="$PWD/infiniswap_bd/infiniswap.ko" \
+  INFINISWAP_TEST_RDMA_DEVICE=rxe0 \
+  INFINISWAP_TEST_RDMA_ADDRESS="<Provider IPv4 address>" \
+  INFINISWAP_TEST_PROVIDER_PORT=19401 \
+  infiniswap_bd/tests/remote-backed-test.sh
+```
+
+The focused test requires an observed Provider timeout before accepting the
+`degraded` transition, preventing successful self-SoftRoCE I/O from being
+misclassified as network-failure fallback.
 
 A separate Remote-Only test needs no Backing Store. It verifies the host gate,
 atomic full-capacity admission, repeated Committed Pool reserve/release cycles,
