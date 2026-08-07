@@ -36,6 +36,7 @@ bool is_rdma_range_mapped(struct is_device *device, sector_t sector,
 bool is_rdma_range_valid(struct is_device *device, sector_t sector,
 			 unsigned int bytes);
 int is_rdma_submit(struct is_device *device, struct is_rdma_io *io);
+int is_rdma_flush(struct is_device *device);
 void is_rdma_note_activity(struct is_device *device, sector_t sector,
 			   unsigned int bytes, bool write);
 void is_rdma_mapping_parameters_changed(struct is_device *device);

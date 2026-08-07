@@ -10,17 +10,19 @@ The current supported build targets are:
   MLNX_OFED 5.8.
 - Ubuntu 24.04 with the Linux 6.8 GA kernel and inbox RDMA.
 
-The current Memory Consumer milestone exposes a Backed Mode Infiniswap Device
-that can connect to one authenticated Memory Provider over one configured RC
-RDMA Rail. Strict is the production default and waits for both Backing Store and
-Remote Memory outcomes; Remote-First remains an explicit latency-oriented
-opt-in. Both policies preserve successful Backing Store writes as Local-Only
-Data when RDMA fails. Provider operations fall back by the configured deadline,
-late completions are ignored, and terminal backing failures enter observable
-Backing-Degraded state and reject new writes until the device is recreated.
-This code is for controlled Soft-RoCE and block verification, not production
-swap cutover. Runtime validation and production operations are tracked
-separately in `docs/modernization-plan.md`.
+The current Memory Consumer milestone exposes Backed Mode and Remote-Only Mode
+Infiniswap Devices that connect to one authenticated Memory Provider over one
+configured RC RDMA Rail. Strict is the production Backed Mode default and waits
+for both Backing Store and Remote Memory outcomes; Remote-First remains an
+explicit latency-oriented opt-in. Both policies preserve successful Backing
+Store writes as Local-Only Data when RDMA fails. Provider operations fall back
+by the configured deadline, late completions are ignored, and terminal backing
+failures enter observable Backing-Degraded state. Remote-Only Mode is gated by
+an explicit Remote-Only-Eligible Host declaration, reserves its complete
+capacity from the Committed Pool before exposing a block device, and enters
+terminal Remote-Lost after Provider loss. This code is for controlled Soft-RoCE
+and block verification, not production swap cutover. Runtime validation and
+production operations are tracked separately in `docs/modernization-plan.md`.
 
 ## Build Dependencies
 
@@ -131,10 +133,11 @@ no PSKs or authentication tags.
 
 The versioned configuration contracts and examples live under `config/`:
 
-- `consumer.schema.json` defines the current Consumer v2 contract, including
-  identity, mode, acknowledgement policy, Backing Store, capacity, Provider
-  Failure Deadline, Hot Range scoring, trusted Providers, and explicit swap
-  priority. `consumer-v1.schema.json` preserves the previous contract, which
+- `consumer.schema.json` defines the current Consumer v3 contract, including
+  the Remote-Only-Eligible Host declaration, mode, acknowledgement policy,
+  Backing Store, capacity, Provider Failure Deadline, Hot Range scoring,
+  trusted Providers, and explicit swap priority. `consumer-v1.schema.json` and
+  `consumer-v2.schema.json` preserve the previous Backed Mode contracts; v1
   loads with documented Hot Range defaults.
 - `provider.schema.json` defines the current Provider v2 contract for identity,
   listen address, RDMA Rail, Host Reserve, Opportunistic and Committed Pool
@@ -144,8 +147,8 @@ The versioned configuration contracts and examples live under `config/`:
   Provider Directory and its expected capabilities and placement weights.
   `provider-directory-v1.schema.json` preserves v1.
 - `status.schema.json` defines the current stable, secret-free JSON status
-  contract; `status-v1.schema.json` and `status-v2.schema.json` preserve the
-  previous compatibility contracts.
+  contract; `status-v1.schema.json` through `status-v3.schema.json` preserve
+  the previous compatibility contracts.
 
 PSK values never belong in JSON. Each referenced PSK must be a non-symlink
 regular file owned by root with mode 0600. Validate a Provider configuration on
@@ -223,19 +226,32 @@ Mutations require root; dry runs do not mutate the host.
 
 Copy `config/consumer.example.json` and
 `config/provider-directory.example.json` into `/etc/infiniswap`, then adjust the
-identity, dedicated Backing Store, one selected Provider, and key path. Provider
-hostnames must resolve to exactly one numeric address during preflight so the
-kernel RDMA CM route is deterministic. PSK files contain either 32-64 raw bytes
-or 64-128 hexadecimal characters; they remain root-owned mode 0600, are passed
-through a write-only configfs attribute, and never appear in status. Remote-Only
-Mode is represented in the versioned schema but remains rejected until the
-Remote-Only milestone is implemented.
+identity, dedicated Backing Store, one selected Provider, and key path. For
+Remote-Only Mode, start from `config/consumer-remote-only.example.json`; setting
+`identity.remote_only_eligible` to true declares that every swap-eligible
+workload on the host can recover after Remote-Lost. The CLI rejects Remote-Only
+Mode on earlier schema versions, a false declaration, a Backing Store, or a
+Provider without Remote-Only and Committed Pool capabilities.
+
+Provider hostnames must resolve to exactly one numeric address during preflight
+so the kernel RDMA CM route is deterministic. PSK files contain either 32-64
+raw bytes or 64-128 hexadecimal characters; they remain root-owned mode 0600,
+are passed through a write-only configfs attribute, and never appear in status.
 
 The `hot_range` object sets the runtime mapping threshold and the per-request
 read/write score weights. These values remain writable while a device is active;
 lowering the threshold immediately reevaluates cold ranges. A newly mapped
 Remote Chunk starts with no remotely valid sectors, so reads continue to use the
 Backing Store until successful remote writes establish validity.
+
+Remote-Only activation is synchronous: the Provider must atomically grant one
+Committed Remote Chunk for every 1 GiB of advertised capacity before
+`/dev/infiniswap0` appears. Those assignments are excluded from normal pressure
+eviction. Reads are accepted only after successful writes establish remote
+validity; there is no Backing Store fallback. While the device is active, an
+authenticated status heartbeat uses one third of the Provider Failure Deadline
+for its interval and one third for its response, leaving the remaining third as
+scheduler margin for the terminal transition.
 
 Review the create preflight, then create and activate only that configured
 Infiniswap Device:
@@ -259,8 +275,8 @@ sudo bin/infiniswapctl enable infiniswap0 --priority 100
 ```
 
 Human-readable status is the default. `--json` emits deterministic schema
-version 3 data covering lifecycle, operational Backing Store state, mode,
-policy, swap state, Provider connections, local/remote capacity, Hot Range
+version 4 data covering lifecycle, operational state (including Remote-Lost),
+mode, policy, swap state, Provider connections, local/remote capacity, Hot Range
 scoring, mapped-range count, correctness/failover metrics, and the last kernel
 control error. It never includes key identifiers, PSK paths, PSKs, or
 authentication tags:
@@ -326,6 +342,20 @@ sudo INFINISWAP_TEST_DESTRUCTIVE=yes \
 The address must belong to the netdev backing the named Soft-RoCE Rail. The test
 allocates one 1 GiB Opportunistic Pool chunk and overwrites the first 2 GiB of
 the Backing Store.
+
+A separate Remote-Only test needs no Backing Store. It verifies the host gate,
+atomic full-capacity admission, repeated Committed Pool reserve/release cycles,
+verified one-sided I/O, bounded Remote-Lost transition during silent network
+loss, and explicit read/write failure after the terminal transition:
+
+```bash
+sudo INFINISWAP_TEST_DESTRUCTIVE=yes \
+  INFINISWAP_TEST_MODULE="$PWD/infiniswap_bd/infiniswap.ko" \
+  INFINISWAP_TEST_PROVIDER="$PWD/build/daemon/infiniswap-daemon" \
+  INFINISWAP_TEST_RDMA_DEVICE=rxe0 \
+  INFINISWAP_TEST_RDMA_ADDRESS=192.0.2.20 \
+  infiniswap_bd/tests/remote-only-test.sh
+```
 
 `setup/install.sh bd` only builds and installs the module. It does not load the
 module, create an Infiniswap Device, format swap, or alter active swap.

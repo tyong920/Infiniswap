@@ -56,6 +56,7 @@ class ProviderDirectoryEntry:
 class ConsumerConfig:
     path: str
     consumer_id: str
+    remote_only_eligible: bool
     name: str
     mode: str
     acknowledgement_policy: str
@@ -450,12 +451,21 @@ def load_consumer(path: str, system: Any) -> ConsumerConfig:
     document = load_json(path)
     _strict_fields(document, "consumer", {"schema_version", "identity", "device"})
     schema_version = document.get("schema_version")
-    if schema_version not in (1, 2):
-        raise ConfigError("schema_version must be 1 or 2")
+    if schema_version not in (1, 2, 3):
+        raise ConfigError("schema_version must be 1, 2, or 3")
 
     identity = _object(document["identity"], "identity")
-    _strict_fields(identity, "identity", {"consumer_id"})
+    identity_fields = {"consumer_id"}
+    if schema_version >= 3:
+        identity_fields.add("remote_only_eligible")
+    _strict_fields(identity, "identity", identity_fields)
     consumer_id = _identifier(identity["consumer_id"], "identity.consumer_id")
+    if schema_version >= 3:
+        remote_only_eligible = identity["remote_only_eligible"]
+    else:
+        remote_only_eligible = False
+    if not isinstance(remote_only_eligible, bool):
+        raise ConfigError("identity.remote_only_eligible must be a boolean")
 
     device = _object(document["device"], "device")
     required = {
@@ -467,37 +477,55 @@ def load_consumer(path: str, system: Any) -> ConsumerConfig:
         "providers",
         "swap_priority",
     }
+    optional = {"acknowledgement_policy", "backing_store"}
     if schema_version >= 2:
-        required.add("hot_range")
-    _strict_fields(
-        device, "device", required, {"acknowledgement_policy", "backing_store"}
-    )
+        optional.add("hot_range")
+    _strict_fields(device, "device", required, optional)
     name = validate_device_name(device["name"])
     mode = device["mode"]
-    if mode != "backed":
-        if mode == "remote-only":
-            raise ConfigError(
-                "device.mode remote-only is not available in this milestone"
-            )
-        raise ConfigError("device.mode must be backed")
-    if "backing_store" not in device:
-        raise ConfigError("device.backing_store is required")
-    policy = device.get("acknowledgement_policy", "strict")
-    if policy not in ("strict", "remote-first"):
+    if mode not in ("backed", "remote-only"):
+        raise ConfigError("device.mode must be backed or remote-only")
+    if mode == "remote-only" and schema_version < 3:
+        raise ConfigError("device.mode remote-only requires schema_version 3")
+    if mode == "remote-only" and not remote_only_eligible:
         raise ConfigError(
-            "device.acknowledgement_policy must be strict or remote-first"
+            "Remote-Only Mode requires a Remote-Only-Eligible Host declaration"
         )
 
-    backing_store = _absolute_path(device["backing_store"], "device.backing_store")
-    resolved_backing_store = system.resolve_path(backing_store)
-    if not resolved_backing_store.startswith("/dev/"):
-        raise ConfigError("device.backing_store must resolve below /dev")
-    if (
-        resolved_backing_store.startswith("/dev/infiniswap")
-        or not system.is_block_device(resolved_backing_store)
-        or system.is_loop_device(resolved_backing_store)
-    ):
-        raise ConfigError("device.backing_store must be a non-loop block device")
+    if mode == "backed":
+        if "backing_store" not in device:
+            raise ConfigError("device.backing_store is required")
+        if schema_version >= 2 and "hot_range" not in device:
+            raise ConfigError("device.hot_range is required")
+        policy = device.get("acknowledgement_policy", "strict")
+        if policy not in ("strict", "remote-first"):
+            raise ConfigError(
+                "device.acknowledgement_policy must be strict or remote-first"
+            )
+        backing_store = _absolute_path(
+            device["backing_store"], "device.backing_store"
+        )
+        resolved_backing_store = system.resolve_path(backing_store)
+        if not resolved_backing_store.startswith("/dev/"):
+            raise ConfigError("device.backing_store must resolve below /dev")
+        if (
+            resolved_backing_store.startswith("/dev/infiniswap")
+            or not system.is_block_device(resolved_backing_store)
+            or system.is_loop_device(resolved_backing_store)
+        ):
+            raise ConfigError("device.backing_store must be a non-loop block device")
+    else:
+        forbidden = sorted(
+            field
+            for field in ("acknowledgement_policy", "backing_store", "hot_range")
+            if field in device
+        )
+        if forbidden:
+            raise ConfigError(
+                "Remote-Only Mode does not accept device." + forbidden[0]
+            )
+        policy = "unset"
+        resolved_backing_store = ""
 
     capacity_bytes = _integer(
         device["capacity_bytes"], "device.capacity_bytes", GIB, 128 * GIB
@@ -510,7 +538,7 @@ def load_consumer(path: str, system: Any) -> ConsumerConfig:
         FAILURE_DEADLINE_MIN_MS,
         FAILURE_DEADLINE_MAX_MS,
     )
-    if schema_version >= 2:
+    if mode == "backed" and schema_version >= 2:
         hot_range = _object(device["hot_range"], "device.hot_range")
         _strict_fields(
             hot_range,
@@ -556,13 +584,22 @@ def load_consumer(path: str, system: Any) -> ConsumerConfig:
     if len(selected_value) != 1:
         raise ConfigError("this milestone requires exactly one Provider")
     selected: List[ProviderDirectoryEntry] = []
-    required_capabilities = {
-        "backed",
-        "opportunistic_pool",
-        "provider_failure_deadline",
-        "status",
-        "auth_hmac_sha256",
-    }
+    if mode == "remote-only":
+        required_capabilities = {
+            "remote_only",
+            "committed_pool",
+            "provider_failure_deadline",
+            "status",
+            "auth_hmac_sha256",
+        }
+    else:
+        required_capabilities = {
+            "backed",
+            "opportunistic_pool",
+            "provider_failure_deadline",
+            "status",
+            "auth_hmac_sha256",
+        }
     for provider_name in selected_value:
         if provider_name not in directory:
             raise ConfigError(
@@ -617,6 +654,7 @@ def load_consumer(path: str, system: Any) -> ConsumerConfig:
     return ConsumerConfig(
         path=path,
         consumer_id=consumer_id,
+        remote_only_eligible=remote_only_eligible,
         name=name,
         mode=mode,
         acknowledgement_policy=policy,

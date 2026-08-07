@@ -21,6 +21,7 @@ class SchemaContractTest(unittest.TestCase):
                 snapshot_directory / "status-v1.json",
                 snapshot_directory / "status-v2.json",
                 snapshot_directory / "status-v3.json",
+                snapshot_directory / "status-v4.json",
             )
         )
         for path in paths:
@@ -32,7 +33,9 @@ class SchemaContractTest(unittest.TestCase):
     def test_versioned_examples_and_status_snapshots_match_their_schemas(self):
         pairs = (
             ("consumer-v1.schema.json", "consumer-v1.example.json"),
+            ("consumer-v2.schema.json", "consumer-v2.example.json"),
             ("consumer.schema.json", "consumer.example.json"),
+            ("consumer.schema.json", "consumer-remote-only.example.json"),
             ("provider-v1.schema.json", "provider-v1.example.json"),
             ("provider.schema.json", "provider.example.json"),
             (
@@ -53,7 +56,8 @@ class SchemaContractTest(unittest.TestCase):
         status_contracts = (
             ("status-v1.schema.json", "status-v1.json"),
             ("status-v2.schema.json", "status-v2.json"),
-            ("status.schema.json", "status-v3.json"),
+            ("status-v3.schema.json", "status-v3.json"),
+            ("status.schema.json", "status-v4.json"),
         )
         for schema_name, snapshot_name in status_contracts:
             with self.subTest(schema=schema_name):

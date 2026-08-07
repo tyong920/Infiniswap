@@ -19,7 +19,9 @@
         "opportunistic_pool",
         "provider_failure_deadline",
         "status",
-        "auth_hmac_sha256"
+        "auth_hmac_sha256",
+        "remote_only",
+        "committed_pool"
       ],
       "placement_weight": 100
     }

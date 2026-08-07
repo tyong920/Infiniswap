@@ -1,6 +1,7 @@
 #include "../is_io_policy.h"
 
 #include <stdio.h>
+#include <string.h>
 
 struct observed_actions {
 	unsigned int completions;
@@ -161,9 +162,49 @@ static int test_cancelled_generation_ignores_late_completion(void)
 	return failed;
 }
 
+static int test_remote_only_never_falls_back_or_masks_failure(void)
+{
+	struct observed_actions observed = {0};
+	struct is_io_policy state;
+	int failed = 0;
+
+	is_io_policy_init_remote_only_write(&state, 301);
+	observe_action(&observed,
+		is_io_policy_remote_complete(&state, 301, -1));
+	if (observed.completions != 1 || observed.errors != 1 ||
+	    observed.local_submissions != 0 || observed.local_only != 0 ||
+	    !is_io_policy_releasable(&state)) {
+		fprintf(stderr, "Remote-Only write failure was masked\n");
+		failed = 1;
+	}
+
+	memset(&observed, 0, sizeof(observed));
+	is_io_policy_init_remote_only_read(&state, 302);
+	observe_action(&observed,
+		is_io_policy_cancel_remote(&state, 302, -1));
+	if (observed.completions != 1 || observed.errors != 1 ||
+	    observed.local_submissions != 0 || !state.remote_cancelled ||
+	    !is_io_policy_releasable(&state)) {
+		fprintf(stderr, "Remote-Only read attempted a local fallback\n");
+		failed = 1;
+	}
+
+	memset(&observed, 0, sizeof(observed));
+	is_io_policy_init_remote_only_write(&state, 303);
+	observe_action(&observed,
+		is_io_policy_remote_complete(&state, 303, 0));
+	if (observed.completions != 1 || observed.successes != 1 ||
+	    !is_io_policy_releasable(&state)) {
+		fprintf(stderr, "Remote-Only success did not complete exactly once\n");
+		failed = 1;
+	}
+	return failed;
+}
+
 int main(void)
 {
 	return test_write_outcome_matrix() |
 		test_remote_read_falls_back_once() |
-		test_cancelled_generation_ignores_late_completion();
+		test_cancelled_generation_ignores_late_completion() |
+		test_remote_only_never_falls_back_or_masks_failure();
 }

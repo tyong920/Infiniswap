@@ -46,6 +46,7 @@ struct is_rdma_session;
 enum is_device_mode {
 	IS_DEVICE_MODE_UNSET = 0,
 	IS_DEVICE_MODE_BACKED,
+	IS_DEVICE_MODE_REMOTE_ONLY,
 };
 
 enum is_acknowledgement_policy {
@@ -67,6 +68,7 @@ enum is_connection_state {
 	IS_CONNECTION_CONNECTING,
 	IS_CONNECTION_CONNECTED,
 	IS_CONNECTION_DEGRADED,
+	IS_CONNECTION_REMOTE_LOST,
 };
 
 enum is_backing_state {
@@ -78,6 +80,7 @@ struct is_device {
 	struct config_group group;
 	struct mutex configfs_lock;
 	struct mutex lifecycle_lock;
+	struct mutex remote_state_lock;
 	spinlock_t io_lock;
 	spinlock_t backing_lock;
 	enum is_device_mode mode;
@@ -89,6 +92,7 @@ struct is_device {
 	bool disk_added;
 	bool tag_set_allocated;
 	bool bioset_initialized;
+	bool remote_only_eligible;
 	char name[DISK_NAME_LEN];
 	char backing_path[PATH_MAX];
 	char consumer_id[IS_CONSUMER_ID_SIZE];
@@ -115,7 +119,8 @@ struct is_device {
 	atomic_t inflight;
 	atomic_t connection_state;
 	atomic_t backing_state;
-	atomic_t mapped_hot_ranges;
+	atomic_t remote_lost;
+	atomic_t mapped_remote_chunks;
 	atomic64_t next_io_generation;
 	atomic64_t backing_failures_total;
 	atomic64_t backing_retries_total;
@@ -124,6 +129,7 @@ struct is_device {
 	atomic64_t late_rdma_completions_total;
 	atomic64_t rejected_writes_total;
 	atomic64_t local_only_writes_total;
+	atomic64_t remote_lost_transitions_total;
 	atomic64_t backing_invalid_sectors;
 	unsigned long *backing_invalid_bitmap;
 	wait_queue_head_t drain_wait;
@@ -158,6 +164,8 @@ void is_configfs_unregister(void);
 void is_device_init(struct is_device *device, const char *name);
 const char *is_device_mode_name(struct is_device *device);
 int is_device_set_mode(struct is_device *device, const char *buf, size_t count);
+int is_device_set_remote_only_eligible(struct is_device *device,
+				       const char *buf, size_t count);
 const char *is_device_acknowledgement_policy_name(struct is_device *device);
 int is_device_set_acknowledgement_policy(struct is_device *device,
 					 const char *buf, size_t count);
@@ -191,6 +199,9 @@ int is_device_set_swap_priority(struct is_device *device, const char *buf,
 				size_t count);
 const char *is_device_state_name(struct is_device *device);
 const char *is_device_backing_state_name(struct is_device *device);
+const char *is_device_operational_state_name(struct is_device *device);
+bool is_device_mark_remote_connected(struct is_device *device);
+void is_device_mark_remote_lost_locked(struct is_device *device, int error);
 int is_device_set_backing_store(struct is_device *device, const char *buf,
 				size_t count);
 int is_device_set_capacity(struct is_device *device, const char *buf,

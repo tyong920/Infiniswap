@@ -2,20 +2,13 @@
   "schema_version": 3,
   "identity": {
     "consumer_id": "consumer-a",
-    "remote_only_eligible": false
+    "remote_only_eligible": true
   },
   "device": {
     "name": "infiniswap0",
-    "mode": "backed",
-    "acknowledgement_policy": "strict",
-    "backing_store": "/dev/disk/by-id/infiniswap-backing",
+    "mode": "remote-only",
     "capacity_bytes": 68719476736,
     "provider_failure_deadline_ms": 2000,
-    "hot_range": {
-      "mapping_threshold": 8,
-      "read_weight": 1,
-      "write_weight": 4
-    },
     "provider_directory": "/etc/infiniswap/provider-directory.json",
     "providers": [
       "provider-a"

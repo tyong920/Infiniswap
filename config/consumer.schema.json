@@ -1,14 +1,24 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/tyong920/Infiniswap/config/consumer.schema.json",
-  "title": "Infiniswap Memory Consumer Configuration",
+  "title": "Infiniswap Memory Consumer Configuration v3",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "identity", "device"],
+  "required": [
+    "schema_version",
+    "identity",
+    "device"
+  ],
   "properties": {
-    "schema_version": {"const": 2},
-    "identity": {"$ref": "#/definitions/consumer_identity"},
-    "device": {"$ref": "#/definitions/device"}
+    "schema_version": {
+      "const": 3
+    },
+    "identity": {
+      "$ref": "#/definitions/consumer_identity"
+    },
+    "device": {
+      "$ref": "#/definitions/device"
+    }
   },
   "definitions": {
     "identifier": {
@@ -32,15 +42,27 @@
     "consumer_identity": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["consumer_id"],
+      "required": [
+        "consumer_id",
+        "remote_only_eligible"
+      ],
       "properties": {
-        "consumer_id": {"$ref": "#/definitions/identifier"}
+        "consumer_id": {
+          "$ref": "#/definitions/identifier"
+        },
+        "remote_only_eligible": {
+          "type": "boolean"
+        }
       }
     },
     "hot_range": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["mapping_threshold", "read_weight", "write_weight"],
+      "required": [
+        "mapping_threshold",
+        "read_weight",
+        "write_weight"
+      ],
       "properties": {
         "mapping_threshold": {
           "type": "integer",
@@ -67,19 +89,30 @@
         "mode",
         "capacity_bytes",
         "provider_failure_deadline_ms",
-        "hot_range",
         "provider_directory",
         "providers",
         "swap_priority"
       ],
       "properties": {
-        "name": {"$ref": "#/definitions/device_name"},
-        "mode": {"enum": ["backed", "remote-only"]},
+        "name": {
+          "$ref": "#/definitions/device_name"
+        },
+        "mode": {
+          "enum": [
+            "backed",
+            "remote-only"
+          ]
+        },
         "acknowledgement_policy": {
-          "enum": ["strict", "remote-first"],
+          "enum": [
+            "strict",
+            "remote-first"
+          ],
           "default": "strict"
         },
-        "backing_store": {"$ref": "#/definitions/absolute_path"},
+        "backing_store": {
+          "$ref": "#/definitions/absolute_path"
+        },
         "capacity_bytes": {
           "type": "integer",
           "minimum": 1073741824,
@@ -91,14 +124,20 @@
           "minimum": 500,
           "maximum": 30000
         },
-        "hot_range": {"$ref": "#/definitions/hot_range"},
-        "provider_directory": {"$ref": "#/definitions/absolute_path"},
+        "hot_range": {
+          "$ref": "#/definitions/hot_range"
+        },
+        "provider_directory": {
+          "$ref": "#/definitions/absolute_path"
+        },
         "providers": {
           "type": "array",
           "minItems": 1,
-          "maxItems": 64,
+          "maxItems": 1,
           "uniqueItems": true,
-          "items": {"$ref": "#/definitions/identifier"}
+          "items": {
+            "$ref": "#/definitions/identifier"
+          }
         },
         "swap_priority": {
           "type": "integer",
@@ -108,21 +147,83 @@
       },
       "allOf": [
         {
-          "if": {"properties": {"mode": {"const": "backed"}}},
-          "then": {"required": ["backing_store"]}
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "backed"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "backing_store",
+              "hot_range"
+            ]
+          }
         },
         {
-          "if": {"properties": {"mode": {"const": "remote-only"}}},
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "remote-only"
+              }
+            }
+          },
           "then": {
             "not": {
               "anyOf": [
-                {"required": ["acknowledgement_policy"]},
-                {"required": ["backing_store"]}
+                {
+                  "required": [
+                    "acknowledgement_policy"
+                  ]
+                },
+                {
+                  "required": [
+                    "backing_store"
+                  ]
+                },
+                {
+                  "required": [
+                    "hot_range"
+                  ]
+                }
               ]
             }
           }
         }
       ]
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "device": {
+            "properties": {
+              "mode": {
+                "const": "remote-only"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "identity": {
+            "properties": {
+              "remote_only_eligible": {
+                "const": true
+              }
+            },
+            "required": [
+              "remote_only_eligible"
+            ]
+          }
+        }
+      }
+    }
+  ]
 }

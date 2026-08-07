@@ -46,6 +46,11 @@ _Static_assert((int)IS_MEMORY_POOL_OPPORTUNISTIC ==
                (int)IS_MEMORY_POOL_COMMITTED ==
                    (int)IS_PROTOCOL_POOL_COMMITTED,
                "memory-manager pools must match the control protocol");
+#define IS_PROVIDER_CAPABILITIES                                           \
+  (IS_PROTOCOL_CAP_BACKED | IS_PROTOCOL_CAP_REMOTE_ONLY |                 \
+   IS_PROTOCOL_CAP_OPPORTUNISTIC_POOL | IS_PROTOCOL_CAP_COMMITTED_POOL |  \
+   IS_PROTOCOL_CAP_FAILURE_DEADLINE | IS_PROTOCOL_CAP_STATUS |            \
+   IS_PROTOCOL_CAP_AUTH_HMAC_SHA256)
 #define PROVIDER_HANDSHAKE_TIMEOUT_MS 5000U
 
 enum mode {

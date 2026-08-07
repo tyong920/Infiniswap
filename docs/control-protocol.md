@@ -94,3 +94,13 @@ replayed, unauthenticated, revoked, unsupported, and out-of-order messages
 receive a structured `ERROR`, after which the Provider closes the connection.
 Connection teardown deregisters every Remote Memory region owned by that
 session, so a protocol failure cannot leave a grant active.
+
+Backed Mode selects the Opportunistic Pool and requests individual Hot Ranges.
+Remote-Only Mode selects the Committed Pool and sends one full-capacity
+`CHUNK_REQUEST` before exposing its block device. The Provider admits that
+request transactionally; a short grant is invalid. Committed grants are never
+included in `EVICT` or Provider-originated `RELEASE` requests. After a completed
+Remote-Only reservation, an authenticated status heartbeat runs often enough
+to detect silent loss within the Provider Failure Deadline. Any connection,
+heartbeat, or operation failure makes the Consumer enter terminal Remote-Lost
+and reject subsequent I/O.

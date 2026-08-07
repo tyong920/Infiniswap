@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/tyong920/Infiniswap/config/status.schema.json",
-  "title": "Infiniswap Device Status v3",
+  "title": "Infiniswap Device Status v4",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -15,8 +15,12 @@
     "last_error"
   ],
   "properties": {
-    "schema_version": {"const": 3},
-    "kind": {"const": "infiniswap.device-status"},
+    "schema_version": {
+      "const": 4
+    },
+    "kind": {
+      "const": "infiniswap.device-status"
+    },
     "device": {
       "type": "object",
       "additionalProperties": false,
@@ -37,16 +41,39 @@
           "maxLength": 31,
           "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"
         },
-        "path": {"type": "string", "pattern": "^/dev/"},
-        "lifecycle": {
-          "enum": ["created", "active", "draining", "drained", "stopped"]
+        "path": {
+          "type": "string",
+          "pattern": "^/dev/"
         },
-        "mode": {"enum": ["backed", "remote-only", "unset"]},
+        "lifecycle": {
+          "enum": [
+            "created",
+            "active",
+            "draining",
+            "drained",
+            "stopped"
+          ]
+        },
+        "mode": {
+          "enum": [
+            "backed",
+            "remote-only",
+            "unset"
+          ]
+        },
         "acknowledgement_policy": {
-          "enum": ["strict", "remote-first", "unset"]
+          "enum": [
+            "strict",
+            "remote-first",
+            "unset"
+          ]
         },
         "operational_state": {
-          "enum": ["healthy", "backing-degraded"]
+          "enum": [
+            "healthy",
+            "backing-degraded",
+            "remote-lost"
+          ]
         },
         "provider_failure_deadline_ms": {
           "type": "integer",
@@ -56,16 +83,25 @@
         "swap": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["configured_priority", "enabled", "priority"],
+          "required": [
+            "configured_priority",
+            "enabled",
+            "priority"
+          ],
           "properties": {
             "configured_priority": {
               "type": "integer",
               "minimum": 0,
               "maximum": 32767
             },
-            "enabled": {"type": "boolean"},
+            "enabled": {
+              "type": "boolean"
+            },
             "priority": {
-              "type": ["integer", "null"],
+              "type": [
+                "integer",
+                "null"
+              ],
               "minimum": -1,
               "maximum": 32767
             }
@@ -76,24 +112,56 @@
     "connection": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["state", "total_providers", "healthy_providers", "providers"],
+      "required": [
+        "state",
+        "total_providers",
+        "healthy_providers",
+        "providers"
+      ],
       "properties": {
         "state": {
-          "enum": ["not-connected", "connecting", "connected", "degraded", "remote-lost"]
+          "enum": [
+            "not-connected",
+            "connecting",
+            "connected",
+            "degraded",
+            "remote-lost"
+          ]
         },
-        "total_providers": {"type": "integer", "minimum": 0, "maximum": 64},
-        "healthy_providers": {"type": "integer", "minimum": 0, "maximum": 64},
+        "total_providers": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 64
+        },
+        "healthy_providers": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 64
+        },
         "providers": {
           "type": "array",
           "maxItems": 64,
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["provider_id", "state"],
+            "required": [
+              "provider_id",
+              "state"
+            ],
             "properties": {
-              "provider_id": {"type": "string", "minLength": 1, "maxLength": 63},
+              "provider_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 63
+              },
               "state": {
-                "enum": ["not-connected", "connecting", "connected", "degraded", "remote-lost"]
+                "enum": [
+                  "not-connected",
+                  "connecting",
+                  "connected",
+                  "degraded",
+                  "remote-lost"
+                ]
               }
             }
           }
@@ -103,11 +171,24 @@
     "capacity": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["advertised_bytes", "backing_bytes", "remote_bytes"],
+      "required": [
+        "advertised_bytes",
+        "backing_bytes",
+        "remote_bytes"
+      ],
       "properties": {
-        "advertised_bytes": {"type": "integer", "minimum": 0},
-        "backing_bytes": {"type": "integer", "minimum": 0},
-        "remote_bytes": {"type": "integer", "minimum": 0}
+        "advertised_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "backing_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "remote_bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "mapping": {
@@ -115,17 +196,38 @@
       "additionalProperties": false,
       "required": [
         "chunk_size_bytes",
-        "threshold",
+        "mapped_hot_ranges",
+        "mapped_remote_chunks",
         "read_weight",
-        "write_weight",
-        "mapped_hot_ranges"
+        "threshold",
+        "write_weight"
       ],
       "properties": {
-        "chunk_size_bytes": {"const": 1073741824},
-        "threshold": {"type": "integer", "minimum": 1},
-        "read_weight": {"type": "integer", "minimum": 1},
-        "write_weight": {"type": "integer", "minimum": 1},
-        "mapped_hot_ranges": {"type": "integer", "minimum": 0, "maximum": 128}
+        "chunk_size_bytes": {
+          "const": 1073741824
+        },
+        "threshold": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "read_weight": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "write_weight": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "mapped_hot_ranges": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 128
+        },
+        "mapped_remote_chunks": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 128
+        }
       }
     },
     "metrics": {
@@ -139,29 +241,69 @@
         "late_rdma_completions_total",
         "local_only_writes_total",
         "provider_timeouts_total",
-        "rejected_writes_total"
+        "rejected_writes_total",
+        "remote_lost_transitions_total"
       ],
       "properties": {
-        "backing_degraded_transitions_total": {"type": "integer", "minimum": 0},
-        "backing_failures_total": {"type": "integer", "minimum": 0},
-        "backing_invalid_sectors": {"type": "integer", "minimum": 0},
-        "backing_retries_total": {"type": "integer", "minimum": 0},
-        "late_rdma_completions_total": {"type": "integer", "minimum": 0},
-        "local_only_writes_total": {"type": "integer", "minimum": 0},
-        "provider_timeouts_total": {"type": "integer", "minimum": 0},
-        "rejected_writes_total": {"type": "integer", "minimum": 0}
+        "backing_degraded_transitions_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "backing_failures_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "backing_invalid_sectors": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "backing_retries_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "late_rdma_completions_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "local_only_writes_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "provider_timeouts_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "rejected_writes_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "remote_lost_transitions_total": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "last_error": {
       "oneOf": [
-        {"type": "null"},
+        {
+          "type": "null"
+        },
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["code", "errno"],
+          "required": [
+            "code",
+            "errno"
+          ],
           "properties": {
-            "code": {"type": "string", "pattern": "^E[A-Z0-9_]+$"},
-            "errno": {"type": "integer", "minimum": 1}
+            "code": {
+              "type": "string",
+              "pattern": "^E[A-Z0-9_]+$"
+            },
+            "errno": {
+              "type": "integer",
+              "minimum": 1
+            }
           }
         }
       ]

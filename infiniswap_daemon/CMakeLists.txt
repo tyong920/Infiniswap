@@ -73,6 +73,9 @@ install(
     ${CMAKE_CURRENT_SOURCE_DIR}/../config/consumer.example.json
     ${CMAKE_CURRENT_SOURCE_DIR}/../config/consumer-v1.schema.json
     ${CMAKE_CURRENT_SOURCE_DIR}/../config/consumer-v1.example.json
+    ${CMAKE_CURRENT_SOURCE_DIR}/../config/consumer-v2.schema.json
+    ${CMAKE_CURRENT_SOURCE_DIR}/../config/consumer-v2.example.json
+    ${CMAKE_CURRENT_SOURCE_DIR}/../config/consumer-remote-only.example.json
     ${CMAKE_CURRENT_SOURCE_DIR}/../config/provider.schema.json
     ${CMAKE_CURRENT_SOURCE_DIR}/../config/provider.example.json
     ${CMAKE_CURRENT_SOURCE_DIR}/../config/provider-v1.schema.json
@@ -83,6 +86,8 @@ install(
     ${CMAKE_CURRENT_SOURCE_DIR}/../config/provider-directory-v1.example.json
     ${CMAKE_CURRENT_SOURCE_DIR}/../config/status.schema.json
     ${CMAKE_CURRENT_SOURCE_DIR}/../config/status-v1.schema.json
+    ${CMAKE_CURRENT_SOURCE_DIR}/../config/status-v2.schema.json
+    ${CMAKE_CURRENT_SOURCE_DIR}/../config/status-v3.schema.json
     ${CMAKE_CURRENT_SOURCE_DIR}/../config/provider-memory.example.conf
   DESTINATION share/infiniswap)
 

@@ -95,6 +95,11 @@ static int hello_capabilities_valid(const struct is_protocol_message *hello,
   uint64_t mode_capability;
   uint64_t pool_capability;
 
+  if ((hello->payload.hello.mode == IS_PROTOCOL_MODE_BACKED &&
+       hello->payload.hello.pool != IS_PROTOCOL_POOL_OPPORTUNISTIC) ||
+      (hello->payload.hello.mode == IS_PROTOCOL_MODE_REMOTE_ONLY &&
+       hello->payload.hello.pool != IS_PROTOCOL_POOL_COMMITTED))
+    return 0;
   mode_capability = hello->payload.hello.mode == IS_PROTOCOL_MODE_BACKED
                         ? IS_PROTOCOL_CAP_BACKED
                         : IS_PROTOCOL_CAP_REMOTE_ONLY;

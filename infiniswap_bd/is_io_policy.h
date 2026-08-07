@@ -19,6 +19,8 @@ enum is_io_policy_kind {
 	IS_IO_POLICY_STRICT_WRITE = 1,
 	IS_IO_POLICY_REMOTE_FIRST_WRITE,
 	IS_IO_POLICY_REMOTE_READ,
+	IS_IO_POLICY_REMOTE_ONLY_WRITE,
+	IS_IO_POLICY_REMOTE_ONLY_READ,
 };
 
 struct is_io_policy {
@@ -52,10 +54,11 @@ static inline void is_io_policy_init_write(struct is_io_policy *state,
 	state->remote_status = 0;
 }
 
-static inline void is_io_policy_init_remote_read(struct is_io_policy *state,
-						 unsigned long long generation)
+static inline void is_io_policy_init_remote(
+	struct is_io_policy *state, enum is_io_policy_kind kind,
+	unsigned long long generation)
 {
-	state->kind = IS_IO_POLICY_REMOTE_READ;
+	state->kind = kind;
 	state->generation = generation;
 	state->local_pending = 0;
 	state->remote_pending = 1;
@@ -66,6 +69,26 @@ static inline void is_io_policy_init_remote_read(struct is_io_policy *state,
 	state->backing_degraded = 0;
 	state->local_status = 0;
 	state->remote_status = 0;
+}
+
+static inline void is_io_policy_init_remote_read(struct is_io_policy *state,
+						 unsigned long long generation)
+{
+	is_io_policy_init_remote(state, IS_IO_POLICY_REMOTE_READ, generation);
+}
+
+static inline void is_io_policy_init_remote_only_write(
+	struct is_io_policy *state, unsigned long long generation)
+{
+	is_io_policy_init_remote(state, IS_IO_POLICY_REMOTE_ONLY_WRITE,
+		generation);
+}
+
+static inline void is_io_policy_init_remote_only_read(
+	struct is_io_policy *state, unsigned long long generation)
+{
+	is_io_policy_init_remote(state, IS_IO_POLICY_REMOTE_ONLY_READ,
+		generation);
 }
 
 static inline enum is_io_action is_io_policy_complete_request(
@@ -127,6 +150,9 @@ static inline enum is_io_action is_io_policy_remote_terminal(
 	state->remote_done = 1;
 	state->remote_status = status;
 
+	if (state->kind == IS_IO_POLICY_REMOTE_ONLY_WRITE ||
+	    state->kind == IS_IO_POLICY_REMOTE_ONLY_READ)
+		return is_io_policy_complete_request(state, status);
 	if (state->kind == IS_IO_POLICY_REMOTE_READ) {
 		if (status == 0)
 			return is_io_policy_complete_request(state, 0);

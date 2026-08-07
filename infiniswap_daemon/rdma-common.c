@@ -228,10 +228,7 @@ int build_connection(struct rdma_cm_id *id)
   conn->next_provider_request_id = 1;
   is_provider_session_init(
       &conn->protocol_session, provider_auth_registry,
-      IS_PROTOCOL_MINOR_CURRENT,
-      IS_PROTOCOL_CAP_BACKED | IS_PROTOCOL_CAP_OPPORTUNISTIC_POOL |
-          IS_PROTOCOL_CAP_FAILURE_DEADLINE | IS_PROTOCOL_CAP_STATUS |
-          IS_PROTOCOL_CAP_AUTH_HMAC_SHA256,
+      IS_PROTOCOL_MINOR_CURRENT, IS_PROVIDER_CAPABILITIES,
       IS_PROTOCOL_CAP_AUTH_HMAC_SHA256, provider_nonce, session_id);
   //add to session
   pthread_mutex_lock(&session_lock);

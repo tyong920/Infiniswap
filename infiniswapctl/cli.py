@@ -58,9 +58,17 @@ def _print_create_preflight(config: ConsumerConfig, stdout: IO[str]) -> None:
     providers = ", ".join(entry.name for entry in config.providers)
     print("Preflight create " + config.name, file=stdout)
     print("  mode: " + config.mode, file=stdout)
-    print("  acknowledgement policy: " + config.acknowledgement_policy, file=stdout)
+    if config.mode == "remote-only":
+        print("  acknowledgement policy: not applicable", file=stdout)
+        print("  Backing Store: none", file=stdout)
+        print("  Remote-Only-Eligible Host: declared", file=stdout)
+    else:
+        print(
+            "  acknowledgement policy: " + config.acknowledgement_policy,
+            file=stdout,
+        )
+        print("  Backing Store: " + config.backing_store, file=stdout)
     print("  capacity bytes: " + str(config.capacity_bytes), file=stdout)
-    print("  Backing Store: " + config.backing_store, file=stdout)
     print("  Providers: " + providers, file=stdout)
     print("  Provider endpoint: %s:%d" % (provider.address, provider.port), file=stdout)
     print(
@@ -93,26 +101,47 @@ def _create(config: ConsumerConfig, system: Any, stdout: IO[str]) -> None:
     system.create_group(config.name)
     try:
         provider = config.providers[0]
-        attributes = (
-            ("mode", config.mode),
-            ("acknowledgement_policy", config.acknowledgement_policy),
-            ("backing_store", config.backing_store),
-            ("capacity_bytes", str(config.capacity_bytes)),
-            ("provider_failure_deadline_ms", str(config.provider_failure_deadline_ms)),
-            ("hot_range_threshold", str(config.hot_range_threshold)),
-            ("hot_range_read_weight", str(config.hot_range_read_weight)),
-            ("hot_range_write_weight", str(config.hot_range_write_weight)),
-            ("consumer_id", config.consumer_id),
-            ("providers", provider.name),
-            ("provider_address", provider.address),
-            ("provider_port", str(provider.port)),
-            ("rdma_device", provider.rail_device),
-            ("rdma_port", str(provider.rail_port)),
-            ("rdma_numa_node", str(provider.numa_node)),
-            ("provider_key_id", provider.key_id),
-            ("provider_psk", provider.psk.hex()),
-            ("swap_priority", str(config.swap_priority)),
-            ("state", "activate"),
+        attributes = [("mode", config.mode)]
+        if config.mode == "remote-only":
+            attributes.append(("remote_only_eligible", "1"))
+        else:
+            attributes.extend(
+                (
+                    ("acknowledgement_policy", config.acknowledgement_policy),
+                    ("backing_store", config.backing_store),
+                )
+            )
+        attributes.extend(
+            (
+                ("capacity_bytes", str(config.capacity_bytes)),
+                (
+                    "provider_failure_deadline_ms",
+                    str(config.provider_failure_deadline_ms),
+                ),
+            )
+        )
+        if config.mode == "backed":
+            attributes.extend(
+                (
+                    ("hot_range_threshold", str(config.hot_range_threshold)),
+                    ("hot_range_read_weight", str(config.hot_range_read_weight)),
+                    ("hot_range_write_weight", str(config.hot_range_write_weight)),
+                )
+            )
+        attributes.extend(
+            (
+                ("consumer_id", config.consumer_id),
+                ("providers", provider.name),
+                ("provider_address", provider.address),
+                ("provider_port", str(provider.port)),
+                ("rdma_device", provider.rail_device),
+                ("rdma_port", str(provider.rail_port)),
+                ("rdma_numa_node", str(provider.numa_node)),
+                ("provider_key_id", provider.key_id),
+                ("provider_psk", provider.psk.hex()),
+                ("swap_priority", str(config.swap_priority)),
+                ("state", "activate"),
+            )
         )
         for attribute, value in attributes:
             system.write_attribute(config.name, attribute, value)
@@ -219,9 +248,10 @@ def _device_status(name: str, system: Any) -> Dict[str, Any]:
     mapping_threshold = int(system.read_attribute(name, "hot_range_threshold"))
     read_weight = int(system.read_attribute(name, "hot_range_read_weight"))
     write_weight = int(system.read_attribute(name, "hot_range_write_weight"))
+    mapped_remote_chunks = int(system.read_attribute(name, "mapped_remote_chunks"))
     mapped_hot_ranges = int(system.read_attribute(name, "mapped_hot_ranges"))
     connection_state = system.read_attribute(name, "connection_state")
-    backing_state = system.read_attribute(name, "backing_state")
+    operational_state = system.read_attribute(name, "operational_state")
     remote_capacity_bytes = int(system.read_attribute(name, "remote_capacity_bytes"))
     provider_names = sorted(
         filter(None, system.read_attribute(name, "providers").split(","))
@@ -249,12 +279,13 @@ def _device_status(name: str, system: Any) -> Dict[str, Any]:
             "late_rdma_completions_total",
             "local_only_writes_total",
             "provider_timeouts_total",
+            "remote_lost_transitions_total",
             "rejected_writes_total",
         )
     }
 
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "kind": "infiniswap.device-status",
         "device": {
             "name": name,
@@ -262,7 +293,7 @@ def _device_status(name: str, system: Any) -> Dict[str, Any]:
             "lifecycle": lifecycle,
             "mode": mode,
             "acknowledgement_policy": policy,
-            "operational_state": backing_state,
+            "operational_state": operational_state,
             "provider_failure_deadline_ms": deadline_ms,
             "swap": {
                 "configured_priority": configured_priority,
@@ -289,6 +320,7 @@ def _device_status(name: str, system: Any) -> Dict[str, Any]:
             "threshold": mapping_threshold,
             "read_weight": read_weight,
             "write_weight": write_weight,
+            "mapped_remote_chunks": mapped_remote_chunks,
             "mapped_hot_ranges": mapped_hot_ranges,
         },
         "metrics": metrics,
@@ -319,31 +351,48 @@ def _print_status(status: Dict[str, Any], json_output: bool, stdout: IO[str]) ->
         % (capacity["advertised_bytes"], capacity["remote_bytes"]),
         file=stdout,
     )
-    print(
-        "  Hot Ranges: %d mapped (threshold %d, read/write weights %d/%d)"
-        % (
-            status["mapping"]["mapped_hot_ranges"],
-            status["mapping"]["threshold"],
-            status["mapping"]["read_weight"],
-            status["mapping"]["write_weight"],
-        ),
-        file=stdout,
-    )
+    if device["mode"] == "remote-only":
+        print(
+            "  Remote Chunks: %d mapped" % status["mapping"]["mapped_remote_chunks"],
+            file=stdout,
+        )
+    else:
+        print(
+            "  Hot Ranges: %d mapped (threshold %d, read/write weights %d/%d)"
+            % (
+                status["mapping"]["mapped_hot_ranges"],
+                status["mapping"]["threshold"],
+                status["mapping"]["read_weight"],
+                status["mapping"]["write_weight"],
+            ),
+            file=stdout,
+        )
     if device["swap"]["enabled"]:
         print(
             "  swap: enabled at priority %d" % device["swap"]["priority"], file=stdout
         )
     else:
         print("  swap: disabled", file=stdout)
-    backing_suffix = (
-        " (new writes rejected)"
-        if device["operational_state"] == "backing-degraded"
-        else ""
-    )
-    print(
-        "  backing: %s%s" % (device["operational_state"], backing_suffix),
-        file=stdout,
-    )
+    if device["mode"] == "remote-only":
+        remote_suffix = (
+            " (all I/O rejected)"
+            if device["operational_state"] == "remote-lost"
+            else ""
+        )
+        print(
+            "  remote: %s%s" % (device["operational_state"], remote_suffix),
+            file=stdout,
+        )
+    else:
+        backing_suffix = (
+            " (new writes rejected)"
+            if device["operational_state"] == "backing-degraded"
+            else ""
+        )
+        print(
+            "  backing: %s%s" % (device["operational_state"], backing_suffix),
+            file=stdout,
+        )
     print(
         "  backing failures/retries: %d/%d"
         % (

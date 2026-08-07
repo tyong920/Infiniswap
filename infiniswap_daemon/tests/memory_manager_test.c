@@ -386,6 +386,54 @@ static int test_committed_assignments_survive_pressure(void)
   return 0;
 }
 
+static int test_repeated_committed_reservations_are_atomic(void)
+{
+  struct fake_environment environment = {
+    .available_bytes = UINT64_C(9) * IS_MEMORY_CHUNK_BYTES,
+  };
+  struct is_memory_manager *manager = create_manager(&environment, 8, 0, 2);
+  struct is_memory_registration_adapter registration =
+      registration_adapter(&environment);
+  struct is_memory_grant grants[2];
+  enum is_memory_rejection_reason rejection = IS_MEMORY_REJECTION_NONE;
+  int owner;
+  int iteration;
+
+  if (!manager ||
+      is_memory_manager_connect(manager, "consumer-a", &owner, 1, 0, 2,
+                                NULL) != IS_MEMORY_OK ||
+      is_memory_manager_acquire(manager, &owner, IS_MEMORY_POOL_COMMITTED, 2,
+                                &rejection, &registration, grants, 2) !=
+          IS_MEMORY_HOST_RESERVE ||
+      rejection != IS_MEMORY_REJECTION_HOST_RESERVE ||
+      expect_status(manager, &owner, 0, 0, 0, 0) ||
+      environment.live_allocations != 0 ||
+      environment.live_registrations != 0 ||
+      is_memory_manager_disconnect(manager, &owner) != IS_MEMORY_OK) {
+    fprintf(stderr, "partial committed capacity escaped failed admission\n");
+    return 1;
+  }
+
+  environment.available_bytes = UINT64_C(10) * IS_MEMORY_CHUNK_BYTES;
+  for (iteration = 0; iteration < 3; iteration++) {
+    if (is_memory_manager_connect(manager, "consumer-a", &owner, 1, 0, 2,
+                                  NULL) != IS_MEMORY_OK ||
+        is_memory_manager_acquire(manager, &owner, IS_MEMORY_POOL_COMMITTED, 2,
+                                  NULL, &registration, grants, 2) !=
+            IS_MEMORY_OK ||
+        expect_status(manager, &owner, 0, 0, 2, 2) ||
+        is_memory_manager_disconnect(manager, &owner) != IS_MEMORY_OK ||
+        expect_status(manager, NULL, 0, 0, 0, 0) ||
+        environment.live_allocations != 0 ||
+        environment.live_registrations != 0) {
+      fprintf(stderr, "committed reserve/release cycle did not reconcile\n");
+      return 1;
+    }
+  }
+
+  return is_memory_manager_destroy(manager) == IS_MEMORY_OK ? 0 : 1;
+}
+
 static int test_connection_quota_eviction_disconnect_and_shutdown(void)
 {
   struct fake_environment environment = {
@@ -506,6 +554,7 @@ int main(void)
   failures += test_partial_failures_are_transactional();
   failures += test_failed_cleanup_is_quarantined();
   failures += test_committed_assignments_survive_pressure();
+  failures += test_repeated_committed_reservations_are_atomic();
   failures += test_connection_quota_eviction_disconnect_and_shutdown();
   failures += test_runtime_config_loader();
   return failures == 0 ? 0 : 1;

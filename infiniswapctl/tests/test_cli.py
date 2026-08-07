@@ -185,6 +185,29 @@ class CliValidationTest(unittest.TestCase):
         path.write_text(json.dumps(config), encoding="utf-8")
         return path
 
+    def write_remote_only_consumer(self, eligible=True):
+        path = self.write_consumer()
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["schema_version"] = 3
+        document["identity"]["remote_only_eligible"] = eligible
+        device = document["device"]
+        device["mode"] = "remote-only"
+        del device["acknowledgement_policy"]
+        del device["backing_store"]
+        del device["hot_range"]
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+        directory = json.loads(
+            self.provider_directory_path.read_text(encoding="utf-8")
+        )
+        directory["providers"]["provider-a"]["expected_capabilities"].extend(
+            ["remote_only", "committed_pool"]
+        )
+        self.provider_directory_path.write_text(
+            json.dumps(directory), encoding="utf-8"
+        )
+        return path
+
     def invoke_create(self, path, system=None):
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -247,9 +270,59 @@ class CliValidationTest(unittest.TestCase):
         self.assertEqual(system.mutations, [])
         self.assertEqual(stdout, "")
 
+    def test_remote_only_requires_current_schema_and_host_eligibility(self):
+        path = self.write_consumer(mode="remote-only")
+        result, stdout, stderr, system = self.invoke_create(path)
+        self.assertEqual(result, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("requires schema_version 3", stderr)
+        self.assertEqual(system.mutations, [])
+
+        path = self.write_remote_only_consumer(eligible=False)
+        result, stdout, stderr, system = self.invoke_create(path)
+        self.assertEqual(result, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("Remote-Only-Eligible Host declaration", stderr)
+        self.assertEqual(system.mutations, [])
+
+    def test_remote_only_create_declares_eligibility_and_omits_backing(self):
+        path = self.write_remote_only_consumer()
+
+        result, stdout, stderr, system = self.invoke_create(path)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("mode: remote-only", stdout)
+        self.assertIn("Remote-Only-Eligible Host: declared", stdout)
+        self.assertIn("Backing Store: none", stdout)
+        self.assertIn("acknowledgement policy: not applicable", stdout)
+        self.assertEqual(system.mutations, [])
+
+        result, stdout, stderr, system = self.invoke_create_without_dry_run(
+            path, FakeSystem()
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+        writes = [
+            mutation
+            for mutation in system.mutations
+            if mutation[0] == "write_attribute"
+        ]
+        self.assertIn(
+            ("write_attribute", "infiniswap0", "remote_only_eligible", "1"),
+            writes,
+        )
+        written_attributes = {mutation[2] for mutation in writes}
+        self.assertNotIn("backing_store", written_attributes)
+        self.assertNotIn("acknowledgement_policy", written_attributes)
+        self.assertNotIn("hot_range_threshold", written_attributes)
+        self.assertEqual(
+            writes[-1],
+            ("write_attribute", "infiniswap0", "state", "activate"),
+        )
+
     def test_create_rejects_unsafe_mode_path_capacity_and_deadline(self):
         cases = (
-            ({"mode": "remote-only"}, "remote-only is not available"),
             ({"backing_store": "relative-device"}, "must be an absolute path"),
             ({"capacity_bytes": GIB + 512}, "must be aligned to 1 GiB"),
             ({"provider_failure_deadline_ms": 499}, "must be between 500 and 30000"),
@@ -577,12 +650,14 @@ class LifecycleCommandTest(unittest.TestCase):
             "hot_range_threshold": "8",
             "hot_range_read_weight": "1",
             "hot_range_write_weight": "4",
+            "mapped_remote_chunks": "1",
             "mapped_hot_ranges": "1",
             "consumer_id": "consumer-a",
             "providers": "provider-a",
             "swap_priority": "100",
             "connection_state": "not-connected",
             "backing_state": "healthy",
+            "operational_state": "healthy",
             "remote_capacity_bytes": "0",
             "last_error": "0",
             "backing_failures_total": "0",
@@ -592,6 +667,7 @@ class LifecycleCommandTest(unittest.TestCase):
             "late_rdma_completions_total": "0",
             "rejected_writes_total": "0",
             "local_only_writes_total": "0",
+            "remote_lost_transitions_total": "0",
             "backing_invalid_sectors": "0",
         }
 
@@ -681,7 +757,7 @@ class LifecycleCommandTest(unittest.TestCase):
             stderr=stderr,
         )
 
-        snapshot = (Path(__file__).parent / "snapshots" / "status-v3.json").read_text(
+        snapshot = (Path(__file__).parent / "snapshots" / "status-v4.json").read_text(
             encoding="utf-8"
         )
         self.assertEqual((result, stderr.getvalue()), (0, ""))
@@ -693,6 +769,7 @@ class LifecycleCommandTest(unittest.TestCase):
             status["mapping"],
             {
                 "chunk_size_bytes": GIB,
+                "mapped_remote_chunks": 1,
                 "mapped_hot_ranges": 1,
                 "read_weight": 1,
                 "threshold": 8,
@@ -712,6 +789,7 @@ class LifecycleCommandTest(unittest.TestCase):
         self.system.attributes["infiniswap0"].update(
             {
                 "backing_state": "backing-degraded",
+                "operational_state": "backing-degraded",
                 "backing_failures_total": "2",
                 "backing_retries_total": "1",
                 "backing_degraded_transitions_total": "1",
@@ -738,6 +816,7 @@ class LifecycleCommandTest(unittest.TestCase):
                 "late_rdma_completions_total": 2,
                 "local_only_writes_total": 5,
                 "provider_timeouts_total": 3,
+                "remote_lost_transitions_total": 0,
                 "rejected_writes_total": 4,
             },
         )
@@ -746,6 +825,35 @@ class LifecycleCommandTest(unittest.TestCase):
         self.assertEqual((result, error), (0, ""))
         self.assertIn("backing: backing-degraded (new writes rejected)", human)
         self.assertIn("backing failures/retries: 2/1", human)
+
+    def test_remote_lost_is_terminal_and_visible(self):
+        self.system.attributes["infiniswap0"].update(
+            {
+                "mode": "remote-only",
+                "acknowledgement_policy": "unset",
+                "connection_state": "remote-lost",
+                "operational_state": "remote-lost",
+                "remote_capacity_bytes": "0",
+                "mapped_remote_chunks": "0",
+                "mapped_hot_ranges": "0",
+                "remote_lost_transitions_total": "1",
+                "last_error": "110",
+            }
+        )
+
+        result, output, error = self.invoke("status", "infiniswap0", "--json")
+
+        self.assertEqual((result, error), (0, ""))
+        status = json.loads(output)
+        self.assertEqual(status["schema_version"], 4)
+        self.assertEqual(status["device"]["operational_state"], "remote-lost")
+        self.assertEqual(status["connection"]["state"], "remote-lost")
+        self.assertEqual(status["capacity"]["backing_bytes"], 0)
+        self.assertEqual(status["metrics"]["remote_lost_transitions_total"], 1)
+
+        result, human, error = self.invoke("status", "infiniswap0")
+        self.assertEqual((result, error), (0, ""))
+        self.assertIn("remote: remote-lost (all I/O rejected)", human)
 
     def test_every_host_affecting_command_has_a_non_mutating_dry_run(self):
         cases = [

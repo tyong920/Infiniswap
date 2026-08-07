@@ -37,6 +37,8 @@ static void is_set_io_state(struct is_device *device,
 	unsigned long flags;
 
 	spin_lock_irqsave(&device->io_lock, flags);
+	if (accepting_io && atomic_read(&device->remote_lost))
+		accepting_io = false;
 	device->state = state;
 	device->accepting_opens = accepting_io;
 	device->accepting_io = accepting_io;
@@ -47,6 +49,7 @@ void is_device_init(struct is_device *device, const char *name)
 {
 	mutex_init(&device->configfs_lock);
 	mutex_init(&device->lifecycle_lock);
+	mutex_init(&device->remote_state_lock);
 	spin_lock_init(&device->io_lock);
 	spin_lock_init(&device->backing_lock);
 	init_waitqueue_head(&device->drain_wait);
@@ -54,7 +57,8 @@ void is_device_init(struct is_device *device, const char *name)
 	atomic_set(&device->inflight, 0);
 	atomic_set(&device->connection_state, IS_CONNECTION_NOT_CONNECTED);
 	atomic_set(&device->backing_state, IS_BACKING_HEALTHY);
-	atomic_set(&device->mapped_hot_ranges, 0);
+	atomic_set(&device->remote_lost, 0);
+	atomic_set(&device->mapped_remote_chunks, 0);
 	atomic64_set(&device->next_io_generation, 0);
 	atomic64_set(&device->backing_failures_total, 0);
 	atomic64_set(&device->backing_retries_total, 0);
@@ -63,6 +67,7 @@ void is_device_init(struct is_device *device, const char *name)
 	atomic64_set(&device->late_rdma_completions_total, 0);
 	atomic64_set(&device->rejected_writes_total, 0);
 	atomic64_set(&device->local_only_writes_total, 0);
+	atomic64_set(&device->remote_lost_transitions_total, 0);
 	atomic64_set(&device->backing_invalid_sectors, 0);
 	device->mode = IS_DEVICE_MODE_UNSET;
 	device->acknowledgement_policy = IS_ACKNOWLEDGEMENT_POLICY_STRICT;
@@ -83,25 +88,61 @@ const char *is_device_mode_name(struct is_device *device)
 	const char *name;
 
 	mutex_lock(&device->lifecycle_lock);
-	name = device->mode == IS_DEVICE_MODE_BACKED ? "backed" : "unset";
+	switch (device->mode) {
+	case IS_DEVICE_MODE_BACKED:
+		name = "backed";
+		break;
+	case IS_DEVICE_MODE_REMOTE_ONLY:
+		name = "remote-only";
+		break;
+	default:
+		name = "unset";
+		break;
+	}
 	mutex_unlock(&device->lifecycle_lock);
 	return name;
 }
 
 int is_device_set_mode(struct is_device *device, const char *buf, size_t count)
 {
+	enum is_device_mode mode;
 	int ret = 0;
 
-	if (!sysfs_streq(buf, "backed"))
-		return -EOPNOTSUPP;
+	if (sysfs_streq(buf, "backed"))
+		mode = IS_DEVICE_MODE_BACKED;
+	else if (sysfs_streq(buf, "remote-only"))
+		mode = IS_DEVICE_MODE_REMOTE_ONLY;
+	else
+		return -EINVAL;
 
 	mutex_lock(&device->lifecycle_lock);
 	if (!is_device_configurable(device))
 		ret = -EBUSY;
 	else if (device->mode == IS_DEVICE_MODE_UNSET)
-		device->mode = IS_DEVICE_MODE_BACKED;
-	else if (device->mode != IS_DEVICE_MODE_BACKED)
+		device->mode = mode;
+	else if (device->mode != mode)
 		ret = -EINVAL;
+	mutex_unlock(&device->lifecycle_lock);
+	return ret;
+}
+
+int is_device_set_remote_only_eligible(struct is_device *device,
+				       const char *buf, size_t count)
+{
+	bool eligible;
+	int ret;
+
+	(void)count;
+	ret = kstrtobool(buf, &eligible);
+	if (ret)
+		return ret;
+	mutex_lock(&device->lifecycle_lock);
+	if (!is_device_configurable(device))
+		ret = -EBUSY;
+	else {
+		device->remote_only_eligible = eligible;
+		ret = 0;
+	}
 	mutex_unlock(&device->lifecycle_lock);
 	return ret;
 }
@@ -111,16 +152,20 @@ const char *is_device_acknowledgement_policy_name(struct is_device *device)
 	const char *name;
 
 	mutex_lock(&device->lifecycle_lock);
-	switch (device->acknowledgement_policy) {
-	case IS_ACKNOWLEDGEMENT_POLICY_STRICT:
-		name = "strict";
-		break;
-	case IS_ACKNOWLEDGEMENT_POLICY_REMOTE_FIRST:
-		name = "remote-first";
-		break;
-	default:
+	if (device->mode == IS_DEVICE_MODE_REMOTE_ONLY) {
 		name = "unset";
-		break;
+	} else {
+		switch (device->acknowledgement_policy) {
+		case IS_ACKNOWLEDGEMENT_POLICY_STRICT:
+			name = "strict";
+			break;
+		case IS_ACKNOWLEDGEMENT_POLICY_REMOTE_FIRST:
+			name = "remote-first";
+			break;
+		default:
+			name = "unset";
+			break;
+		}
 	}
 	mutex_unlock(&device->lifecycle_lock);
 	return name;
@@ -142,6 +187,8 @@ int is_device_set_acknowledgement_policy(struct is_device *device,
 	mutex_lock(&device->lifecycle_lock);
 	if (!is_device_configurable(device))
 		ret = -EBUSY;
+	else if (device->mode == IS_DEVICE_MODE_REMOTE_ONLY)
+		ret = -EINVAL;
 	else
 		device->acknowledgement_policy = policy;
 	mutex_unlock(&device->lifecycle_lock);
@@ -536,6 +583,52 @@ const char *is_device_backing_state_name(struct is_device *device)
 		"backing-degraded" : "healthy";
 }
 
+const char *is_device_operational_state_name(struct is_device *device)
+{
+	if (atomic_read(&device->remote_lost))
+		return "remote-lost";
+	return is_device_backing_state_name(device);
+}
+
+bool is_device_mark_remote_connected(struct is_device *device)
+{
+	unsigned long flags;
+	bool connected = false;
+
+	mutex_lock(&device->remote_state_lock);
+	spin_lock_irqsave(&device->io_lock, flags);
+	if (!atomic_read(&device->remote_lost)) {
+		atomic_set(&device->connection_state, IS_CONNECTION_CONNECTED);
+		WRITE_ONCE(device->last_error, 0);
+		connected = true;
+	}
+	spin_unlock_irqrestore(&device->io_lock, flags);
+	mutex_unlock(&device->remote_state_lock);
+	return connected;
+}
+
+void is_device_mark_remote_lost_locked(struct is_device *device, int error)
+{
+	unsigned long flags;
+	bool transitioned = false;
+
+	if (device->mode != IS_DEVICE_MODE_REMOTE_ONLY)
+		return;
+	spin_lock_irqsave(&device->io_lock, flags);
+	if (atomic_cmpxchg(&device->remote_lost, 0, 1) == 0) {
+		device->accepting_opens = false;
+		device->accepting_io = false;
+		atomic_set(&device->connection_state, IS_CONNECTION_REMOTE_LOST);
+		WRITE_ONCE(device->last_error, error > 0 ? error : EIO);
+		transitioned = true;
+	}
+	spin_unlock_irqrestore(&device->io_lock, flags);
+	if (!transitioned)
+		return;
+	atomic64_inc(&device->remote_lost_transitions_total);
+	wake_up_all(&device->drain_wait);
+}
+
 static bool is_backing_range_valid(struct is_device *device, sector_t sector,
 				   unsigned int bytes)
 {
@@ -640,6 +733,10 @@ int is_device_set_backing_store(struct is_device *device, const char *buf,
 		ret = -EBUSY;
 		goto unlock;
 	}
+	if (device->mode == IS_DEVICE_MODE_REMOTE_ONLY) {
+		ret = -EINVAL;
+		goto unlock;
+	}
 
 	ret = is_validate_backing_path(path);
 	if (!ret)
@@ -724,8 +821,8 @@ static void is_close_backing_store(struct is_device *device)
 
 static void is_finish_inflight(struct is_device *device)
 {
-	if (atomic_dec_and_test(&device->inflight))
-		wake_up_all(&device->drain_wait);
+	atomic_dec(&device->inflight);
+	wake_up_all(&device->drain_wait);
 }
 
 static void is_end_request(struct is_request_ctx *ctx, blk_status_t status)
@@ -1117,7 +1214,10 @@ static bool is_dispatch_remote_read(struct is_device *device,
 		goto free_remote;
 	remote->rdma_io.write = false;
 	generation = remote->rdma_io.generation;
-	is_io_policy_init_remote_read(&remote->policy, generation);
+	if (device->mode == IS_DEVICE_MODE_REMOTE_ONLY)
+		is_io_policy_init_remote_only_read(&remote->policy, generation);
+	else
+		is_io_policy_init_remote_read(&remote->policy, generation);
 	refcount_set(&remote->references, 3);
 	ret = is_rdma_submit(device, &remote->rdma_io);
 	if (ret) {
@@ -1139,8 +1239,7 @@ static bool is_dispatch_remote_write(struct is_device *device,
 {
 	struct is_remote_request *remote =
 		is_alloc_remote_request(device, request);
-	struct bio *bio;
-	enum is_io_policy_kind kind;
+	struct bio *bio = NULL;
 	u64 generation;
 	unsigned int index;
 	int ret;
@@ -1151,21 +1250,31 @@ static bool is_dispatch_remote_write(struct is_device *device,
 	ret = is_prepare_owned_pages(remote, true);
 	if (ret)
 		goto free_remote;
-	bio = is_build_owned_bio(remote);
-	if (!bio)
-		goto free_remote;
+	if (device->mode == IS_DEVICE_MODE_BACKED) {
+		enum is_io_policy_kind kind;
+
+		bio = is_build_owned_bio(remote);
+		if (!bio)
+			goto free_remote;
+		kind = device->acknowledgement_policy ==
+			IS_ACKNOWLEDGEMENT_POLICY_REMOTE_FIRST ?
+			IS_IO_POLICY_REMOTE_FIRST_WRITE : IS_IO_POLICY_STRICT_WRITE;
+		is_io_policy_init_write(&remote->policy, kind,
+			remote->rdma_io.generation);
+		refcount_set(&remote->references, 4);
+		atomic_set(&remote->local_status, BLK_STS_OK);
+		atomic_set(&remote->pending_bios, 1);
+	} else {
+		is_io_policy_init_remote_only_write(&remote->policy,
+			remote->rdma_io.generation);
+		refcount_set(&remote->references, 3);
+	}
 	remote->rdma_io.write = true;
 	generation = remote->rdma_io.generation;
-	kind = device->acknowledgement_policy ==
-		IS_ACKNOWLEDGEMENT_POLICY_REMOTE_FIRST ?
-		IS_IO_POLICY_REMOTE_FIRST_WRITE : IS_IO_POLICY_STRICT_WRITE;
-	is_io_policy_init_write(&remote->policy, kind, generation);
-	refcount_set(&remote->references, 4);
-	atomic_set(&remote->local_status, BLK_STS_OK);
-	atomic_set(&remote->pending_bios, 1);
 
-	/* Both policies require the Backing Store write to be submitted first. */
-	submit_bio_noacct(bio);
+	/* Backed policies submit their recovery copy before Remote Memory. */
+	if (bio)
+		submit_bio_noacct(bio);
 	ret = is_rdma_submit(device, &remote->rdma_io);
 	if (ret) {
 		is_remote_transport_release(remote);
@@ -1188,7 +1297,8 @@ static bool is_dispatch_remote(struct is_device *device,
 	sector_t sector = blk_rq_pos(request);
 	bool write = req_op(request) == REQ_OP_WRITE;
 
-	is_rdma_note_activity(device, sector, bytes, write);
+	if (device->mode == IS_DEVICE_MODE_BACKED)
+		is_rdma_note_activity(device, sector, bytes, write);
 	if (write) {
 		if (!is_rdma_range_mapped(device, sector, bytes))
 			return false;
@@ -1248,7 +1358,8 @@ static bool is_accept_request(struct is_device *device,
 
 	spin_lock_irqsave(&device->io_lock, flags);
 	accepted = device->accepting_io;
-	if (accepted && write && !is_backing_healthy(device)) {
+	if (accepted && device->mode == IS_DEVICE_MODE_BACKED && write &&
+	    !is_backing_healthy(device)) {
 		accepted = false;
 		rejected_degraded = true;
 	}
@@ -1262,9 +1373,21 @@ static bool is_accept_request(struct is_device *device,
 
 static void is_issue_flush(struct is_device *device, struct request *request)
 {
-	blk_status_t status = errno_to_blk_status(
-		blkdev_issue_flush(device->backing_bdev));
+	blk_status_t status;
 
+	if (device->mode == IS_DEVICE_MODE_REMOTE_ONLY) {
+		unsigned long flags;
+
+		status = errno_to_blk_status(is_rdma_flush(device));
+		spin_lock_irqsave(&device->io_lock, flags);
+		if (atomic_read(&device->remote_lost))
+			status = BLK_STS_IOERR;
+		blk_mq_end_request(request, status);
+		is_finish_inflight(device);
+		spin_unlock_irqrestore(&device->io_lock, flags);
+		return;
+	}
+	status = errno_to_blk_status(blkdev_issue_flush(device->backing_bdev));
 	if (status != BLK_STS_OK)
 		is_degrade_backing(device, 0, 0, EIO);
 	is_complete_accepted_request(device, request, status);
@@ -1281,6 +1404,8 @@ static void is_dispatch_backing_work(struct work_struct *work)
 		is_issue_flush(device, request);
 	} else if (is_dispatch_remote(device, request)) {
 		return;
+	} else if (device->mode == IS_DEVICE_MODE_REMOTE_ONLY) {
+		is_complete_accepted_request(device, request, BLK_STS_IOERR);
 	} else if (req_op(request) == REQ_OP_READ &&
 		   !is_backing_range_valid(device, blk_rq_pos(request),
 			blk_rq_bytes(request))) {
@@ -1394,28 +1519,40 @@ static const struct block_device_operations is_block_ops = {
 
 static void is_configure_queue(struct is_device *device)
 {
-	struct request_queue *backing_queue = bdev_get_queue(device->backing_bdev);
 	struct request_queue *queue = device->disk->queue;
 
-	blk_queue_logical_block_size(queue,
-				     bdev_logical_block_size(device->backing_bdev));
-	blk_queue_physical_block_size(queue,
-				      bdev_physical_block_size(device->backing_bdev));
-	blk_queue_max_hw_sectors(queue,
-		min_t(unsigned int, queue_max_hw_sectors(backing_queue),
-		      IS_RDMA_MAX_SEGMENTS * (PAGE_SIZE >> 9)));
-	blk_queue_max_segments(queue,
-		min_t(unsigned int, queue_max_segments(backing_queue),
-		      IS_RDMA_MAX_SEGMENTS));
-	blk_queue_max_segment_size(queue,
-		min_t(unsigned int, queue_max_segment_size(backing_queue), PAGE_SIZE));
-	blk_queue_write_cache(queue,
-			      test_bit(QUEUE_FLAG_WC,
-				       &backing_queue->queue_flags),
-			      test_bit(QUEUE_FLAG_FUA,
-				       &backing_queue->queue_flags));
+	if (device->mode == IS_DEVICE_MODE_BACKED) {
+		struct request_queue *backing_queue =
+			bdev_get_queue(device->backing_bdev);
+
+		blk_queue_logical_block_size(queue,
+			bdev_logical_block_size(device->backing_bdev));
+		blk_queue_physical_block_size(queue,
+			bdev_physical_block_size(device->backing_bdev));
+		blk_queue_max_hw_sectors(queue,
+			min_t(unsigned int, queue_max_hw_sectors(backing_queue),
+			      IS_RDMA_MAX_SEGMENTS * (PAGE_SIZE >> 9)));
+		blk_queue_max_segments(queue,
+			min_t(unsigned int, queue_max_segments(backing_queue),
+			      IS_RDMA_MAX_SEGMENTS));
+		blk_queue_max_segment_size(queue,
+			min_t(unsigned int, queue_max_segment_size(backing_queue),
+			      PAGE_SIZE));
+		blk_queue_write_cache(queue,
+			test_bit(QUEUE_FLAG_WC, &backing_queue->queue_flags),
+			test_bit(QUEUE_FLAG_FUA, &backing_queue->queue_flags));
+	} else {
+		blk_queue_logical_block_size(queue, IS_SECTOR_SIZE);
+		blk_queue_physical_block_size(queue, PAGE_SIZE);
+		blk_queue_max_hw_sectors(queue,
+			IS_RDMA_MAX_SEGMENTS * (PAGE_SIZE >> 9));
+		blk_queue_max_segments(queue, IS_RDMA_MAX_SEGMENTS);
+		blk_queue_max_segment_size(queue, PAGE_SIZE);
+		blk_queue_write_cache(queue, true, false);
+	}
 	blk_queue_max_discard_sectors(queue, 0);
 	blk_queue_max_write_zeroes_sectors(queue, 0);
+	blk_queue_chunk_sectors(queue, IS_REMOTE_CHUNK_BYTES / IS_SECTOR_SIZE);
 	blk_queue_flag_set(QUEUE_FLAG_NONROT, queue);
 	blk_queue_flag_clear(QUEUE_FLAG_ADD_RANDOM, queue);
 }
@@ -1477,6 +1614,9 @@ static int is_validate_open_backing_store(struct is_device *device)
 int is_device_activate(struct is_device *device)
 {
 	enum is_device_state previous_state;
+	bool remote_only;
+	bool remote_configured;
+	bool remote_state_locked = false;
 	int ret;
 
 	mutex_lock(&device->lifecycle_lock);
@@ -1484,52 +1624,65 @@ int is_device_activate(struct is_device *device)
 		ret = device->state == IS_DEVICE_ACTIVE ? -EALREADY : -EINVAL;
 		goto out;
 	}
-	if (!is_backing_healthy(device)) {
+	remote_only = device->mode == IS_DEVICE_MODE_REMOTE_ONLY;
+	remote_configured =
+		!(device->capacity_bytes % IS_REMOTE_CHUNK_BYTES) &&
+		device->capacity_bytes <=
+			IS_REMOTE_CHUNK_BYTES * IS_MAX_REMOTE_CHUNKS &&
+		device->provider_address[0] && device->provider_port &&
+		device->rdma_device[0] && device->rdma_port &&
+		device->provider_key_id[0] &&
+		device->provider_psk_size >= IS_PSK_MIN_SIZE;
+	if (atomic_read(&device->remote_lost) ||
+	    (device->mode == IS_DEVICE_MODE_BACKED &&
+	     !is_backing_healthy(device))) {
 		ret = -EUCLEAN;
 		goto out;
 	}
-	if (device->mode != IS_DEVICE_MODE_BACKED ||
-	    !device->backing_path[0] || !device->capacity_sectors ||
-	    !device->consumer_id[0] || !device->providers[0] ||
-	    device->swap_priority < 0) {
+	if ((device->mode != IS_DEVICE_MODE_BACKED && !remote_only) ||
+	    !device->capacity_sectors || !device->consumer_id[0] ||
+	    !device->providers[0] || device->swap_priority < 0) {
 		ret = -EINVAL;
 		goto out;
 	}
-	if (device->acknowledgement_policy ==
-		    IS_ACKNOWLEDGEMENT_POLICY_REMOTE_FIRST &&
-	    ((device->capacity_bytes % IS_REMOTE_CHUNK_BYTES) ||
-	     device->capacity_bytes >
-		IS_REMOTE_CHUNK_BYTES * IS_MAX_REMOTE_CHUNKS ||
-	     !device->provider_address[0] || !device->provider_port ||
-	     !device->rdma_device[0] || !device->rdma_port ||
-	     !device->provider_key_id[0] ||
-	     device->provider_psk_size < IS_PSK_MIN_SIZE)) {
+	if (remote_only) {
+		if (!device->remote_only_eligible || device->backing_path[0] ||
+		    !remote_configured) {
+			ret = -EINVAL;
+			goto out;
+		}
+	} else if (!device->backing_path[0] ||
+		   (device->acknowledgement_policy ==
+			IS_ACKNOWLEDGEMENT_POLICY_REMOTE_FIRST &&
+		    !remote_configured)) {
 		ret = -EINVAL;
 		goto out;
 	}
 	previous_state = device->state;
 
-	ret = is_open_backing_store(device);
-	if (ret)
-		goto out;
-	ret = is_validate_open_backing_store(device);
-	if (ret)
-		goto release_resources;
+	if (!remote_only) {
+		ret = is_open_backing_store(device);
+		if (ret)
+			goto out;
+		ret = is_validate_open_backing_store(device);
+		if (ret)
+			goto release_resources;
 
-	ret = bioset_init(&device->bio_set, IS_BIO_POOL_SIZE, 0,
-			  BIOSET_NEED_RESCUER | BIOSET_NEED_BVECS);
-	if (ret)
-		goto release_resources;
-	device->bioset_initialized = true;
+		ret = bioset_init(&device->bio_set, IS_BIO_POOL_SIZE, 0,
+				  BIOSET_NEED_RESCUER | BIOSET_NEED_BVECS);
+		if (ret)
+			goto release_resources;
+		device->bioset_initialized = true;
 
-	device->backing_invalid_bitmap = kvcalloc(
-		BITS_TO_LONGS(device->capacity_sectors), sizeof(unsigned long),
-		GFP_KERNEL);
-	if (!device->backing_invalid_bitmap) {
-		ret = -ENOMEM;
-		goto release_resources;
+		device->backing_invalid_bitmap = kvcalloc(
+			BITS_TO_LONGS(device->capacity_sectors),
+			sizeof(unsigned long), GFP_KERNEL);
+		if (!device->backing_invalid_bitmap) {
+			ret = -ENOMEM;
+			goto release_resources;
+		}
+		atomic64_set(&device->backing_invalid_sectors, 0);
 	}
-	atomic64_set(&device->backing_invalid_sectors, 0);
 
 	device->ordered_backing_wq = alloc_ordered_workqueue("infiniswap-io",
 							WQ_MEM_RECLAIM);
@@ -1541,6 +1694,8 @@ int is_device_activate(struct is_device *device)
 	ret = is_rdma_start(device);
 	if (ret) {
 		WRITE_ONCE(device->last_error, -ret);
+		if (remote_only)
+			goto release_resources;
 		ret = 0;
 	}
 
@@ -1581,6 +1736,17 @@ int is_device_activate(struct is_device *device)
 	strscpy(device->disk->disk_name, device->name, DISK_NAME_LEN);
 	set_capacity(device->disk, device->capacity_sectors);
 	is_configure_queue(device);
+	if (remote_only) {
+		mutex_lock(&device->remote_state_lock);
+		remote_state_locked = true;
+	}
+	if (remote_only &&
+	    (atomic_read(&device->remote_lost) ||
+	     atomic_read(&device->connection_state) != IS_CONNECTION_CONNECTED ||
+	     READ_ONCE(device->remote_capacity_bytes) != device->capacity_bytes)) {
+		ret = -ENOTCONN;
+		goto release_resources;
+	}
 
 	is_set_io_state(device, IS_DEVICE_ACTIVE, true);
 	ret = add_disk(device->disk);
@@ -1589,11 +1755,18 @@ int is_device_activate(struct is_device *device)
 		goto release_resources;
 	}
 	device->disk_added = true;
-	pr_info(IS_DRIVER_NAME ": activated %s on %s (%llu bytes)\n",
-		device->name, device->backing_path, device->capacity_bytes);
+	if (remote_state_locked) {
+		mutex_unlock(&device->remote_state_lock);
+		remote_state_locked = false;
+	}
+	pr_info(IS_DRIVER_NAME ": activated %s in %s mode (%llu bytes)\n",
+		device->name, remote_only ? "remote-only" : "backed",
+		device->capacity_bytes);
 	goto out;
 
 release_resources:
+	if (remote_state_locked)
+		mutex_unlock(&device->remote_state_lock);
 	is_set_io_state(device, previous_state, false);
 	is_release_resources(device);
 out:

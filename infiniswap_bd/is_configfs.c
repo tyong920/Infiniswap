@@ -62,6 +62,24 @@ static ssize_t is_device_mode_store(struct config_item *item,
 	return is_store_result(device, ret, count);
 }
 
+static ssize_t is_device_remote_only_eligible_show(struct config_item *item,
+						    char *page)
+{
+	struct is_device *device = to_is_device(item);
+
+	return sysfs_emit(page, "%u\n", device->remote_only_eligible ? 1U : 0U);
+}
+
+static ssize_t is_device_remote_only_eligible_store(struct config_item *item,
+						     const char *page,
+						     size_t count)
+{
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_remote_only_eligible(device, page, count);
+
+	return is_store_result(device, ret, count);
+}
+
 static ssize_t is_device_acknowledgement_policy_show(struct config_item *item,
 						      char *page)
 {
@@ -348,6 +366,9 @@ static ssize_t is_device_connection_state_show(struct config_item *item,
 	case IS_CONNECTION_DEGRADED:
 		name = "degraded";
 		break;
+	case IS_CONNECTION_REMOTE_LOST:
+		name = "remote-lost";
+		break;
 	default:
 		name = "not-connected";
 		break;
@@ -367,11 +388,21 @@ static ssize_t is_device_remote_capacity_bytes_show(struct config_item *item,
 	return count;
 }
 
+static ssize_t is_device_mapped_remote_chunks_show(struct config_item *item,
+						    char *page)
+{
+	return sysfs_emit(page, "%d\n",
+		atomic_read(&to_is_device(item)->mapped_remote_chunks));
+}
+
 static ssize_t is_device_mapped_hot_ranges_show(struct config_item *item,
 						 char *page)
 {
-	return sysfs_emit(page, "%d\n",
-		atomic_read(&to_is_device(item)->mapped_hot_ranges));
+	struct is_device *device = to_is_device(item);
+	int mapped = device->mode == IS_DEVICE_MODE_BACKED ?
+		atomic_read(&device->mapped_remote_chunks) : 0;
+
+	return sysfs_emit(page, "%d\n", mapped);
 }
 
 static ssize_t is_device_backing_state_show(struct config_item *item,
@@ -379,6 +410,13 @@ static ssize_t is_device_backing_state_show(struct config_item *item,
 {
 	return sysfs_emit(page, "%s\n",
 		is_device_backing_state_name(to_is_device(item)));
+}
+
+static ssize_t is_device_operational_state_show(struct config_item *item,
+						 char *page)
+{
+	return sysfs_emit(page, "%s\n",
+		is_device_operational_state_name(to_is_device(item)));
 }
 
 #define IS_DEVICE_METRIC_SHOW(name, field) \
@@ -396,6 +434,8 @@ IS_DEVICE_METRIC_SHOW(provider_timeouts_total, provider_timeouts_total)
 IS_DEVICE_METRIC_SHOW(late_rdma_completions_total, late_rdma_completions_total)
 IS_DEVICE_METRIC_SHOW(rejected_writes_total, rejected_writes_total)
 IS_DEVICE_METRIC_SHOW(local_only_writes_total, local_only_writes_total)
+IS_DEVICE_METRIC_SHOW(remote_lost_transitions_total,
+	remote_lost_transitions_total)
 IS_DEVICE_METRIC_SHOW(backing_invalid_sectors, backing_invalid_sectors)
 
 static ssize_t is_device_last_error_show(struct config_item *item, char *page)
@@ -454,6 +494,7 @@ out:
 
 CONFIGFS_ATTR(is_device_, backing_store);
 CONFIGFS_ATTR(is_device_, mode);
+CONFIGFS_ATTR(is_device_, remote_only_eligible);
 CONFIGFS_ATTR(is_device_, acknowledgement_policy);
 CONFIGFS_ATTR(is_device_, capacity_bytes);
 CONFIGFS_ATTR(is_device_, provider_failure_deadline_ms);
@@ -472,8 +513,10 @@ CONFIGFS_ATTR_WO(is_device_, provider_psk);
 CONFIGFS_ATTR(is_device_, swap_priority);
 CONFIGFS_ATTR_RO(is_device_, connection_state);
 CONFIGFS_ATTR_RO(is_device_, remote_capacity_bytes);
+CONFIGFS_ATTR_RO(is_device_, mapped_remote_chunks);
 CONFIGFS_ATTR_RO(is_device_, mapped_hot_ranges);
 CONFIGFS_ATTR_RO(is_device_, backing_state);
+CONFIGFS_ATTR_RO(is_device_, operational_state);
 CONFIGFS_ATTR_RO(is_device_, backing_failures_total);
 CONFIGFS_ATTR_RO(is_device_, backing_retries_total);
 CONFIGFS_ATTR_RO(is_device_, backing_degraded_transitions_total);
@@ -481,6 +524,7 @@ CONFIGFS_ATTR_RO(is_device_, provider_timeouts_total);
 CONFIGFS_ATTR_RO(is_device_, late_rdma_completions_total);
 CONFIGFS_ATTR_RO(is_device_, rejected_writes_total);
 CONFIGFS_ATTR_RO(is_device_, local_only_writes_total);
+CONFIGFS_ATTR_RO(is_device_, remote_lost_transitions_total);
 CONFIGFS_ATTR_RO(is_device_, backing_invalid_sectors);
 CONFIGFS_ATTR_RO(is_device_, last_error);
 CONFIGFS_ATTR(is_device_, state);
@@ -488,6 +532,7 @@ CONFIGFS_ATTR(is_device_, state);
 static struct configfs_attribute *is_device_attrs[] = {
 	&is_device_attr_backing_store,
 	&is_device_attr_mode,
+	&is_device_attr_remote_only_eligible,
 	&is_device_attr_acknowledgement_policy,
 	&is_device_attr_capacity_bytes,
 	&is_device_attr_provider_failure_deadline_ms,
@@ -506,8 +551,10 @@ static struct configfs_attribute *is_device_attrs[] = {
 	&is_device_attr_swap_priority,
 	&is_device_attr_connection_state,
 	&is_device_attr_remote_capacity_bytes,
+	&is_device_attr_mapped_remote_chunks,
 	&is_device_attr_mapped_hot_ranges,
 	&is_device_attr_backing_state,
+	&is_device_attr_operational_state,
 	&is_device_attr_backing_failures_total,
 	&is_device_attr_backing_retries_total,
 	&is_device_attr_backing_degraded_transitions_total,
@@ -515,6 +562,7 @@ static struct configfs_attribute *is_device_attrs[] = {
 	&is_device_attr_late_rdma_completions_total,
 	&is_device_attr_rejected_writes_total,
 	&is_device_attr_local_only_writes_total,
+	&is_device_attr_remote_lost_transitions_total,
 	&is_device_attr_backing_invalid_sectors,
 	&is_device_attr_last_error,
 	&is_device_attr_state,
