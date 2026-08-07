@@ -1517,7 +1517,7 @@ int is_device_activate(struct is_device *device)
 		goto release_resources;
 
 	ret = bioset_init(&device->bio_set, IS_BIO_POOL_SIZE, 0,
-			  BIOSET_NEED_RESCUER);
+			  BIOSET_NEED_RESCUER | BIOSET_NEED_BVECS);
 	if (ret)
 		goto release_resources;
 	device->bioset_initialized = true;

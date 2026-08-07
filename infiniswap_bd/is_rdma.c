@@ -100,6 +100,7 @@ struct is_rdma_session {
 	atomic_t rdma_reads_inflight;
 	atomic_t operation_objects;
 	atomic_t disconnect_started;
+	bool disconnect_deferred;
 	bool stopping;
 	bool ever_connected;
 	enum is_rdma_control_state control_state;
@@ -169,6 +170,14 @@ static void is_force_qp_error(struct is_rdma_session *session)
 	(void)ib_modify_qp(session->qp, &attributes, IB_QP_STATE);
 }
 
+static void is_fail_after_provider_timeout(struct is_rdma_session *session)
+{
+	/* Send the disconnect during stop, after a transient fault can clear. */
+	WRITE_ONCE(session->disconnect_deferred, true);
+	is_force_qp_error(session);
+	is_rdma_fail(session, -ETIMEDOUT);
+}
+
 static void *is_kzalloc_numa(struct is_device *device, size_t size,
 			     gfp_t flags)
 {
@@ -227,6 +236,7 @@ static void is_rdma_fail(struct is_rdma_session *session, int error)
 		IS_CONNECTION_NOT_CONNECTED);
 	queue_work(session->control_wq, &session->failure_work);
 	if (session->connect_started &&
+	    !READ_ONCE(session->disconnect_deferred) &&
 	    atomic_cmpxchg(&session->disconnect_started, 0, 1) == 0)
 		rdma_disconnect(session->cm_id);
 }
@@ -262,8 +272,7 @@ static void is_control_deadline(struct work_struct *work)
 		session->control_state = IS_RDMA_CONTROL_FAILED;
 	mutex_unlock(&session->control_lock);
 	atomic64_inc(&session->device->provider_timeouts_total);
-	is_force_qp_error(session);
-	is_rdma_fail(session, -ETIMEDOUT);
+	is_fail_after_provider_timeout(session);
 }
 
 static void is_arm_control_deadline(struct is_rdma_session *session)
@@ -1217,8 +1226,7 @@ void is_rdma_stop(struct is_device *device)
 	mutex_unlock(&session->control_lock);
 	cancel_delayed_work_sync(&session->control_deadline_work);
 	cancel_work_sync(&session->connect_work);
-	if (session->connect_started &&
-	    atomic_cmpxchg(&session->disconnect_started, 0, 1) == 0)
+	if (session->connect_started)
 		rdma_disconnect(session->cm_id);
 	cancel_work_sync(&session->hello_work);
 	cancel_work_sync(&session->receive_work);
@@ -1328,8 +1336,7 @@ static void is_operation_deadline(struct work_struct *work)
 		atomic_set(&operation->timed_out, 1);
 		is_set_operation_remote_valid(operation, false);
 		atomic64_inc(&session->device->provider_timeouts_total);
-		is_force_qp_error(session);
-		is_rdma_fail(session, -ETIMEDOUT);
+		is_fail_after_provider_timeout(session);
 		operation->io->complete(operation->io->context,
 			operation->io->generation, -ETIMEDOUT, true);
 	}

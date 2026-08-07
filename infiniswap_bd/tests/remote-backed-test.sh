@@ -399,6 +399,7 @@ measure_parallel_write_p99 /dev/infiniswap-network-fault \
   "$tmp/network-pattern" "$tmp/network-latency"
 ((measured_p99_ms <= failure_deadline_ms + 500)) || \
   fail "network fallback p99 was ${measured_p99_ms} ms"
+echo "network fallback p99: ${measured_p99_ms} ms"
 wait_for_value "$root/infiniswap-network-fault/connection_state" degraded
 tc qdisc del dev "$netdev" root
 network_fault_active=0
@@ -431,6 +432,7 @@ measure_parallel_write_p99 /dev/infiniswap-provider-death \
   "$tmp/death-pattern" "$tmp/death-latency"
 ((measured_p99_ms <= failure_deadline_ms + 500)) || \
   fail "Provider-death fallback p99 was ${measured_p99_ms} ms"
+echo "Provider-death fallback p99: ${measured_p99_ms} ms"
 dd if=/dev/infiniswap-provider-death of="$tmp/death-actual" bs=4096 \
   count=100 iflag=direct status=none
 cmp "$tmp/death-pattern" "$tmp/death-actual" || \
