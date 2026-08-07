@@ -1,0 +1,52 @@
+{
+  "capacity": {
+    "advertised_bytes": 8589934592,
+    "backing_bytes": 8589934592,
+    "remote_bytes": 0
+  },
+  "connection": {
+    "healthy_providers": 0,
+    "providers": [
+      {
+        "provider_id": "provider-a",
+        "state": "not-connected"
+      }
+    ],
+    "state": "not-connected",
+    "total_providers": 1
+  },
+  "device": {
+    "acknowledgement_policy": "strict",
+    "lifecycle": "active",
+    "mode": "backed",
+    "name": "infiniswap0",
+    "operational_state": "healthy",
+    "path": "/dev/infiniswap0",
+    "provider_failure_deadline_ms": 2000,
+    "swap": {
+      "configured_priority": 100,
+      "enabled": true,
+      "priority": 100
+    }
+  },
+  "kind": "infiniswap.device-status",
+  "last_error": null,
+  "mapping": {
+    "chunk_size_bytes": 1073741824,
+    "mapped_hot_ranges": 1,
+    "read_weight": 1,
+    "threshold": 8,
+    "write_weight": 4
+  },
+  "metrics": {
+    "backing_degraded_transitions_total": 0,
+    "backing_failures_total": 0,
+    "backing_invalid_sectors": 0,
+    "backing_retries_total": 0,
+    "late_rdma_completions_total": 0,
+    "local_only_writes_total": 0,
+    "provider_timeouts_total": 0,
+    "rejected_writes_total": 0
+  },
+  "schema_version": 3
+}

@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/tyong920/Infiniswap/config/status.schema.json",
-  "title": "Infiniswap Device Status v3",
+  "$id": "https://github.com/tyong920/Infiniswap/config/status-v2.schema.json",
+  "title": "Infiniswap Device Status v2",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -11,11 +11,10 @@
     "connection",
     "capacity",
     "mapping",
-    "metrics",
     "last_error"
   ],
   "properties": {
-    "schema_version": {"const": 3},
+    "schema_version": {"const": 2},
     "kind": {"const": "infiniswap.device-status"},
     "device": {
       "type": "object",
@@ -26,7 +25,6 @@
         "lifecycle",
         "mode",
         "acknowledgement_policy",
-        "operational_state",
         "provider_failure_deadline_ms",
         "swap"
       ],
@@ -44,9 +42,6 @@
         "mode": {"enum": ["backed", "remote-only", "unset"]},
         "acknowledgement_policy": {
           "enum": ["strict", "remote-first", "unset"]
-        },
-        "operational_state": {
-          "enum": ["healthy", "backing-degraded"]
         },
         "provider_failure_deadline_ms": {
           "type": "integer",
@@ -126,30 +121,6 @@
         "read_weight": {"type": "integer", "minimum": 1},
         "write_weight": {"type": "integer", "minimum": 1},
         "mapped_hot_ranges": {"type": "integer", "minimum": 0, "maximum": 128}
-      }
-    },
-    "metrics": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "backing_degraded_transitions_total",
-        "backing_failures_total",
-        "backing_invalid_sectors",
-        "backing_retries_total",
-        "late_rdma_completions_total",
-        "local_only_writes_total",
-        "provider_timeouts_total",
-        "rejected_writes_total"
-      ],
-      "properties": {
-        "backing_degraded_transitions_total": {"type": "integer", "minimum": 0},
-        "backing_failures_total": {"type": "integer", "minimum": 0},
-        "backing_invalid_sectors": {"type": "integer", "minimum": 0},
-        "backing_retries_total": {"type": "integer", "minimum": 0},
-        "late_rdma_completions_total": {"type": "integer", "minimum": 0},
-        "local_only_writes_total": {"type": "integer", "minimum": 0},
-        "provider_timeouts_total": {"type": "integer", "minimum": 0},
-        "rejected_writes_total": {"type": "integer", "minimum": 0}
       }
     },
     "last_error": {

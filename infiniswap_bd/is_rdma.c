@@ -73,9 +73,12 @@ struct is_rdma_operation {
 	struct ib_sge sges[IS_RDMA_MAX_SEGMENTS];
 	u64 dma_addresses[IS_RDMA_MAX_SEGMENTS];
 	enum dma_data_direction direction;
+	struct delayed_work deadline_work;
+	refcount_t references;
 	unsigned int mapped_segments;
 	unsigned int logical_chunk_id;
-	atomic_t completed;
+	atomic_t callback_complete;
+	atomic_t timed_out;
 };
 
 struct is_rdma_session {
@@ -95,6 +98,7 @@ struct is_rdma_session {
 	wait_queue_head_t chunk_wait;
 	atomic_t send_busy;
 	atomic_t rdma_reads_inflight;
+	atomic_t operation_objects;
 	atomic_t disconnect_started;
 	bool stopping;
 	bool ever_connected;
@@ -121,6 +125,9 @@ struct is_rdma_session {
 	struct work_struct mapping_work;
 	struct work_struct release_work;
 	struct work_struct failure_work;
+	struct delayed_work control_deadline_work;
+	unsigned long control_deadline_expires;
+	bool control_deadline_armed;
 
 	u8 hello_frame[IS_PROTOCOL_MAX_FRAME_SIZE];
 	size_t hello_size;
@@ -148,6 +155,19 @@ struct is_rdma_session {
 static void is_rdma_fail(struct is_rdma_session *session, int error);
 static int is_post_control_receive(struct is_rdma_session *session);
 static void is_mapping_work(struct work_struct *work);
+static void is_arm_control_deadline(struct is_rdma_session *session);
+static void is_cancel_control_deadline(struct is_rdma_session *session);
+
+static void is_force_qp_error(struct is_rdma_session *session)
+{
+	struct ib_qp_attr attributes;
+
+	if (!session->qp)
+		return;
+	memset(&attributes, 0, sizeof(attributes));
+	attributes.qp_state = IB_QPS_ERR;
+	(void)ib_modify_qp(session->qp, &attributes, IB_QP_STATE);
+}
 
 static void *is_kzalloc_numa(struct is_device *device, size_t size,
 			     gfp_t flags)
@@ -187,6 +207,7 @@ static void is_failure_work(struct work_struct *work)
 	mutex_lock(&session->control_lock);
 	if (session->control_state != IS_RDMA_CONTROL_STOPPING)
 		session->control_state = IS_RDMA_CONTROL_FAILED;
+	is_cancel_control_deadline(session);
 	mutex_unlock(&session->control_lock);
 	is_unmap_all_chunks(session);
 	atomic_set(&session->device->connection_state,
@@ -201,10 +222,63 @@ static void is_rdma_fail(struct is_rdma_session *session, int error)
 	if (error >= 0)
 		error = -EIO;
 	WRITE_ONCE(session->device->last_error, -error);
+	atomic_set(&session->device->connection_state,
+		session->ever_connected ? IS_CONNECTION_DEGRADED :
+		IS_CONNECTION_NOT_CONNECTED);
 	queue_work(session->control_wq, &session->failure_work);
 	if (session->connect_started &&
 	    atomic_cmpxchg(&session->disconnect_started, 0, 1) == 0)
 		rdma_disconnect(session->cm_id);
+}
+
+static void is_control_deadline(struct work_struct *work)
+{
+	struct is_rdma_session *session = container_of(
+		to_delayed_work(work), struct is_rdma_session,
+		control_deadline_work);
+	unsigned long remaining = 0;
+	bool timed_out = false;
+
+	mutex_lock(&session->control_lock);
+	if (session->control_deadline_armed &&
+	    !READ_ONCE(session->stopping)) {
+		if (time_before(jiffies, session->control_deadline_expires)) {
+			remaining = session->control_deadline_expires - jiffies;
+		} else {
+			session->control_deadline_armed = false;
+			timed_out = true;
+		}
+	}
+	mutex_unlock(&session->control_lock);
+	if (remaining) {
+		mod_delayed_work(system_wq, &session->control_deadline_work,
+			remaining);
+		return;
+	}
+	if (!timed_out)
+		return;
+	mutex_lock(&session->control_lock);
+	if (session->control_state != IS_RDMA_CONTROL_STOPPING)
+		session->control_state = IS_RDMA_CONTROL_FAILED;
+	mutex_unlock(&session->control_lock);
+	atomic64_inc(&session->device->provider_timeouts_total);
+	is_force_qp_error(session);
+	is_rdma_fail(session, -ETIMEDOUT);
+}
+
+static void is_arm_control_deadline(struct is_rdma_session *session)
+{
+	session->control_deadline_expires = jiffies + msecs_to_jiffies(
+		session->device->provider_failure_deadline_ms);
+	session->control_deadline_armed = true;
+	mod_delayed_work(system_wq, &session->control_deadline_work,
+		msecs_to_jiffies(session->device->provider_failure_deadline_ms));
+}
+
+static void is_cancel_control_deadline(struct is_rdma_session *session)
+{
+	session->control_deadline_armed = false;
+	cancel_delayed_work(&session->control_deadline_work);
 }
 
 static void is_control_send_done(struct ib_cq *cq, struct ib_wc *wc)
@@ -356,6 +430,7 @@ static int is_send_hello(struct is_rdma_session *session)
 {
 	struct is_protocol_message *hello = &session->outbound_message;
 	size_t frame_size;
+	int ret;
 
 	memset(hello, 0, sizeof(*hello));
 	hello->header.major = IS_PROTOCOL_MAJOR;
@@ -383,8 +458,11 @@ static int is_send_hello(struct is_rdma_session *session)
 	session->hello_size = frame_size;
 	session->pending_request_id = hello->header.request_id;
 	session->control_state = IS_RDMA_CONTROL_WAIT_CHALLENGE;
-	return is_send_control_frame(session, session->hello_frame,
+	ret = is_send_control_frame(session, session->hello_frame,
 		session->hello_size);
+	if (!ret)
+		is_arm_control_deadline(session);
+	return ret;
 }
 
 static void is_hello_work(struct work_struct *work)
@@ -444,7 +522,10 @@ static int is_handle_challenge(struct is_rdma_session *session,
 	memzero_explicit(tag, sizeof(tag));
 	session->pending_request_id = auth->header.request_id;
 	session->control_state = IS_RDMA_CONTROL_WAIT_ACCEPT;
-	return is_encode_and_send(session, auth);
+	ret = is_encode_and_send(session, auth);
+	if (!ret)
+		is_arm_control_deadline(session);
+	return ret;
 }
 
 static void is_mark_session_ready(struct is_rdma_session *session,
@@ -454,6 +535,7 @@ static void is_mark_session_ready(struct is_rdma_session *session,
 	session->pending_request_id = 0;
 	session->control_state = IS_RDMA_CONTROL_READY;
 	session->ever_connected = true;
+	is_cancel_control_deadline(session);
 	WRITE_ONCE(session->device->last_error, 0);
 	atomic_set(&session->device->connection_state, IS_CONNECTION_CONNECTED);
 	queue_work(session->control_wq, &session->mapping_work);
@@ -463,6 +545,7 @@ static int is_handle_accept(struct is_rdma_session *session,
 			    const struct is_protocol_message *accept)
 {
 	struct is_protocol_message *request = &session->outbound_message;
+	int ret;
 
 	if (accept->header.major != IS_PROTOCOL_MAJOR ||
 	    accept->header.minor != session->negotiated_minor ||
@@ -481,7 +564,10 @@ static int is_handle_accept(struct is_rdma_session *session,
 		session->next_request_id++, false);
 	session->pending_request_id = request->header.request_id;
 	session->control_state = IS_RDMA_CONTROL_WAIT_STATUS;
-	return is_encode_and_send(session, request);
+	ret = is_encode_and_send(session, request);
+	if (!ret)
+		is_arm_control_deadline(session);
+	return ret;
 }
 
 static int is_handle_status(struct is_rdma_session *session,
@@ -691,6 +777,9 @@ static void is_receive_work(struct work_struct *work)
 		ret = -EPROTO;
 		goto out;
 	}
+	if (message->header.flags & IS_PROTOCOL_FLAG_RESPONSE &&
+	    message->header.request_id == session->pending_request_id)
+		is_cancel_control_deadline(session);
 	if (message->header.type == IS_PROTOCOL_MSG_ERROR) {
 		ret = -EREMOTEIO;
 		goto out;
@@ -789,6 +878,8 @@ static void is_mapping_work(struct work_struct *work)
 		chunk->state = IS_REMOTE_CHUNK_UNMAPPED;
 		spin_unlock_irqrestore(&session->chunk_lock, flags);
 		session->pending_request_id = 0;
+	} else {
+		is_arm_control_deadline(session);
 	}
 out:
 	mutex_unlock(&session->control_lock);
@@ -923,7 +1014,8 @@ static int is_rdma_cm_event(struct rdma_cm_id *id,
 	struct is_rdma_session *session = id->context;
 	int ret = 0;
 
-	if (READ_ONCE(session->stopping))
+	if (READ_ONCE(session->stopping) ||
+	    READ_ONCE(session->control_state) == IS_RDMA_CONTROL_FAILED)
 		return 0;
 	switch (event->event) {
 	case RDMA_CM_EVENT_ADDR_RESOLVED:
@@ -988,8 +1080,15 @@ int is_rdma_start(struct is_device *device)
 	unsigned int index;
 	int ret;
 
-	if (device->acknowledgement_policy !=
-	    IS_ACKNOWLEDGEMENT_POLICY_REMOTE_FIRST)
+	if (device->mode != IS_DEVICE_MODE_BACKED)
+		return 0;
+	if (device->acknowledgement_policy == IS_ACKNOWLEDGEMENT_POLICY_STRICT &&
+	    ((device->capacity_bytes % IS_CHUNK_BYTES) ||
+	     device->capacity_bytes > IS_CHUNK_BYTES * IS_MAX_REMOTE_CHUNKS ||
+	     !device->provider_address[0] || !device->provider_port ||
+	     !device->rdma_device[0] || !device->rdma_port ||
+	     !device->provider_key_id[0] ||
+	     device->provider_psk_size < IS_PSK_MIN_SIZE))
 		return 0;
 	session = is_kzalloc_numa(device, sizeof(*session), GFP_KERNEL);
 	if (!session)
@@ -1008,6 +1107,7 @@ int is_rdma_start(struct is_device *device)
 	init_waitqueue_head(&session->chunk_wait);
 	atomic_set(&session->send_busy, 0);
 	atomic_set(&session->rdma_reads_inflight, 0);
+	atomic_set(&session->operation_objects, 0);
 	atomic_set(&session->disconnect_started, 0);
 	for (index = 0; index < session->chunk_count; index++) {
 		atomic64_set(&session->chunks[index].activity, 0);
@@ -1032,6 +1132,8 @@ int is_rdma_start(struct is_device *device)
 	INIT_WORK(&session->mapping_work, is_mapping_work);
 	INIT_WORK(&session->release_work, is_release_work);
 	INIT_WORK(&session->failure_work, is_failure_work);
+	INIT_DELAYED_WORK(&session->control_deadline_work,
+		is_control_deadline);
 	session->cm_id = rdma_create_id(&init_net, is_rdma_cm_event, session,
 		RDMA_PS_TCP, IB_QPT_RC);
 	if (IS_ERR(session->cm_id)) {
@@ -1041,6 +1143,7 @@ int is_rdma_start(struct is_device *device)
 	}
 	device->rdma = session;
 	atomic_set(&device->connection_state, IS_CONNECTION_CONNECTING);
+	is_arm_control_deadline(session);
 	ret = is_resolve_provider(session);
 	if (ret)
 		is_rdma_fail(session, ret);
@@ -1062,6 +1165,8 @@ static void is_free_control_resources(struct is_rdma_session *session)
 	if (session->qp) {
 		if (session->qp_has_work)
 			ib_drain_qp(session->qp);
+		wait_event(session->chunk_wait,
+			!atomic_read(&session->operation_objects));
 		cancel_work_sync(&session->hello_work);
 		cancel_work_sync(&session->receive_work);
 		cancel_work_sync(&session->mapping_work);
@@ -1108,7 +1213,9 @@ void is_rdma_stop(struct is_device *device)
 	wake_up_all(&session->chunk_wait);
 	mutex_lock(&session->control_lock);
 	session->control_state = IS_RDMA_CONTROL_STOPPING;
+	session->control_deadline_armed = false;
 	mutex_unlock(&session->control_lock);
+	cancel_delayed_work_sync(&session->control_deadline_work);
 	cancel_work_sync(&session->connect_work);
 	if (session->connect_started &&
 	    atomic_cmpxchg(&session->disconnect_started, 0, 1) == 0)
@@ -1182,26 +1289,74 @@ bool is_rdma_range_valid(struct is_device *device, sector_t sector,
 	return valid;
 }
 
+static void is_operation_put(struct is_rdma_operation *operation)
+{
+	struct is_rdma_session *session = operation->session;
+
+	if (!refcount_dec_and_test(&operation->references))
+		return;
+	atomic_dec(&session->operation_objects);
+	wake_up_all(&session->chunk_wait);
+	kfree(operation);
+}
+
+static void is_set_operation_remote_valid(struct is_rdma_operation *operation,
+					  bool valid)
+{
+	struct is_rdma_session *session = operation->session;
+	unsigned long flags;
+
+	if (!operation->io->write)
+		return;
+	spin_lock_irqsave(&session->chunk_lock, flags);
+	if (valid)
+		bitmap_set(session->valid_sectors, operation->io->sector,
+			operation->io->bytes >> 9);
+	else
+		bitmap_clear(session->valid_sectors, operation->io->sector,
+			operation->io->bytes >> 9);
+	spin_unlock_irqrestore(&session->chunk_lock, flags);
+}
+
+static void is_operation_deadline(struct work_struct *work)
+{
+	struct is_rdma_operation *operation = container_of(
+		to_delayed_work(work), struct is_rdma_operation, deadline_work);
+	struct is_rdma_session *session = operation->session;
+
+	if (atomic_cmpxchg(&operation->callback_complete, 0, 1) == 0) {
+		atomic_set(&operation->timed_out, 1);
+		is_set_operation_remote_valid(operation, false);
+		atomic64_inc(&session->device->provider_timeouts_total);
+		is_force_qp_error(session);
+		is_rdma_fail(session, -ETIMEDOUT);
+		operation->io->complete(operation->io->context,
+			operation->io->generation, -ETIMEDOUT, true);
+	}
+	is_operation_put(operation);
+}
+
 static void is_complete_operation(struct is_rdma_operation *operation,
 				  int status)
 {
 	struct is_rdma_session *session = operation->session;
+	bool callback_ready;
+	bool remote_valid;
 	unsigned long flags;
 	unsigned int index;
 
-	if (atomic_cmpxchg(&operation->completed, 0, 1) != 0)
-		return;
+	callback_ready = atomic_cmpxchg(&operation->callback_complete, 0, 1) == 0;
+	if (cancel_delayed_work(&operation->deadline_work))
+		is_operation_put(operation);
 	for (index = 0; index < operation->mapped_segments; index++)
 		ib_dma_unmap_page(session->cm_id->device,
 			operation->dma_addresses[index],
 			operation->io->segments[index].length,
 			operation->direction);
-	if (!status && operation->io->write) {
-		spin_lock_irqsave(&session->chunk_lock, flags);
-		bitmap_set(session->valid_sectors, operation->io->sector,
-			operation->io->bytes >> 9);
-		spin_unlock_irqrestore(&session->chunk_lock, flags);
-	}
+	remote_valid = callback_ready && !status &&
+		atomic_read(&session->device->connection_state) ==
+			IS_CONNECTION_CONNECTED;
+	is_set_operation_remote_valid(operation, remote_valid);
 	if (!operation->io->write)
 		atomic_set(&session->rdma_reads_inflight, 0);
 	spin_lock_irqsave(&session->operation_lock, flags);
@@ -1209,18 +1364,25 @@ static void is_complete_operation(struct is_rdma_operation *operation,
 	spin_unlock_irqrestore(&session->operation_lock, flags);
 	atomic_dec(&operation->chunk->inflight);
 	wake_up_all(&session->chunk_wait);
-	operation->io->complete(operation->io->context, status);
-	kfree(operation);
+	if (callback_ready)
+		operation->io->complete(operation->io->context,
+			operation->io->generation, status, false);
+	else if (atomic_read(&operation->timed_out))
+		atomic64_inc(&session->device->late_rdma_completions_total);
+	operation->io->release(operation->io->context);
+	is_operation_put(operation);
 }
 
 static void is_data_completion(struct ib_cq *cq, struct ib_wc *wc)
 {
 	struct is_rdma_operation *operation = container_of(
 		wc->wr_cqe, struct is_rdma_operation, cqe);
+	int status = wc->status == IB_WC_SUCCESS ? 0 : -EIO;
 
 	(void)cq;
-	is_complete_operation(operation,
-		wc->status == IB_WC_SUCCESS ? 0 : -EIO);
+	if (status)
+		is_rdma_fail(operation->session, status);
+	is_complete_operation(operation, status);
 }
 
 int is_rdma_submit(struct is_device *device, struct is_rdma_io *io)
@@ -1236,7 +1398,8 @@ int is_rdma_submit(struct is_device *device, struct is_rdma_io *io)
 	bool read_claimed = false;
 	int ret;
 
-	if (!session || !io || !io->complete || !io->segment_count ||
+	if (!session || !io || !io->complete || !io->release ||
+	    !io->generation || !io->segment_count ||
 	    io->segment_count > IS_RDMA_MAX_SEGMENTS || !io->bytes ||
 	    (io->bytes & 511U) ||
 	    atomic_read(&device->connection_state) != IS_CONNECTION_CONNECTED)
@@ -1261,6 +1424,9 @@ int is_rdma_submit(struct is_device *device, struct is_rdma_io *io)
 		goto release_read;
 	}
 	atomic_inc(&chunk->inflight);
+	if (io->write)
+		bitmap_clear(session->valid_sectors, io->sector,
+			io->bytes >> 9);
 	remote_offset = ((u64)io->sector % IS_SECTORS_PER_CHUNK) << 9;
 	spin_unlock_irqrestore(&session->chunk_lock, flags);
 
@@ -1275,7 +1441,9 @@ int is_rdma_submit(struct is_device *device, struct is_rdma_io *io)
 	operation->logical_chunk_id = logical_chunk;
 	operation->direction = io->write ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
 	operation->cqe.done = is_data_completion;
-	atomic_set(&operation->completed, 0);
+	atomic_set(&operation->callback_complete, 0);
+	atomic_set(&operation->timed_out, 0);
+	INIT_DELAYED_WORK(&operation->deadline_work, is_operation_deadline);
 	INIT_LIST_HEAD(&operation->list);
 	for (index = 0; index < io->segment_count; index++) {
 		u64 dma_address = ib_dma_map_page(session->cm_id->device,
@@ -1300,12 +1468,23 @@ int is_rdma_submit(struct is_device *device, struct is_rdma_io *io)
 	operation->wr.wr.send_flags = IB_SEND_SIGNALED;
 	operation->wr.remote_addr = chunk->remote_address + remote_offset;
 	operation->wr.rkey = chunk->remote_key;
+	refcount_set(&operation->references, 3);
+	atomic_inc(&session->operation_objects);
 	spin_lock_irqsave(&session->operation_lock, flags);
 	list_add_tail(&operation->list, &session->operations);
 	spin_unlock_irqrestore(&session->operation_lock, flags);
 	ret = ib_post_send(session->qp, &operation->wr.wr, &bad_wr);
-	if (!ret)
+	if (!ret) {
+		if (atomic_read(&operation->callback_complete)) {
+			is_operation_put(operation);
+		} else {
+			schedule_delayed_work(&operation->deadline_work,
+				msecs_to_jiffies(
+					device->provider_failure_deadline_ms));
+		}
+		is_operation_put(operation);
 		return 0;
+	}
 	spin_lock_irqsave(&session->operation_lock, flags);
 	list_del(&operation->list);
 	spin_unlock_irqrestore(&session->operation_lock, flags);
@@ -1316,7 +1495,13 @@ unmap_segments:
 			operation->dma_addresses[index],
 			io->segments[index].length, operation->direction);
 	}
-	kfree(operation);
+	if (refcount_read(&operation->references)) {
+		is_operation_put(operation);
+		is_operation_put(operation);
+		is_operation_put(operation);
+	} else {
+		kfree(operation);
+	}
 release_chunk:
 	atomic_dec(&chunk->inflight);
 	wake_up_all(&session->chunk_wait);

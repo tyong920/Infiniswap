@@ -21,9 +21,12 @@ struct is_rdma_io {
 	unsigned int bytes;
 	unsigned int segment_count;
 	bool write;
+	u64 generation;
 	struct is_rdma_io_segment segments[IS_RDMA_MAX_SEGMENTS];
 	void *context;
-	void (*complete)(void *context, int status);
+	void (*complete)(void *context, u64 generation, int status,
+			 bool cancelled);
+	void (*release)(void *context);
 };
 
 int is_rdma_start(struct is_device *device);

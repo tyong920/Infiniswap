@@ -221,6 +221,7 @@ def _device_status(name: str, system: Any) -> Dict[str, Any]:
     write_weight = int(system.read_attribute(name, "hot_range_write_weight"))
     mapped_hot_ranges = int(system.read_attribute(name, "mapped_hot_ranges"))
     connection_state = system.read_attribute(name, "connection_state")
+    backing_state = system.read_attribute(name, "backing_state")
     remote_capacity_bytes = int(system.read_attribute(name, "remote_capacity_bytes"))
     provider_names = sorted(
         filter(None, system.read_attribute(name, "providers").split(","))
@@ -238,8 +239,22 @@ def _device_status(name: str, system: Any) -> Dict[str, Any]:
             "errno": positive_error,
         }
 
+    metrics = {
+        metric: int(system.read_attribute(name, metric))
+        for metric in (
+            "backing_degraded_transitions_total",
+            "backing_failures_total",
+            "backing_invalid_sectors",
+            "backing_retries_total",
+            "late_rdma_completions_total",
+            "local_only_writes_total",
+            "provider_timeouts_total",
+            "rejected_writes_total",
+        )
+    }
+
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "kind": "infiniswap.device-status",
         "device": {
             "name": name,
@@ -247,6 +262,7 @@ def _device_status(name: str, system: Any) -> Dict[str, Any]:
             "lifecycle": lifecycle,
             "mode": mode,
             "acknowledgement_policy": policy,
+            "operational_state": backing_state,
             "provider_failure_deadline_ms": deadline_ms,
             "swap": {
                 "configured_priority": configured_priority,
@@ -275,6 +291,7 @@ def _device_status(name: str, system: Any) -> Dict[str, Any]:
             "write_weight": write_weight,
             "mapped_hot_ranges": mapped_hot_ranges,
         },
+        "metrics": metrics,
         "last_error": last_error,
     }
 
@@ -318,6 +335,23 @@ def _print_status(status: Dict[str, Any], json_output: bool, stdout: IO[str]) ->
         )
     else:
         print("  swap: disabled", file=stdout)
+    backing_suffix = (
+        " (new writes rejected)"
+        if device["operational_state"] == "backing-degraded"
+        else ""
+    )
+    print(
+        "  backing: %s%s" % (device["operational_state"], backing_suffix),
+        file=stdout,
+    )
+    print(
+        "  backing failures/retries: %d/%d"
+        % (
+            status["metrics"]["backing_failures_total"],
+            status["metrics"]["backing_retries_total"],
+        ),
+        file=stdout,
+    )
     print(
         "  connection: %s (%d/%d Providers healthy)"
         % (

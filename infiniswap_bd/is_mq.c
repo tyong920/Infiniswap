@@ -4,6 +4,7 @@
  * Copyright 2014 Oren Kishon
  * Copyright (c) 2013 Mellanox Technologies. All rights reserved.
  */
+#include <linux/bitmap.h>
 #include <linux/ctype.h>
 #include <linux/fs.h>
 #include <linux/highmem.h>
@@ -12,6 +13,7 @@
 #include <linux/refcount.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/vmalloc.h>
 
 #include "infiniswap.h"
 #include "is_io_policy.h"
@@ -46,11 +48,22 @@ void is_device_init(struct is_device *device, const char *name)
 	mutex_init(&device->configfs_lock);
 	mutex_init(&device->lifecycle_lock);
 	spin_lock_init(&device->io_lock);
+	spin_lock_init(&device->backing_lock);
 	init_waitqueue_head(&device->drain_wait);
 	atomic_set(&device->openers, 0);
 	atomic_set(&device->inflight, 0);
 	atomic_set(&device->connection_state, IS_CONNECTION_NOT_CONNECTED);
+	atomic_set(&device->backing_state, IS_BACKING_HEALTHY);
 	atomic_set(&device->mapped_hot_ranges, 0);
+	atomic64_set(&device->next_io_generation, 0);
+	atomic64_set(&device->backing_failures_total, 0);
+	atomic64_set(&device->backing_retries_total, 0);
+	atomic64_set(&device->backing_degraded_transitions_total, 0);
+	atomic64_set(&device->provider_timeouts_total, 0);
+	atomic64_set(&device->late_rdma_completions_total, 0);
+	atomic64_set(&device->rejected_writes_total, 0);
+	atomic64_set(&device->local_only_writes_total, 0);
+	atomic64_set(&device->backing_invalid_sectors, 0);
 	device->mode = IS_DEVICE_MODE_UNSET;
 	device->acknowledgement_policy = IS_ACKNOWLEDGEMENT_POLICY_STRICT;
 	device->provider_failure_deadline_ms =
@@ -517,6 +530,65 @@ const char *is_device_state_name(struct is_device *device)
 	return name;
 }
 
+const char *is_device_backing_state_name(struct is_device *device)
+{
+	return atomic_read(&device->backing_state) == IS_BACKING_DEGRADED ?
+		"backing-degraded" : "healthy";
+}
+
+static bool is_backing_range_valid(struct is_device *device, sector_t sector,
+				   unsigned int bytes)
+{
+	unsigned long flags;
+	unsigned long sector_count = bytes >> 9;
+	bool valid;
+
+	if (!device->backing_invalid_bitmap || !bytes || (bytes & 511U))
+		return false;
+	spin_lock_irqsave(&device->backing_lock, flags);
+	valid = find_next_bit(device->backing_invalid_bitmap,
+		sector + sector_count, sector) >= sector + sector_count;
+	spin_unlock_irqrestore(&device->backing_lock, flags);
+	return valid;
+}
+
+static void is_mark_backing_invalid(struct is_device *device, sector_t sector,
+				    unsigned int bytes)
+{
+	unsigned long flags;
+	unsigned long sector_count = bytes >> 9;
+	unsigned long index;
+	u64 newly_invalid = 0;
+
+	if (!device->backing_invalid_bitmap || !bytes || (bytes & 511U))
+		return;
+	spin_lock_irqsave(&device->backing_lock, flags);
+	for (index = sector; index < sector + sector_count; index++) {
+		if (!test_bit(index, device->backing_invalid_bitmap)) {
+			__set_bit(index, device->backing_invalid_bitmap);
+			newly_invalid++;
+		}
+	}
+	spin_unlock_irqrestore(&device->backing_lock, flags);
+	atomic64_add(newly_invalid, &device->backing_invalid_sectors);
+}
+
+static void is_degrade_backing(struct is_device *device, sector_t sector,
+			       unsigned int bytes, int error)
+{
+	is_mark_backing_invalid(device, sector, bytes);
+	atomic64_inc(&device->backing_failures_total);
+	if (atomic_cmpxchg(&device->backing_state, IS_BACKING_HEALTHY,
+			   IS_BACKING_DEGRADED) == IS_BACKING_HEALTHY)
+		atomic64_inc(&device->backing_degraded_transitions_total);
+	WRITE_ONCE(device->last_error, error > 0 ? error : EIO);
+}
+
+static bool is_backing_healthy(struct is_device *device)
+{
+	return atomic_read(&device->backing_state) == IS_BACKING_HEALTHY;
+}
+
 static bool is_backing_device_allowed(dev_t dev)
 {
 	return MAJOR(dev) != LOOP_MAJOR && MAJOR(dev) != is_major;
@@ -668,6 +740,11 @@ static void is_end_request(struct is_request_ctx *ctx, blk_status_t status)
 		return;
 
 	status = (__force blk_status_t)atomic_read(&ctx->status);
+	if (atomic_read(&ctx->backing_io_failed))
+		is_degrade_backing(device, blk_rq_pos(request),
+			blk_rq_bytes(request), EIO);
+	else if (req_op(request) == REQ_OP_WRITE && status == BLK_STS_OK)
+		atomic64_inc(&device->local_only_writes_total);
 	blk_mq_end_request(request, status);
 	is_finish_inflight(device);
 }
@@ -677,6 +754,8 @@ static void is_backing_end_io(struct bio *bio)
 	struct is_request_ctx *ctx = bio->bi_private;
 	blk_status_t status = bio->bi_status;
 
+	if (status != BLK_STS_OK)
+		atomic_set(&ctx->backing_io_failed, 1);
 	bio_put(bio);
 	is_end_request(ctx, status);
 }
@@ -699,12 +778,16 @@ static struct bio *is_clone_bio(struct is_device *device, struct bio *source)
 struct is_remote_request {
 	struct is_device *device;
 	struct request *request;
+	sector_t sector;
+	unsigned int bytes;
+	unsigned int command_flags;
 	spinlock_t policy_lock;
 	refcount_t references;
 	struct is_io_policy policy;
 	atomic_t pending_bios;
 	atomic_t local_status;
-	struct work_struct fallback_work;
+	unsigned int backing_retries;
+	struct work_struct local_work;
 	struct is_rdma_io rdma_io;
 	struct page *owned_pages[IS_RDMA_MAX_SEGMENTS];
 	unsigned int owned_page_count;
@@ -728,40 +811,51 @@ static void is_remote_local_complete(struct is_remote_request *remote,
 				     blk_status_t status);
 static void is_remote_path_complete(struct is_remote_request *remote,
 				    bool remote_path,
-				    blk_status_t status);
+				    blk_status_t status, bool cancelled);
 
 static void is_remote_apply_action(struct is_remote_request *remote,
 				   enum is_io_action action,
 				   blk_status_t completion_status)
 {
-	if (action == IS_IO_SUBMIT_LOCAL) {
+	if (action & IS_IO_BACKING_DEGRADED)
+		is_degrade_backing(remote->device, remote->sector,
+			remote->bytes, EIO);
+	if (action & IS_IO_MARK_LOCAL_ONLY)
+		atomic64_inc(&remote->device->local_only_writes_total);
+	if (action & IS_IO_SUBMIT_LOCAL) {
 		refcount_inc(&remote->references);
 		if (!queue_work(remote->device->ordered_backing_wq,
-				&remote->fallback_work))
-			is_remote_path_complete(remote, false, BLK_STS_IOERR);
-	} else if (action == IS_IO_COMPLETE_SUCCESS) {
-		blk_mq_end_request(remote->request, BLK_STS_OK);
-	} else if (action == IS_IO_COMPLETE_ERROR) {
-		blk_mq_end_request(remote->request, completion_status);
+				&remote->local_work))
+			is_remote_path_complete(remote, false, BLK_STS_IOERR,
+				false);
 	}
+	if (action & IS_IO_COMPLETE_SUCCESS)
+		blk_mq_end_request(remote->request, BLK_STS_OK);
+	else if (action & IS_IO_COMPLETE_ERROR)
+		blk_mq_end_request(remote->request, completion_status);
 }
 
 static void is_remote_path_complete(struct is_remote_request *remote,
 				    bool remote_path,
-				    blk_status_t status)
+				    blk_status_t status, bool cancelled)
 {
 	enum is_io_action action;
 	blk_status_t completion_status = status;
 	unsigned long flags;
 
 	spin_lock_irqsave(&remote->policy_lock, flags);
-	if (remote_path)
-		action = is_io_policy_remote_complete(&remote->policy,
-			(__force int)status);
-	else
+	if (remote_path) {
+		if (cancelled)
+			action = is_io_policy_cancel_remote(&remote->policy,
+				remote->rdma_io.generation, (__force int)status);
+		else
+			action = is_io_policy_remote_complete(&remote->policy,
+				remote->rdma_io.generation, (__force int)status);
+	} else {
 		action = is_io_policy_local_complete(&remote->policy,
 			(__force int)status);
-	if (action == IS_IO_COMPLETE_ERROR) {
+	}
+	if (action & IS_IO_COMPLETE_ERROR) {
 		if (remote->policy.local_done)
 			completion_status = (__force blk_status_t)
 				remote->policy.local_status;
@@ -771,18 +865,52 @@ static void is_remote_path_complete(struct is_remote_request *remote,
 	}
 	spin_unlock_irqrestore(&remote->policy_lock, flags);
 
-	if (!remote_path && status != BLK_STS_OK)
-		WRITE_ONCE(remote->device->last_error, EIO);
 	is_remote_apply_action(remote, action, completion_status);
 	is_remote_request_put(remote);
 }
 
-static void is_remote_rdma_complete(void *context, int status)
+static int is_copy_owned_pages_to_request(struct is_remote_request *remote)
+{
+	struct req_iterator iterator;
+	struct bio_vec segment;
+	unsigned int index = 0;
+
+	rq_for_each_segment(segment, remote->request, iterator) {
+		void *destination;
+		void *source;
+
+		if (index >= remote->owned_page_count ||
+		    segment.bv_len != remote->rdma_io.segments[index].length)
+			return -EIO;
+		destination = kmap_local_page(segment.bv_page);
+		source = kmap_local_page(remote->owned_pages[index]);
+		memcpy((u8 *)destination + segment.bv_offset, source,
+			segment.bv_len);
+		kunmap_local(source);
+		kunmap_local(destination);
+		index++;
+	}
+	return index == remote->owned_page_count ? 0 : -EIO;
+}
+
+static void is_remote_rdma_complete(void *context, u64 generation, int status,
+				    bool cancelled)
 {
 	struct is_remote_request *remote = context;
 
+	if (generation != remote->rdma_io.generation) {
+		is_remote_request_put(remote);
+		return;
+	}
+	if (!status && !cancelled && !remote->rdma_io.write)
+		status = is_copy_owned_pages_to_request(remote);
 	is_remote_path_complete(remote, true,
-		status ? errno_to_blk_status(status) : BLK_STS_OK);
+		status ? errno_to_blk_status(status) : BLK_STS_OK, cancelled);
+}
+
+static void is_remote_transport_release(void *context)
+{
+	is_remote_request_put(context);
 }
 
 static void is_remote_local_complete(struct is_remote_request *remote,
@@ -794,7 +922,7 @@ static void is_remote_local_complete(struct is_remote_request *remote,
 	if (!atomic_dec_and_test(&remote->pending_bios))
 		return;
 	status = (__force blk_status_t)atomic_read(&remote->local_status);
-	is_remote_path_complete(remote, false, status);
+	is_remote_path_complete(remote, false, status, false);
 }
 
 static void is_remote_backing_end_io(struct bio *bio)
@@ -803,6 +931,15 @@ static void is_remote_backing_end_io(struct bio *bio)
 	blk_status_t status = bio->bi_status;
 
 	bio_put(bio);
+	if (status != BLK_STS_OK && remote->rdma_io.write &&
+	    remote->policy.kind == IS_IO_POLICY_REMOTE_FIRST_WRITE &&
+	    remote->backing_retries < IS_BACKING_RETRY_LIMIT) {
+		remote->backing_retries++;
+		atomic64_inc(&remote->device->backing_retries_total);
+		if (queue_work(remote->device->ordered_backing_wq,
+			       &remote->local_work))
+			return;
+	}
 	is_remote_local_complete(remote, status);
 }
 
@@ -812,22 +949,53 @@ static struct bio *is_alloc_owned_bio(struct is_remote_request *remote)
 
 #ifdef INFINISWAP_HAVE_BIO_ALLOC_CLONE
 	bio = bio_alloc_bioset(remote->device->backing_bdev,
-		remote->owned_page_count, remote->request->cmd_flags, GFP_NOIO,
+		remote->owned_page_count, remote->command_flags, GFP_NOIO,
 		&remote->device->bio_set);
 #else
 	bio = bio_alloc_bioset(GFP_NOIO, remote->owned_page_count,
 		&remote->device->bio_set);
 	if (bio) {
 		bio_set_dev(bio, remote->device->backing_bdev);
-		bio->bi_opf = remote->request->cmd_flags;
+		bio->bi_opf = remote->command_flags;
 	}
 #endif
 	if (bio)
-		bio->bi_iter.bi_sector = blk_rq_pos(remote->request);
+		bio->bi_iter.bi_sector = remote->sector;
 	return bio;
 }
 
-static int is_copy_request_to_owned_pages(struct is_remote_request *remote)
+static struct bio *is_build_owned_bio(struct is_remote_request *remote)
+{
+	struct bio *bio = is_alloc_owned_bio(remote);
+	unsigned int index;
+
+	if (!bio)
+		return NULL;
+	for (index = 0; index < remote->owned_page_count; index++) {
+		unsigned int length = remote->rdma_io.segments[index].length;
+
+		if (bio_add_page(bio, remote->owned_pages[index], length, 0) !=
+		    length) {
+			bio_put(bio);
+			return NULL;
+		}
+	}
+	bio->bi_private = remote;
+	bio->bi_end_io = is_remote_backing_end_io;
+	return bio;
+}
+
+static int is_submit_owned_backing_write(struct is_remote_request *remote)
+{
+	struct bio *bio = is_build_owned_bio(remote);
+
+	if (!bio)
+		return -ENOMEM;
+	submit_bio_noacct(bio);
+	return 0;
+}
+
+static int is_prepare_owned_pages(struct is_remote_request *remote, bool copy)
 {
 	struct req_iterator iterator;
 	struct bio_vec segment;
@@ -835,8 +1003,6 @@ static int is_copy_request_to_owned_pages(struct is_remote_request *remote)
 
 	rq_for_each_segment(segment, remote->request, iterator) {
 		struct page *page;
-		void *destination;
-		void *source;
 
 		if (remote->owned_page_count == IS_RDMA_MAX_SEGMENTS ||
 		    segment.bv_len > PAGE_SIZE)
@@ -848,12 +1014,15 @@ static int is_copy_request_to_owned_pages(struct is_remote_request *remote)
 		if (!page)
 			return -ENOMEM;
 		remote->owned_pages[remote->owned_page_count] = page;
-		destination = kmap_local_page(page);
-		source = kmap_local_page(segment.bv_page);
-		memcpy(destination, (u8 *)source + segment.bv_offset,
-			segment.bv_len);
-		kunmap_local(source);
-		kunmap_local(destination);
+		if (copy) {
+			void *destination = kmap_local_page(page);
+			void *source = kmap_local_page(segment.bv_page);
+
+			memcpy(destination, (u8 *)source + segment.bv_offset,
+				segment.bv_len);
+			kunmap_local(source);
+			kunmap_local(destination);
+		}
 		remote->rdma_io.segments[remote->owned_page_count].page = page;
 		remote->rdma_io.segments[remote->owned_page_count].offset = 0;
 		remote->rdma_io.segments[remote->owned_page_count].length =
@@ -862,27 +1031,8 @@ static int is_copy_request_to_owned_pages(struct is_remote_request *remote)
 		copied += segment.bv_len;
 	}
 	remote->rdma_io.segment_count = remote->owned_page_count;
-	return copied == blk_rq_bytes(remote->request) ? 0 : -EIO;
-}
-
-static int is_reference_request_pages(struct is_remote_request *remote)
-{
-	struct req_iterator iterator;
-	struct bio_vec segment;
-	unsigned int count = 0;
-	unsigned int bytes = 0;
-
-	rq_for_each_segment(segment, remote->request, iterator) {
-		if (count == IS_RDMA_MAX_SEGMENTS || segment.bv_len > PAGE_SIZE)
-			return -E2BIG;
-		remote->rdma_io.segments[count].page = segment.bv_page;
-		remote->rdma_io.segments[count].offset = segment.bv_offset;
-		remote->rdma_io.segments[count].length = segment.bv_len;
-		count++;
-		bytes += segment.bv_len;
-	}
-	remote->rdma_io.segment_count = count;
-	return count && bytes == blk_rq_bytes(remote->request) ? 0 : -EIO;
+	return remote->owned_page_count &&
+		copied == blk_rq_bytes(remote->request) ? 0 : -EIO;
 }
 
 static struct is_remote_request *is_alloc_remote_request(
@@ -900,23 +1050,40 @@ static struct is_remote_request *is_alloc_remote_request(
 		return NULL;
 	remote->device = device;
 	remote->request = request;
+	remote->sector = blk_rq_pos(request);
+	remote->bytes = blk_rq_bytes(request);
+	remote->command_flags = request->cmd_flags;
 	spin_lock_init(&remote->policy_lock);
-	remote->rdma_io.sector = blk_rq_pos(request);
-	remote->rdma_io.bytes = blk_rq_bytes(request);
+	remote->rdma_io.sector = remote->sector;
+	remote->rdma_io.bytes = remote->bytes;
+	remote->rdma_io.generation = atomic64_inc_return(
+		&device->next_io_generation);
 	remote->rdma_io.context = remote;
 	remote->rdma_io.complete = is_remote_rdma_complete;
+	remote->rdma_io.release = is_remote_transport_release;
 	return remote;
 }
 
-static void is_submit_remote_fallback_work(struct work_struct *work)
+static void is_submit_remote_local_work(struct work_struct *work)
 {
 	struct is_remote_request *remote = container_of(
-		work, struct is_remote_request, fallback_work);
+		work, struct is_remote_request, local_work);
 	struct bio *source;
 	blk_status_t status = BLK_STS_OK;
 
+	if (remote->rdma_io.write) {
+		if (is_submit_owned_backing_write(remote))
+			is_remote_local_complete(remote, BLK_STS_RESOURCE);
+		return;
+	}
 	atomic_set(&remote->local_status, BLK_STS_OK);
 	atomic_set(&remote->pending_bios, 1);
+	if (!is_backing_range_valid(remote->device, remote->sector,
+				    remote->bytes)) {
+		is_remote_local_complete(remote, BLK_STS_IOERR);
+		return;
+	}
+
 	for (source = remote->request->bio; source; source = source->bi_next) {
 		struct bio *clone = is_clone_bio(remote->device, source);
 
@@ -939,24 +1106,32 @@ static bool is_dispatch_remote_read(struct is_device *device,
 {
 	struct is_remote_request *remote =
 		is_alloc_remote_request(device, request);
+	u64 generation;
 	int ret;
 
 	if (!remote)
 		return false;
-	INIT_WORK(&remote->fallback_work, is_submit_remote_fallback_work);
-	ret = is_reference_request_pages(remote);
-	if (ret) {
-		kfree(remote);
-		return false;
-	}
-	remote->rdma_io.write = false;
-	is_io_policy_init_remote_read(&remote->policy);
-	refcount_set(&remote->references, 2);
-	ret = is_rdma_submit(device, &remote->rdma_io);
+	INIT_WORK(&remote->local_work, is_submit_remote_local_work);
+	ret = is_prepare_owned_pages(remote, false);
 	if (ret)
-		is_remote_rdma_complete(remote, ret);
+		goto free_remote;
+	remote->rdma_io.write = false;
+	generation = remote->rdma_io.generation;
+	is_io_policy_init_remote_read(&remote->policy, generation);
+	refcount_set(&remote->references, 3);
+	ret = is_rdma_submit(device, &remote->rdma_io);
+	if (ret) {
+		is_remote_transport_release(remote);
+		is_remote_rdma_complete(remote, generation, ret, false);
+	}
 	is_remote_request_put(remote);
 	return true;
+
+free_remote:
+	while (remote->owned_page_count)
+		__free_page(remote->owned_pages[--remote->owned_page_count]);
+	kfree(remote);
+	return false;
 }
 
 static bool is_dispatch_remote_write(struct is_device *device,
@@ -965,39 +1140,37 @@ static bool is_dispatch_remote_write(struct is_device *device,
 	struct is_remote_request *remote =
 		is_alloc_remote_request(device, request);
 	struct bio *bio;
+	enum is_io_policy_kind kind;
+	u64 generation;
 	unsigned int index;
 	int ret;
 
 	if (!remote)
 		return false;
-	ret = is_copy_request_to_owned_pages(remote);
+	INIT_WORK(&remote->local_work, is_submit_remote_local_work);
+	ret = is_prepare_owned_pages(remote, true);
 	if (ret)
 		goto free_remote;
-	bio = is_alloc_owned_bio(remote);
+	bio = is_build_owned_bio(remote);
 	if (!bio)
 		goto free_remote;
-	for (index = 0; index < remote->owned_page_count; index++) {
-		unsigned int length = remote->rdma_io.segments[index].length;
-
-		if (bio_add_page(bio, remote->owned_pages[index], length, 0) !=
-		    length) {
-			bio_put(bio);
-			goto free_remote;
-		}
-	}
-	bio->bi_private = remote;
-	bio->bi_end_io = is_remote_backing_end_io;
 	remote->rdma_io.write = true;
-	is_io_policy_init_remote_first_write(&remote->policy);
-	refcount_set(&remote->references, 3);
+	generation = remote->rdma_io.generation;
+	kind = device->acknowledgement_policy ==
+		IS_ACKNOWLEDGEMENT_POLICY_REMOTE_FIRST ?
+		IS_IO_POLICY_REMOTE_FIRST_WRITE : IS_IO_POLICY_STRICT_WRITE;
+	is_io_policy_init_write(&remote->policy, kind, generation);
+	refcount_set(&remote->references, 4);
 	atomic_set(&remote->local_status, BLK_STS_OK);
 	atomic_set(&remote->pending_bios, 1);
 
-	/* Remote-First may report only after this backing write is submitted. */
+	/* Both policies require the Backing Store write to be submitted first. */
 	submit_bio_noacct(bio);
 	ret = is_rdma_submit(device, &remote->rdma_io);
-	if (ret)
-		is_remote_rdma_complete(remote, ret);
+	if (ret) {
+		is_remote_transport_release(remote);
+		is_remote_rdma_complete(remote, generation, ret, false);
+	}
 	is_remote_request_put(remote);
 	return true;
 
@@ -1042,6 +1215,7 @@ static void is_submit_to_backing_store(struct is_device *device,
 	blk_status_t status = BLK_STS_OK;
 
 	atomic_set(&ctx->status, BLK_STS_OK);
+	atomic_set(&ctx->backing_io_failed, 0);
 	/* The sentinel keeps the request alive while clones are submitted. */
 	atomic_set(&ctx->pending_bios, 1);
 
@@ -1063,16 +1237,26 @@ static void is_submit_to_backing_store(struct is_device *device,
 	is_end_request(ctx, status);
 }
 
-static bool is_accept_request(struct is_device *device)
+static bool is_accept_request(struct is_device *device,
+			      struct request *request)
 {
 	unsigned long flags;
+	bool write = req_op(request) == REQ_OP_WRITE ||
+		req_op(request) == REQ_OP_FLUSH;
+	bool rejected_degraded = false;
 	bool accepted;
 
 	spin_lock_irqsave(&device->io_lock, flags);
 	accepted = device->accepting_io;
+	if (accepted && write && !is_backing_healthy(device)) {
+		accepted = false;
+		rejected_degraded = true;
+	}
 	if (accepted)
 		atomic_inc(&device->inflight);
 	spin_unlock_irqrestore(&device->io_lock, flags);
+	if (rejected_degraded)
+		atomic64_inc(&device->rejected_writes_total);
 	return accepted;
 }
 
@@ -1081,6 +1265,8 @@ static void is_issue_flush(struct is_device *device, struct request *request)
 	blk_status_t status = errno_to_blk_status(
 		blkdev_issue_flush(device->backing_bdev));
 
+	if (status != BLK_STS_OK)
+		is_degrade_backing(device, 0, 0, EIO);
 	is_complete_accepted_request(device, request, status);
 }
 
@@ -1091,14 +1277,17 @@ static void is_dispatch_backing_work(struct work_struct *work)
 	struct is_device *device = ctx->device;
 	struct request *request = ctx->request;
 
-	if (req_op(request) == REQ_OP_FLUSH)
+	if (req_op(request) == REQ_OP_FLUSH) {
 		is_issue_flush(device, request);
-	else if (device->acknowledgement_policy ==
-			 IS_ACKNOWLEDGEMENT_POLICY_REMOTE_FIRST &&
-		 is_dispatch_remote(device, request))
+	} else if (is_dispatch_remote(device, request)) {
 		return;
-	else
+	} else if (req_op(request) == REQ_OP_READ &&
+		   !is_backing_range_valid(device, blk_rq_pos(request),
+			blk_rq_bytes(request))) {
+		is_complete_accepted_request(device, request, BLK_STS_IOERR);
+	} else {
 		is_submit_to_backing_store(device, request);
+	}
 }
 
 static blk_status_t is_queue_rq(struct blk_mq_hw_ctx *hctx,
@@ -1115,7 +1304,7 @@ static blk_status_t is_queue_rq(struct blk_mq_hw_ctx *hctx,
 		blk_mq_end_request(request, BLK_STS_NOTSUPP);
 		return BLK_STS_OK;
 	}
-	if (!is_accept_request(device)) {
+	if (!is_accept_request(device, request)) {
 		blk_mq_end_request(request, BLK_STS_IOERR);
 		return BLK_STS_OK;
 	}
@@ -1258,6 +1447,9 @@ static void is_release_resources(struct is_device *device)
 		bioset_exit(&device->bio_set);
 		device->bioset_initialized = false;
 	}
+	kvfree(device->backing_invalid_bitmap);
+	device->backing_invalid_bitmap = NULL;
+	atomic64_set(&device->backing_invalid_sectors, 0);
 	if (device->minor >= 0) {
 		is_minor_free(device->minor);
 		device->minor = -1;
@@ -1290,6 +1482,10 @@ int is_device_activate(struct is_device *device)
 	mutex_lock(&device->lifecycle_lock);
 	if (!is_device_configurable(device)) {
 		ret = device->state == IS_DEVICE_ACTIVE ? -EALREADY : -EINVAL;
+		goto out;
+	}
+	if (!is_backing_healthy(device)) {
+		ret = -EUCLEAN;
 		goto out;
 	}
 	if (device->mode != IS_DEVICE_MODE_BACKED ||
@@ -1325,6 +1521,15 @@ int is_device_activate(struct is_device *device)
 	if (ret)
 		goto release_resources;
 	device->bioset_initialized = true;
+
+	device->backing_invalid_bitmap = kvcalloc(
+		BITS_TO_LONGS(device->capacity_sectors), sizeof(unsigned long),
+		GFP_KERNEL);
+	if (!device->backing_invalid_bitmap) {
+		ret = -ENOMEM;
+		goto release_resources;
+	}
+	atomic64_set(&device->backing_invalid_sectors, 0);
 
 	device->ordered_backing_wq = alloc_ordered_workqueue("infiniswap-io",
 							WQ_MEM_RECLAIM);

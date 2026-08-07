@@ -37,6 +37,7 @@
 #define IS_HOT_RANGE_THRESHOLD_DEFAULT 8U
 #define IS_HOT_RANGE_READ_WEIGHT_DEFAULT 1U
 #define IS_HOT_RANGE_WRITE_WEIGHT_DEFAULT 4U
+#define IS_BACKING_RETRY_LIMIT 1U
 #define IS_REMOTE_CHUNK_BYTES (1ULL << 30)
 #define IS_MAX_REMOTE_CHUNKS IS_PROTOCOL_MAX_CHUNKS_PER_FRAME
 
@@ -68,11 +69,17 @@ enum is_connection_state {
 	IS_CONNECTION_DEGRADED,
 };
 
+enum is_backing_state {
+	IS_BACKING_HEALTHY = 0,
+	IS_BACKING_DEGRADED,
+};
+
 struct is_device {
 	struct config_group group;
 	struct mutex configfs_lock;
 	struct mutex lifecycle_lock;
 	spinlock_t io_lock;
+	spinlock_t backing_lock;
 	enum is_device_mode mode;
 	enum is_acknowledgement_policy acknowledgement_policy;
 	enum is_device_state state;
@@ -107,7 +114,18 @@ struct is_device {
 	atomic_t openers;
 	atomic_t inflight;
 	atomic_t connection_state;
+	atomic_t backing_state;
 	atomic_t mapped_hot_ranges;
+	atomic64_t next_io_generation;
+	atomic64_t backing_failures_total;
+	atomic64_t backing_retries_total;
+	atomic64_t backing_degraded_transitions_total;
+	atomic64_t provider_timeouts_total;
+	atomic64_t late_rdma_completions_total;
+	atomic64_t rejected_writes_total;
+	atomic64_t local_only_writes_total;
+	atomic64_t backing_invalid_sectors;
+	unsigned long *backing_invalid_bitmap;
 	wait_queue_head_t drain_wait;
 	struct block_device *backing_bdev;
 #ifdef INFINISWAP_HAVE_BDEV_HANDLE
@@ -125,6 +143,7 @@ struct is_request_ctx {
 	struct request *request;
 	atomic_t pending_bios;
 	atomic_t status;
+	atomic_t backing_io_failed;
 	struct work_struct work;
 };
 
@@ -171,6 +190,7 @@ int is_device_set_provider_psk(struct is_device *device, const char *buf,
 int is_device_set_swap_priority(struct is_device *device, const char *buf,
 				size_t count);
 const char *is_device_state_name(struct is_device *device);
+const char *is_device_backing_state_name(struct is_device *device);
 int is_device_set_backing_store(struct is_device *device, const char *buf,
 				size_t count);
 int is_device_set_capacity(struct is_device *device, const char *buf,

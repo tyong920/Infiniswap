@@ -12,14 +12,15 @@ The current supported build targets are:
 
 The current Memory Consumer milestone exposes a Backed Mode Infiniswap Device
 that can connect to one authenticated Memory Provider over one configured RC
-RDMA Rail. The explicit Remote-First Policy submits every Backing Store write
-before reporting a successful one-sided RDMA write, maps fixed 1 GiB Remote
-Chunks lazily from runtime Hot Range scores, and keeps cold or unmapped data
-local. Strict remains accepted as a local-only compatibility path until its full
-completion and failure matrix is delivered in the next milestone. This code is
-for controlled Soft-RoCE and block verification, not production swap cutover.
-Runtime validation and production operations are tracked separately in
-`docs/modernization-plan.md`.
+RDMA Rail. Strict is the production default and waits for both Backing Store and
+Remote Memory outcomes; Remote-First remains an explicit latency-oriented
+opt-in. Both policies preserve successful Backing Store writes as Local-Only
+Data when RDMA fails. Provider operations fall back by the configured deadline,
+late completions are ignored, and terminal backing failures enter observable
+Backing-Degraded state and reject new writes until the device is recreated.
+This code is for controlled Soft-RoCE and block verification, not production
+swap cutover. Runtime validation and production operations are tracked
+separately in `docs/modernization-plan.md`.
 
 ## Build Dependencies
 
@@ -143,8 +144,8 @@ The versioned configuration contracts and examples live under `config/`:
   Provider Directory and its expected capabilities and placement weights.
   `provider-directory-v1.schema.json` preserves v1.
 - `status.schema.json` defines the current stable, secret-free JSON status
-  contract; `status-v1.schema.json` preserves the previous compatibility
-  contract.
+  contract; `status-v1.schema.json` and `status-v2.schema.json` preserve the
+  previous compatibility contracts.
 
 PSK values never belong in JSON. Each referenced PSK must be a non-symlink
 regular file owned by root with mode 0600. Validate a Provider configuration on
@@ -258,10 +259,11 @@ sudo bin/infiniswapctl enable infiniswap0 --priority 100
 ```
 
 Human-readable status is the default. `--json` emits deterministic schema
-version 2 data covering lifecycle, mode, policy, swap state, Provider
-connections, local/remote capacity, Hot Range scoring and mapped-range count,
-and the last kernel control error. It never includes key identifiers, PSK paths,
-PSKs, or authentication tags:
+version 3 data covering lifecycle, operational Backing Store state, mode,
+policy, swap state, Provider connections, local/remote capacity, Hot Range
+scoring, mapped-range count, correctness/failover metrics, and the last kernel
+control error. It never includes key identifiers, PSK paths, PSKs, or
+authentication tags:
 
 ```bash
 bin/infiniswapctl status infiniswap0
@@ -306,9 +308,10 @@ Backing Store.
 For the end-to-end path, prepare a disposable VM with a dedicated 2 GiB Backing
 Store and a Soft-RoCE Rail, then build both the Provider and Consumer. The test
 performs authenticated RC setup, verified random and mixed one-sided I/O,
-Remote-First completion with an independent backing-buffer lifetime, cold local
-readback, rejected-authentication fallback, runtime threshold changes, and
-repeated teardown:
+Strict and Remote-First completion with independent backing-buffer lifetimes,
+cold Local-Only readback, rejected-authentication fallback, runtime threshold
+changes, bounded Provider-death/network fallback, delayed completion safety,
+Backing-Degraded write rejection, and repeated teardown:
 
 ```bash
 sudo INFINISWAP_TEST_DESTRUCTIVE=yes \

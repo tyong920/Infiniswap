@@ -17,7 +17,11 @@ class SchemaContractTest(unittest.TestCase):
         paths = list(CONFIG.glob("*.json"))
         snapshot_directory = Path(__file__).parent / "snapshots"
         paths.extend(
-            (snapshot_directory / "status-v1.json", snapshot_directory / "status-v2.json")
+            (
+                snapshot_directory / "status-v1.json",
+                snapshot_directory / "status-v2.json",
+                snapshot_directory / "status-v3.json",
+            )
         )
         for path in paths:
             with self.subTest(path=path.name):
@@ -48,7 +52,8 @@ class SchemaContractTest(unittest.TestCase):
 
         status_contracts = (
             ("status-v1.schema.json", "status-v1.json"),
-            ("status.schema.json", "status-v2.json"),
+            ("status-v2.schema.json", "status-v2.json"),
+            ("status.schema.json", "status-v3.json"),
         )
         for schema_name, snapshot_name in status_contracts:
             with self.subTest(schema=schema_name):

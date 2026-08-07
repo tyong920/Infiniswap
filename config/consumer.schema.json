@@ -75,7 +75,10 @@
       "properties": {
         "name": {"$ref": "#/definitions/device_name"},
         "mode": {"enum": ["backed", "remote-only"]},
-        "acknowledgement_policy": {"enum": ["strict", "remote-first"]},
+        "acknowledgement_policy": {
+          "enum": ["strict", "remote-first"],
+          "default": "strict"
+        },
         "backing_store": {"$ref": "#/definitions/absolute_path"},
         "capacity_bytes": {
           "type": "integer",
@@ -106,7 +109,7 @@
       "allOf": [
         {
           "if": {"properties": {"mode": {"const": "backed"}}},
-          "then": {"required": ["acknowledgement_policy", "backing_store"]}
+          "then": {"required": ["backing_store"]}
         },
         {
           "if": {"properties": {"mode": {"const": "remote-only"}}},

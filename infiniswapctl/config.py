@@ -480,11 +480,9 @@ def load_consumer(path: str, system: Any) -> ConsumerConfig:
                 "device.mode remote-only is not available in this milestone"
             )
         raise ConfigError("device.mode must be backed")
-    if "acknowledgement_policy" not in device:
-        raise ConfigError("device.acknowledgement_policy is required")
     if "backing_store" not in device:
         raise ConfigError("device.backing_store is required")
-    policy = device["acknowledgement_policy"]
+    policy = device.get("acknowledgement_policy", "strict")
     if policy not in ("strict", "remote-first"):
         raise ConfigError(
             "device.acknowledgement_policy must be strict or remote-first"

@@ -86,7 +86,8 @@ jobs:
 
           status_pairs = (
               ("status-v1.schema.json", "status-v1.json"),
-              ("status.schema.json", "status-v2.json"),
+              ("status-v2.schema.json", "status-v2.json"),
+              ("status.schema.json", "status-v3.json"),
           )
           for schema_name, snapshot_name in status_pairs:
               schema = json.loads((config / schema_name).read_text())

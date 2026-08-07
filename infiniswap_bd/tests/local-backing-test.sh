@@ -217,8 +217,26 @@ case $dd_status in
   0) fail "write to an error Backing Store unexpectedly succeeded" ;;
   124) fail "write to an error Backing Store did not complete" ;;
 esac
+[[ $(<"$root/backing-error/backing_state") == backing-degraded ]] || \
+  fail "backing error did not enter Backing-Degraded"
+[[ $(<"$root/backing-error/backing_degraded_transitions_total") == 1 ]] || \
+  fail "Backing-Degraded transition was not counted exactly once"
+set +e
+timeout 10 dd if=/dev/zero of=/dev/backing-error bs=4096 count=1 \
+  oflag=direct status=none
+dd_status=$?
+set -e
+case $dd_status in
+  0) fail "Backing-Degraded accepted a new write" ;;
+  124) fail "Backing-Degraded write rejection hung" ;;
+esac
+[[ $(<"$root/backing-error/rejected_writes_total") -ge 1 ]] || \
+  fail "Backing-Degraded write rejection was not counted"
 stop_device "$root/backing-error" || fail "error Backing Store device stayed busy"
 wait_for_path /dev/backing-error absent
+write_must_fail activate "$root/backing-error/state"
+[[ $(<"$root/backing-error/backing_state") == backing-degraded ]] || \
+  fail "stop silently cleared Backing-Degraded"
 rmdir "$root/backing-error"
 dmsetup remove "$dm_error_name"
 dm_error_name=

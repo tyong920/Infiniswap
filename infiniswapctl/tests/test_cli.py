@@ -211,6 +211,19 @@ class CliValidationTest(unittest.TestCase):
         self.assertIn("threshold 8, read weight 1, write weight 4", stdout)
         self.assertEqual(system.mutations, [])
 
+    def test_create_defaults_acknowledgement_policy_to_strict(self):
+        path = self.write_consumer()
+        document = json.loads(path.read_text(encoding="utf-8"))
+        del document["device"]["acknowledgement_policy"]
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+        result, stdout, stderr, system = self.invoke_create(path)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("acknowledgement policy: strict", stdout)
+        self.assertEqual(system.mutations, [])
+
     def test_create_rejects_missing_capacity_before_system_mutation(self):
         path = self.write_consumer()
         document = json.loads(path.read_text(encoding="utf-8"))
@@ -569,8 +582,17 @@ class LifecycleCommandTest(unittest.TestCase):
             "providers": "provider-a",
             "swap_priority": "100",
             "connection_state": "not-connected",
+            "backing_state": "healthy",
             "remote_capacity_bytes": "0",
             "last_error": "0",
+            "backing_failures_total": "0",
+            "backing_retries_total": "0",
+            "backing_degraded_transitions_total": "0",
+            "provider_timeouts_total": "0",
+            "late_rdma_completions_total": "0",
+            "rejected_writes_total": "0",
+            "local_only_writes_total": "0",
+            "backing_invalid_sectors": "0",
         }
 
     def invoke(self, *arguments):
@@ -659,7 +681,7 @@ class LifecycleCommandTest(unittest.TestCase):
             stderr=stderr,
         )
 
-        snapshot = (Path(__file__).parent / "snapshots" / "status-v2.json").read_text(
+        snapshot = (Path(__file__).parent / "snapshots" / "status-v3.json").read_text(
             encoding="utf-8"
         )
         self.assertEqual((result, stderr.getvalue()), (0, ""))
@@ -683,7 +705,47 @@ class LifecycleCommandTest(unittest.TestCase):
         self.assertIn("infiniswap0: active (backed, strict)", human)
         self.assertIn("connection: not-connected (0/1 Providers healthy)", human)
         self.assertIn("swap: enabled at priority 100", human)
+        self.assertIn("backing: healthy", human)
         self.assertIn("last error: none", human)
+
+    def test_backing_degraded_is_visible_in_cli_json_and_metrics(self):
+        self.system.attributes["infiniswap0"].update(
+            {
+                "backing_state": "backing-degraded",
+                "backing_failures_total": "2",
+                "backing_retries_total": "1",
+                "backing_degraded_transitions_total": "1",
+                "provider_timeouts_total": "3",
+                "late_rdma_completions_total": "2",
+                "rejected_writes_total": "4",
+                "local_only_writes_total": "5",
+                "backing_invalid_sectors": "8",
+            }
+        )
+
+        result, output, error = self.invoke("status", "infiniswap0", "--json")
+
+        self.assertEqual((result, error), (0, ""))
+        status = json.loads(output)
+        self.assertEqual(status["device"]["operational_state"], "backing-degraded")
+        self.assertEqual(
+            status["metrics"],
+            {
+                "backing_degraded_transitions_total": 1,
+                "backing_failures_total": 2,
+                "backing_invalid_sectors": 8,
+                "backing_retries_total": 1,
+                "late_rdma_completions_total": 2,
+                "local_only_writes_total": 5,
+                "provider_timeouts_total": 3,
+                "rejected_writes_total": 4,
+            },
+        )
+
+        result, human, error = self.invoke("status", "infiniswap0")
+        self.assertEqual((result, error), (0, ""))
+        self.assertIn("backing: backing-degraded (new writes rejected)", human)
+        self.assertIn("backing failures/retries: 2/1", human)
 
     def test_every_host_affecting_command_has_a_non_mutating_dry_run(self):
         cases = [
