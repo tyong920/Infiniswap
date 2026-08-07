@@ -14,6 +14,7 @@ fi
 module=${INFINISWAP_TEST_MODULE:-}
 provider=${INFINISWAP_TEST_PROVIDER:-}
 external_provider=${INFINISWAP_TEST_EXTERNAL_PROVIDER:-no}
+test_case=${INFINISWAP_TEST_CASE:-all}
 fault_mode=${INFINISWAP_TEST_FAULT_MODE:-netem}
 rail=${INFINISWAP_TEST_RDMA_DEVICE:-rxe0}
 address=${INFINISWAP_TEST_RDMA_ADDRESS:-}
@@ -50,6 +51,25 @@ wait_for_value() {
     sleep 0.1
   done
   fail "$path did not become $expected"
+}
+
+wait_for_counter_at_least_deadline() {
+  local path=$1
+  local minimum=$2
+  local started_ms=$3
+  local deadline_ms=$4
+  local now value
+
+  while true; do
+    value=$(<"$path")
+    if ((value >= minimum)); then
+      return 0
+    fi
+    now=$(date +%s%3N)
+    ((now - started_ms <= deadline_ms)) ||
+      fail "network fault injection did not produce a Provider timeout"
+    sleep 0.01
+  done
 }
 
 wait_for_remote_lost_deadline() {
@@ -177,16 +197,31 @@ for command in awk cmp date dd dmesg grep insmod kill mount mountpoint openssl \
 done
 [[ -n $module && -n $address ]] ||
   fail "set INFINISWAP_TEST_MODULE and INFINISWAP_TEST_RDMA_ADDRESS"
+case $test_case in
+  all | network-fault) ;;
+  *) fail "INFINISWAP_TEST_CASE must be all or network-fault" ;;
+esac
 case $external_provider in
   yes | no) ;;
   *) fail "INFINISWAP_TEST_EXTERNAL_PROVIDER must be yes or no" ;;
 esac
+if [[ $test_case == network-fault && $external_provider != yes ]]; then
+  fail "network-fault requires INFINISWAP_TEST_EXTERNAL_PROVIDER=yes"
+fi
+network_test_enabled=0
+if [[ $test_case == network-fault || $external_provider == yes ]]; then
+  network_test_enabled=1
+fi
 case $fault_mode in
   netem)
-    command -v tc >/dev/null || fail "missing command: tc"
+    if ((network_test_enabled)); then
+      command -v tc >/dev/null || fail "missing command: tc"
+    fi
     ;;
   roce-iptables)
-    command -v iptables >/dev/null || fail "missing command: iptables"
+    if ((network_test_enabled)); then
+      command -v iptables >/dev/null || fail "missing command: iptables"
+    fi
     [[ $address != *:* ]] ||
       fail "roce-iptables fault injection requires an IPv4 Provider address"
     ;;
@@ -284,6 +319,54 @@ configure_group() {
   printf '100\n' > "$group/swap_priority"
 }
 
+test_network_fault() {
+  local name=$1
+  local group=$root/$name
+  local fault_started now transition_budget transition_elapsed timeouts
+
+  fault_started=$(date +%s%3N)
+  network_fault_active=1
+  inject_network_fault
+  wait_for_counter_at_least_deadline \
+    "$group/provider_timeouts_total" 1 "$fault_started" \
+    "$((failure_deadline_ms + 500))"
+
+  now=$(date +%s%3N)
+  transition_budget=$((failure_deadline_ms + 500 - (now - fault_started)))
+  ((transition_budget >= 0)) ||
+    fail "Provider timeout exceeded the Remote-Lost transition deadline"
+  wait_for_remote_lost_deadline \
+    "$group/connection_state" "$group/operational_state" \
+    "$transition_budget"
+  transition_elapsed=$(($(date +%s%3N) - fault_started))
+
+  clear_network_fault
+  network_fault_active=0
+  timeouts=$(<"$group/provider_timeouts_total")
+  [[ $(<"$group/remote_lost_transitions_total") == 1 ]] ||
+    fail "Remote-Lost transition was not counted exactly once"
+  expect_explicit_io_failure write dd if=/dev/zero \
+    of="/dev/$name" bs=4096 count=1 oflag=direct status=none
+  expect_explicit_io_failure read dd if="/dev/$name" \
+    of="$tmp/lost-read" bs=4096 count=1 iflag=direct status=none
+  printf 'network fault elapsed_ms=%s state=%s timeouts=%s\n' \
+    "$transition_elapsed" "$(<"$group/connection_state")" "$timeouts"
+}
+
+if [[ $test_case == network-fault ]]; then
+  configure_group infiniswap-remote-only "$chunk_bytes" 1
+  printf 'activate\n' > "$root/infiniswap-remote-only/state"
+  wait_for_path /dev/infiniswap-remote-only present
+  wait_for_value "$root/infiniswap-remote-only/connection_state" connected
+  [[ $(<"$root/infiniswap-remote-only/mapped_remote_chunks") == 1 ]] ||
+    fail "activation did not map its Remote Chunk"
+  test_network_fault infiniswap-remote-only
+  stop_group infiniswap-remote-only ||
+    fail "Remote-Lost device did not stop"
+  echo "focused Remote-Only network interruption verification passed"
+  exit 0
+fi
+
 # Direct configfs callers cannot bypass the host-wide recoverability gate.
 configure_group infiniswap-ineligible "$capacity_bytes" 0
 if printf 'activate\n' > "$root/infiniswap-ineligible/state" 2>/dev/null; then
@@ -342,24 +425,11 @@ dd if=/dev/infiniswap-remote-only of="$tmp/boundary-actual" bs=4096 \
 cmp "$tmp/boundary-pattern" "$tmp/boundary-actual" ||
   fail "Remote Chunk boundary I/O mismatched"
 
-# Silent RoCE packet loss exercises the idle Remote-Only heartbeat deadline
-# rather than relying on an immediate RDMA CM disconnect.
-network_fault_active=1
-inject_network_fault
-wait_for_remote_lost_deadline \
-  "$root/infiniswap-remote-only/connection_state" \
-  "$root/infiniswap-remote-only/operational_state" \
-  "$failure_deadline_ms"
-clear_network_fault
-network_fault_active=0
-[[ $(<"$root/infiniswap-remote-only/remote_lost_transitions_total") == 1 ]] ||
-  fail "Remote-Lost transition was not counted exactly once"
-expect_explicit_io_failure write dd if=/dev/zero \
-  of=/dev/infiniswap-remote-only bs=4096 count=1 oflag=direct status=none
-expect_explicit_io_failure read dd if=/dev/infiniswap-remote-only \
-  of="$tmp/lost-read" bs=4096 count=1 iflag=direct status=none
+if [[ $external_provider == yes ]]; then
+  test_network_fault infiniswap-remote-only
+fi
 
-stop_group infiniswap-remote-only || fail "Remote-Lost device did not stop"
+stop_group infiniswap-remote-only || fail "Remote-Only device did not stop"
 new_logs=$(dmesg | tail -n "+$((dmesg_start + 1))")
 if grep -Eqi 'BUG:|Oops:|kernel panic|KASAN:|use-after-free|general protection fault' \
   <<<"$new_logs"; then

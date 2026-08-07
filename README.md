@@ -375,11 +375,11 @@ The focused test requires an observed Provider timeout before accepting the
 `degraded` transition, preventing successful self-SoftRoCE I/O from being
 misclassified as network-failure fallback.
 
-A separate Remote-Only test needs no Backing Store. It verifies the host gate,
-atomic full-capacity admission, repeated Committed Pool reserve/release cycles,
-verified one-sided I/O, bounded Remote-Lost transition during silent network
-loss, and explicit read/write failure after the terminal transition. By default
-it launches the Provider locally and uses `tc netem` for fault injection:
+A separate Remote-Only test needs no Backing Store. Its default local-Provider
+path verifies the host gate, atomic full-capacity admission, repeated Committed
+Pool reserve/release cycles, and verified one-sided I/O. It does not claim a
+silent-network transition because self-SoftRoCE traffic bypasses the local
+netdev's qdisc:
 
 ```bash
 sudo INFINISWAP_TEST_DESTRUCTIVE=yes \
@@ -399,7 +399,7 @@ cat >/tmp/provider-memory.conf <<'EOF'
 version = 1
 host_reserve_gib = 1
 max_opportunistic_gib = 0
-max_committed_gib = 2
+max_committed_gib = 1
 EOF
 cat >/tmp/consumers.conf <<EOF
 version = 1
@@ -409,7 +409,7 @@ current_key_id = key-test
 current_psk_hex = $psk
 max_connections = 1
 max_opportunistic_gib = 0
-max_committed_gib = 2
+max_committed_gib = 1
 revoked = false
 EOF
 chmod 0600 /tmp/consumers.conf
@@ -419,21 +419,28 @@ sudo prlimit --memlock=unlimited:unlimited -- \
   /tmp/provider-memory.conf /tmp/consumers.conf
 ```
 
-Then run the test on the Consumer, replacing the PSK and Provider address:
+Then run the focused test on the Consumer, replacing the PSK and Provider
+address:
 
 ```bash
 sudo INFINISWAP_TEST_DESTRUCTIVE=yes \
+  INFINISWAP_TEST_CASE=network-fault \
   INFINISWAP_TEST_MODULE="$PWD/infiniswap_bd/infiniswap.ko" \
   INFINISWAP_TEST_EXTERNAL_PROVIDER=yes \
   INFINISWAP_TEST_PSK_HEX="<PSK printed by Provider setup>" \
-  INFINISWAP_TEST_FAULT_MODE=roce-iptables \
+  INFINISWAP_TEST_FAULT_MODE=netem \
   INFINISWAP_TEST_RDMA_DEVICE=rxe0 \
-  INFINISWAP_TEST_RDMA_ADDRESS=192.0.2.20 \
+  INFINISWAP_TEST_RDMA_NETDEV="<netdev backing rxe0>" \
+  INFINISWAP_TEST_RDMA_ADDRESS="<Provider IPv4 address>" \
   infiniswap_bd/tests/remote-only-test.sh
 ```
 
-The RoCE firewall mode drops only UDP/4791 traffic to the IPv4 Provider, so an
-SSH management connection on the same netdev remains available.
+The focused test reserves one Committed Remote Chunk and requires an observed
+Provider timeout before it waits for both device states to become Remote-Lost.
+It also verifies the transition count and explicit read/write failure. `netem`
+briefly interrupts other Consumer traffic on the same netdev. Set
+`INFINISWAP_TEST_FAULT_MODE=roce-iptables` to drop only UDP/4791 traffic to an
+IPv4 Provider when the management connection must remain unaffected.
 
 `setup/install.sh bd` only builds and installs the module. It does not load the
 module, create an Infiniswap Device, format swap, or alter active swap.
