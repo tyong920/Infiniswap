@@ -20,6 +20,7 @@ address=${INFINISWAP_TEST_RDMA_ADDRESS:-}
 netdev=${INFINISWAP_TEST_RDMA_NETDEV:-}
 port=${INFINISWAP_TEST_PROVIDER_PORT:-19400}
 failure_deadline_ms=${INFINISWAP_TEST_FAILURE_DEADLINE_MS:-2000}
+test_case=${INFINISWAP_TEST_CASE:-all}
 capacity_bytes=$((2 * 1024 * 1024 * 1024))
 chunk_bytes=$((1024 * 1024 * 1024))
 configfs=/sys/kernel/config
@@ -30,6 +31,7 @@ dm_delay_name=
 loaded_module=0
 mounted_configfs=0
 network_fault_active=0
+backing_fault_active=0
 declare -a created_groups=()
 
 fail() {
@@ -142,6 +144,16 @@ stop_group() {
   rmdir "$group"
 }
 
+restore_delayed_backing() {
+  ((backing_fault_active)) || return 0
+  dmsetup suspend "$dm_delay_name"
+  printf '0 %s delay %s 0 0 %s 0 200\n' \
+    "$((capacity_bytes / 512))" "$raw_backing" "$raw_backing" | \
+    dmsetup reload "$dm_delay_name"
+  dmsetup resume "$dm_delay_name"
+  backing_fault_active=0
+}
+
 cleanup() {
   local index
 
@@ -149,6 +161,7 @@ cleanup() {
   if ((network_fault_active)) && [[ -n $netdev ]]; then
     tc qdisc del dev "$netdev" root 2>/dev/null
   fi
+  restore_delayed_backing
   for ((index = ${#created_groups[@]} - 1; index >= 0; index--)); do
     stop_group "${created_groups[index]}"
   done
@@ -168,6 +181,13 @@ cleanup() {
   rm -rf "$tmp"
 }
 trap cleanup EXIT HUP INT TERM
+
+case $test_case in
+  all | remote-first-backing-failure) ;;
+  *)
+    fail "INFINISWAP_TEST_CASE must be all or remote-first-backing-failure"
+    ;;
+esac
 
 for command in awk blockdev cmp date dd dmesg dmsetup fio grep insmod kill modprobe \
   mount mountpoint openssl rdma readlink rmmod sort tail tc timeout; do
@@ -271,6 +291,85 @@ configure_group() {
   wait_for_path "/dev/$name" present
 }
 
+test_remote_first_backing_failure() {
+  local name=infiniswap-backing-degraded
+  local group=$root/$name
+  local write_status read_status
+
+  configure_group "$name" "$psk_hex" remote-first
+  wait_for_value "$group/connection_state" connected
+  dd if=/dev/urandom of="$tmp/degraded-seed" bs=4096 count=1 status=none
+  dd if="$tmp/degraded-seed" of="/dev/$name" bs=4096 count=1 \
+    oflag=direct conv=fsync status=none
+  wait_for_value "$group/mapped_hot_ranges" 1
+
+  dmsetup suspend "$dm_delay_name"
+  printf '0 %s error\n' "$((capacity_bytes / 512))" | \
+    dmsetup reload "$dm_delay_name"
+  dmsetup resume "$dm_delay_name"
+  backing_fault_active=1
+
+  dd if=/dev/urandom of="$tmp/degraded-pattern" bs=4096 count=1 status=none
+  set +e
+  timeout 5 dd if="$tmp/degraded-pattern" of="/dev/$name" bs=4096 \
+    count=1 oflag=direct status=none
+  write_status=$?
+  set -e
+  wait_for_value "$group/backing_state" backing-degraded
+  [[ $(<"$group/backing_retries_total") == 1 ]] || \
+    fail "Remote-First did not retry the delayed backing failure exactly once"
+  [[ $(<"$group/backing_degraded_transitions_total") == 1 ]] || \
+    fail "Backing-Degraded transition metric was not recorded"
+
+  set +e
+  timeout 5 dd if="/dev/$name" of="$tmp/degraded-actual" bs=4096 \
+    count=1 iflag=direct status=none
+  read_status=$?
+  set -e
+  if ((write_status != 0)); then
+    if ((read_status == 0)) && \
+        cmp -s "$tmp/degraded-pattern" "$tmp/degraded-actual"; then
+      fail "Remote-First returned an error even though its payload reached Remote Memory"
+    fi
+    fail "Remote Memory write failed while the Backing Store fault was injected"
+  fi
+  ((read_status == 0)) || \
+    fail "Remote-First acknowledged data could not be read from Remote Memory"
+  cmp "$tmp/degraded-pattern" "$tmp/degraded-actual" || \
+    fail "Remote-First acknowledged corrupted Remote Memory data"
+
+  if timeout 5 dd if=/dev/zero of="/dev/$name" bs=4096 count=1 \
+    oflag=direct status=none; then
+    fail "Backing-Degraded accepted a new write"
+  fi
+  [[ $(<"$group/rejected_writes_total") -ge 1 ]] || \
+    fail "rejected Backing-Degraded write was not counted"
+
+  restore_delayed_backing
+  printf 'stop\n' > "$group/state"
+  wait_for_value "$group/state" stopped
+  if printf 'activate\n' > "$group/state" 2>/dev/null; then
+    fail "Backing-Degraded was silently reset without device recreation"
+  fi
+  rmdir "$group"
+  echo "focused Remote-First backing failure verification passed"
+}
+
+check_kernel_diagnostics() {
+  dmesg | tail -n "+$((dmesg_start + 1))" > "$tmp/kernel.log"
+  if grep -Eiq 'BUG:|WARNING:|Oops:|kernel panic|use-after-free|refcount.*underflow' \
+    "$tmp/kernel.log"; then
+    cat "$tmp/kernel.log" >&2
+    fail "kernel diagnostics reported a correctness failure"
+  fi
+}
+
+if [[ $test_case == remote-first-backing-failure ]]; then
+  test_remote_first_backing_failure
+  check_kernel_diagnostics
+  exit 0
+fi
+
 # A rejected authenticated setup remains a correct local Backed Mode device.
 bad_psk=$(openssl rand -hex 32)
 configure_group infiniswap-rejected "$bad_psk"
@@ -332,6 +431,9 @@ cmp "$tmp/cold-pattern" "$tmp/cold-actual" || fail "cold local data was corrupte
 stop_group infiniswap-remote || fail "remote session did not tear down"
 sleep 1
 
+test_remote_first_backing_failure
+sleep 1
+
 # Repeated authenticated setup and teardown catches stale QPs, CQs, MRs, work,
 # and request contexts.
 for iteration in 1 2 3; do
@@ -343,45 +445,6 @@ for iteration in 1 2 3; do
   stop_group "$name" || fail "$name did not tear down"
   sleep 1
 done
-
-# Remote-First retries one delayed Backing Store failure, then enters the
-# operator-visible Backing-Degraded state and rejects every later write.
-configure_group infiniswap-backing-degraded "$psk_hex" remote-first
-wait_for_value "$root/infiniswap-backing-degraded/connection_state" connected
-dd if=/dev/urandom of="$tmp/degraded-seed" bs=4096 count=1 status=none
-dd if="$tmp/degraded-seed" of=/dev/infiniswap-backing-degraded bs=4096 count=1 \
-  oflag=direct conv=fsync status=none
-wait_for_value "$root/infiniswap-backing-degraded/mapped_hot_ranges" 1
-dmsetup suspend "$dm_delay_name"
-printf '0 %s error\n' "$((capacity_bytes / 512))" | \
-  dmsetup reload "$dm_delay_name"
-dmsetup resume "$dm_delay_name"
-dd if=/dev/urandom of="$tmp/degraded-pattern" bs=4096 count=1 status=none
-timeout 5 dd if="$tmp/degraded-pattern" of=/dev/infiniswap-backing-degraded \
-  bs=4096 count=1 oflag=direct status=none || \
-  fail "Remote-First did not preserve its completed remote write"
-wait_for_value "$root/infiniswap-backing-degraded/backing_state" backing-degraded
-[[ $(<"$root/infiniswap-backing-degraded/backing_retries_total") == 1 ]] || \
-  fail "Remote-First did not retry the delayed backing failure exactly once"
-[[ $(<"$root/infiniswap-backing-degraded/backing_degraded_transitions_total") == 1 ]] || \
-  fail "Backing-Degraded transition metric was not recorded"
-if timeout 5 dd if=/dev/zero of=/dev/infiniswap-backing-degraded bs=4096 \
-  count=1 oflag=direct status=none; then
-  fail "Backing-Degraded accepted a new write"
-fi
-[[ $(<"$root/infiniswap-backing-degraded/rejected_writes_total") -ge 1 ]] || \
-  fail "rejected Backing-Degraded write was not counted"
-dmsetup suspend "$dm_delay_name"
-printf '0 %s delay %s 0 0 %s 0 200\n' \
-  "$((capacity_bytes / 512))" "$raw_backing" "$raw_backing" | \
-  dmsetup reload "$dm_delay_name"
-dmsetup resume "$dm_delay_name"
-printf 'stop\n' > "$root/infiniswap-backing-degraded/state"
-wait_for_value "$root/infiniswap-backing-degraded/state" stopped
-if printf 'activate\n' > "$root/infiniswap-backing-degraded/state" 2>/dev/null; then
-  fail "Backing-Degraded was silently reset without device recreation"
-fi
-rmdir "$root/infiniswap-backing-degraded"
 
 # A silent network interruption exercises the per-operation watchdog. The
 # timed-out Strict write succeeds from its valid Backing Store copy, and the
@@ -439,11 +502,6 @@ cmp "$tmp/death-pattern" "$tmp/death-actual" || \
   fail "Provider death did not preserve Backing Store data"
 stop_group infiniswap-provider-death || fail "Provider death device did not tear down"
 
-dmesg | tail -n "+$((dmesg_start + 1))" > "$tmp/kernel.log"
-if grep -Eiq 'BUG:|WARNING:|Oops:|kernel panic|use-after-free|refcount.*underflow' \
-  "$tmp/kernel.log"; then
-  cat "$tmp/kernel.log" >&2
-  fail "kernel diagnostics reported a correctness failure"
-fi
+check_kernel_diagnostics
 
 echo "single-Provider Backed Strict/Remote-First failure verification passed"

@@ -345,7 +345,11 @@ sudo INFINISWAP_TEST_DESTRUCTIVE=yes \
 
 The address must belong to the netdev backing the named Soft-RoCE Rail. The test
 allocates one 1 GiB Opportunistic Pool chunk and overwrites the first 2 GiB of
-the Backing Store.
+the Backing Store. Set
+`INFINISWAP_TEST_CASE=remote-first-backing-failure` to run only the focused
+Remote-First fault case. That case reads the written payload back from Remote
+Memory. This distinguishes an application-visible write error with the payload
+present in Remote Memory from a failure where the remote payload is absent.
 
 A separate Remote-Only test needs no Backing Store. It verifies the host gate,
 atomic full-capacity admission, repeated Committed Pool reserve/release cycles,
