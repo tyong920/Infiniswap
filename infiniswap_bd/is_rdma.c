@@ -34,6 +34,7 @@ enum is_rdma_control_state {
 	IS_RDMA_CONTROL_CONNECTING = 0,
 	IS_RDMA_CONTROL_WAIT_CHALLENGE,
 	IS_RDMA_CONTROL_WAIT_ACCEPT,
+	IS_RDMA_CONTROL_WAIT_STATUS,
 	IS_RDMA_CONTROL_READY,
 	IS_RDMA_CONTROL_FAILED,
 	IS_RDMA_CONTROL_STOPPING,
@@ -114,6 +115,7 @@ struct is_rdma_session {
 	struct is_control_completion recv_completion;
 
 	struct workqueue_struct *control_wq;
+	struct work_struct connect_work;
 	struct work_struct hello_work;
 	struct work_struct receive_work;
 	struct work_struct mapping_work;
@@ -138,6 +140,7 @@ struct is_rdma_session {
 	u16 release_count;
 
 	unsigned int chunk_count;
+	unsigned int remote_chunk_limit;
 	struct is_remote_chunk chunks[IS_PROTOCOL_MAX_CHUNKS_PER_FRAME];
 	unsigned long *valid_sectors;
 };
@@ -444,9 +447,23 @@ static int is_handle_challenge(struct is_rdma_session *session,
 	return is_encode_and_send(session, auth);
 }
 
+static void is_mark_session_ready(struct is_rdma_session *session,
+				  unsigned int remote_chunk_limit)
+{
+	session->remote_chunk_limit = remote_chunk_limit;
+	session->pending_request_id = 0;
+	session->control_state = IS_RDMA_CONTROL_READY;
+	session->ever_connected = true;
+	WRITE_ONCE(session->device->last_error, 0);
+	atomic_set(&session->device->connection_state, IS_CONNECTION_CONNECTED);
+	queue_work(session->control_wq, &session->mapping_work);
+}
+
 static int is_handle_accept(struct is_rdma_session *session,
 			    const struct is_protocol_message *accept)
 {
+	struct is_protocol_message *request = &session->outbound_message;
+
 	if (accept->header.major != IS_PROTOCOL_MAJOR ||
 	    accept->header.minor != session->negotiated_minor ||
 	    !(accept->header.flags & IS_PROTOCOL_FLAG_RESPONSE) ||
@@ -456,12 +473,32 @@ static int is_handle_accept(struct is_rdma_session *session,
 	    accept->header.capabilities != session->negotiated_capabilities)
 		return -EPROTO;
 	session->session_id = accept->header.session_id;
-	session->pending_request_id = 0;
-	session->control_state = IS_RDMA_CONTROL_READY;
-	session->ever_connected = true;
-	WRITE_ONCE(session->device->last_error, 0);
-	atomic_set(&session->device->connection_state, IS_CONNECTION_CONNECTED);
-	queue_work(session->control_wq, &session->mapping_work);
+	if (!(session->negotiated_capabilities & IS_PROTOCOL_CAP_STATUS)) {
+		is_mark_session_ready(session, 0);
+		return 0;
+	}
+	is_init_message(session, request, IS_PROTOCOL_MSG_STATUS_REQUEST,
+		session->next_request_id++, false);
+	session->pending_request_id = request->header.request_id;
+	session->control_state = IS_RDMA_CONTROL_WAIT_STATUS;
+	return is_encode_and_send(session, request);
+}
+
+static int is_handle_status(struct is_rdma_session *session,
+			    const struct is_protocol_message *status)
+{
+	if (!is_authenticated_header_valid(session, status) ||
+	    !(status->header.flags & IS_PROTOCOL_FLAG_RESPONSE) ||
+	    status->header.request_id != session->pending_request_id ||
+	    status->payload.status.provider_failure_deadline_ms !=
+		    session->device->provider_failure_deadline_ms)
+		return -EPROTO;
+
+	is_mark_session_ready(session,
+		status->payload.status.flags & IS_PROTOCOL_STATUS_HEALTHY ?
+		min_t(unsigned int,
+			status->payload.status.available_opportunistic_chunks,
+			session->chunk_count) : 0);
 	return 0;
 }
 
@@ -673,6 +710,10 @@ static void is_receive_work(struct work_struct *work)
 		ret = message->header.type == IS_PROTOCOL_MSG_ACCEPT ?
 			is_handle_accept(session, message) : -EPROTO;
 		break;
+	case IS_RDMA_CONTROL_WAIT_STATUS:
+		ret = message->header.type == IS_PROTOCOL_MSG_STATUS_RESPONSE ?
+			is_handle_status(session, message) : -EPROTO;
+		break;
 	case IS_RDMA_CONTROL_READY:
 		switch (message->header.type) {
 		case IS_PROTOCOL_MSG_CHUNK_GRANT:
@@ -718,7 +759,9 @@ static void is_mapping_work(struct work_struct *work)
 
 	mutex_lock(&session->control_lock);
 	if (session->control_state != IS_RDMA_CONTROL_READY ||
-	    session->pending_request_id || session->release_count)
+	    session->pending_request_id || session->release_count ||
+	    (unsigned int)atomic_read(&session->device->mapped_hot_ranges) >=
+		    session->remote_chunk_limit)
 		goto out;
 	spin_lock_irqsave(&session->chunk_lock, flags);
 	for (index = 0; index < session->chunk_count; index++) {
@@ -859,6 +902,21 @@ static int is_connect_qp(struct is_rdma_session *session)
 	return rdma_connect(session->cm_id, &parameters);
 }
 
+static void is_connect_work(struct work_struct *work)
+{
+	struct is_rdma_session *session = container_of(
+		work, struct is_rdma_session, connect_work);
+	int ret;
+
+	if (READ_ONCE(session->stopping))
+		return;
+	ret = is_setup_qp(session);
+	if (!ret && !READ_ONCE(session->stopping))
+		ret = is_connect_qp(session);
+	if (ret)
+		is_rdma_fail(session, ret);
+}
+
 static int is_rdma_cm_event(struct rdma_cm_id *id,
 			    struct rdma_cm_event *event)
 {
@@ -877,9 +935,8 @@ static int is_rdma_cm_event(struct rdma_cm_id *id,
 			ret = rdma_resolve_route(id, IS_RDMA_CONTROL_TIMEOUT_MS);
 		break;
 	case RDMA_CM_EVENT_ROUTE_RESOLVED:
-		ret = is_setup_qp(session);
-		if (!ret)
-			ret = is_connect_qp(session);
+		/* rdma_connect() takes the CM handler lock held by this callback. */
+		queue_work(session->control_wq, &session->connect_work);
 		break;
 	case RDMA_CM_EVENT_ESTABLISHED:
 		queue_work(session->control_wq, &session->hello_work);
@@ -969,6 +1026,7 @@ int is_rdma_start(struct is_device *device)
 		ret = -ENOMEM;
 		goto free_bitmap;
 	}
+	INIT_WORK(&session->connect_work, is_connect_work);
 	INIT_WORK(&session->hello_work, is_hello_work);
 	INIT_WORK(&session->receive_work, is_receive_work);
 	INIT_WORK(&session->mapping_work, is_mapping_work);
@@ -1051,6 +1109,7 @@ void is_rdma_stop(struct is_device *device)
 	mutex_lock(&session->control_lock);
 	session->control_state = IS_RDMA_CONTROL_STOPPING;
 	mutex_unlock(&session->control_lock);
+	cancel_work_sync(&session->connect_work);
 	if (session->connect_started &&
 	    atomic_cmpxchg(&session->disconnect_started, 0, 1) == 0)
 		rdma_disconnect(session->cm_id);

@@ -116,9 +116,14 @@ done
   fail "set INFINISWAP_TEST_BACKING, INFINISWAP_TEST_PROVIDER, and INFINISWAP_TEST_RDMA_ADDRESS"
 [[ -x $provider ]] || fail "Provider executable is not executable: $provider"
 [[ -f $module ]] || fail "Memory Consumer module does not exist: $module"
-rdma link show "$rail" >/dev/null 2>&1 || fail "RDMA Rail is unavailable: $rail"
+rdma link show "$rail/1" >/dev/null 2>&1 || fail "RDMA Rail is unavailable: $rail"
 [[ -d /sys/class/infiniband/$rail/ports/1 ]] || fail "$rail port 1 is unavailable"
-numa_node=$(<"/sys/class/infiniband/$rail/device/numa_node")
+numa_path="/sys/class/infiniband/$rail/device/numa_node"
+if [[ -r $numa_path ]]; then
+  numa_node=$(<"$numa_path")
+else
+  numa_node=-1
+fi
 
 backing=$(readlink -f "$backing")
 [[ -b $backing ]] || fail "Backing Store must be a block device"
@@ -225,6 +230,19 @@ dd if="$tmp/hot-seed" of=/dev/infiniswap-remote bs=4096 count=1 \
 wait_for_value "$root/infiniswap-remote/mapped_hot_ranges" 1
 [[ $(<"$root/infiniswap-remote/remote_capacity_bytes") == "$chunk_bytes" ]] || \
   fail "mapped capacity is not exactly one Remote Chunk"
+
+# Heating a second range beyond the Provider's one-chunk quota must stay local
+# without turning a retryable admission limit into a connection failure.
+dd if=/dev/urandom of="$tmp/quota-pattern" bs=4096 count=16 status=none
+dd if="$tmp/quota-pattern" of=/dev/infiniswap-remote bs=4096 count=16 \
+  seek=$((1536 * 1024 / 4)) oflag=direct conv=fsync status=none
+dd if=/dev/infiniswap-remote of="$tmp/quota-actual" bs=4096 count=16 \
+  skip=$((1536 * 1024 / 4)) iflag=direct status=none
+cmp "$tmp/quota-pattern" "$tmp/quota-actual" || \
+  fail "quota-limited local data was corrupted"
+wait_for_value "$root/infiniswap-remote/connection_state" connected
+[[ $(<"$root/infiniswap-remote/mapped_hot_ranges") == 1 ]] || \
+  fail "Consumer exceeded the Provider's advertised Remote Chunk budget"
 
 fio --name=remote-random --filename=/dev/infiniswap-remote --direct=1 \
   --ioengine=libaio --rw=randrw --rwmixread=60 --bs=4k --iodepth=32 \
