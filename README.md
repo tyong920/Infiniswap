@@ -346,7 +346,8 @@ the Backing Store.
 A separate Remote-Only test needs no Backing Store. It verifies the host gate,
 atomic full-capacity admission, repeated Committed Pool reserve/release cycles,
 verified one-sided I/O, bounded Remote-Lost transition during silent network
-loss, and explicit read/write failure after the terminal transition:
+loss, and explicit read/write failure after the terminal transition. By default
+it launches the Provider locally and uses `tc netem` for fault injection:
 
 ```bash
 sudo INFINISWAP_TEST_DESTRUCTIVE=yes \
@@ -356,6 +357,51 @@ sudo INFINISWAP_TEST_DESTRUCTIVE=yes \
   INFINISWAP_TEST_RDMA_ADDRESS=192.0.2.20 \
   infiniswap_bd/tests/remote-only-test.sh
 ```
+
+For a two-VM topology, prepare and start the external Provider first:
+
+```bash
+psk="$(openssl rand -hex 32)"
+printf 'Use this PSK on the Consumer: %s\n' "$psk"
+cat >/tmp/provider-memory.conf <<'EOF'
+version = 1
+host_reserve_gib = 1
+max_opportunistic_gib = 0
+max_committed_gib = 2
+EOF
+cat >/tmp/consumers.conf <<EOF
+version = 1
+
+[consumer:consumer-test]
+current_key_id = key-test
+current_psk_hex = $psk
+max_connections = 1
+max_opportunistic_gib = 0
+max_committed_gib = 2
+revoked = false
+EOF
+chmod 0600 /tmp/consumers.conf
+sudo chown root:root /tmp/provider-memory.conf /tmp/consumers.conf
+sudo prlimit --memlock=unlimited:unlimited -- \
+  "$PWD/build/daemon/infiniswap-daemon" :: 19401 \
+  /tmp/provider-memory.conf /tmp/consumers.conf
+```
+
+Then run the test on the Consumer, replacing the PSK and Provider address:
+
+```bash
+sudo INFINISWAP_TEST_DESTRUCTIVE=yes \
+  INFINISWAP_TEST_MODULE="$PWD/infiniswap_bd/infiniswap.ko" \
+  INFINISWAP_TEST_EXTERNAL_PROVIDER=yes \
+  INFINISWAP_TEST_PSK_HEX="<PSK printed by Provider setup>" \
+  INFINISWAP_TEST_FAULT_MODE=roce-iptables \
+  INFINISWAP_TEST_RDMA_DEVICE=rxe0 \
+  INFINISWAP_TEST_RDMA_ADDRESS=192.0.2.20 \
+  infiniswap_bd/tests/remote-only-test.sh
+```
+
+The RoCE firewall mode drops only UDP/4791 traffic to the IPv4 Provider, so an
+SSH management connection on the same netdev remains available.
 
 `setup/install.sh bd` only builds and installs the module. It does not load the
 module, create an Infiniswap Device, format swap, or alter active swap.

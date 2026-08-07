@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Destructive single-host Soft-RoCE verification for Remote-Only Mode.
+# Destructive Soft-RoCE verification for Remote-Only Mode.
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   echo "run as root" >&2
   exit 2
@@ -13,11 +13,14 @@ fi
 
 module=${INFINISWAP_TEST_MODULE:-}
 provider=${INFINISWAP_TEST_PROVIDER:-}
+external_provider=${INFINISWAP_TEST_EXTERNAL_PROVIDER:-no}
+fault_mode=${INFINISWAP_TEST_FAULT_MODE:-netem}
 rail=${INFINISWAP_TEST_RDMA_DEVICE:-rxe0}
 address=${INFINISWAP_TEST_RDMA_ADDRESS:-}
 netdev=${INFINISWAP_TEST_RDMA_NETDEV:-}
 port=${INFINISWAP_TEST_PROVIDER_PORT:-19401}
 failure_deadline_ms=${INFINISWAP_TEST_FAILURE_DEADLINE_MS:-2000}
+fault_tag="infiniswap-ro-test-$$"
 chunk_bytes=$((1024 * 1024 * 1024))
 capacity_bytes=$((2 * chunk_bytes))
 configfs=/sys/kernel/config
@@ -49,23 +52,25 @@ wait_for_value() {
   fail "$path did not become $expected"
 }
 
-wait_for_value_deadline() {
-  local path=$1
-  local expected=$2
+wait_for_remote_lost_deadline() {
+  local connection_path=$1
+  local operational_path=$2
   local deadline_ms=$3
   local started now
 
   started=$(date +%s%3N)
   while true; do
-    if [[ -r $path && $(<"$path") == "$expected" ]]; then
+    if [[ -r $connection_path && -r $operational_path &&
+          $(<"$connection_path") == remote-lost &&
+          $(<"$operational_path") == remote-lost ]]; then
       now=$(date +%s%3N)
       ((now - started <= deadline_ms)) ||
-        fail "$path took $((now - started)) ms to become $expected"
+        fail "Remote-Lost took $((now - started)) ms"
       return 0
     fi
     now=$(date +%s%3N)
     ((now - started <= deadline_ms)) ||
-      fail "$path did not become $expected within ${deadline_ms} ms"
+      fail "Remote-Lost did not become terminal within ${deadline_ms} ms"
     sleep 0.01
   done
 }
@@ -85,6 +90,44 @@ wait_for_path() {
     sleep 0.05
   done
   fail "$path did not become $expected"
+}
+
+expect_explicit_io_failure() {
+  local description=$1
+  local status
+
+  shift
+  if timeout 5 "$@"; then
+    fail "Remote-Lost accepted a $description"
+  else
+    status=$?
+  fi
+  [[ $status -eq 1 ]] ||
+    fail "Remote-Lost $description did not fail explicitly (status $status)"
+}
+
+clear_network_fault() {
+  case $fault_mode in
+    netem)
+      tc qdisc del dev "$netdev" root 2>/dev/null
+      ;;
+    roce-iptables)
+      iptables -w -D OUTPUT -p udp -d "$address" --dport 4791 \
+        -m comment --comment "$fault_tag" -j DROP 2>/dev/null
+      ;;
+  esac
+}
+
+inject_network_fault() {
+  case $fault_mode in
+    netem)
+      tc qdisc replace dev "$netdev" root netem loss 100%
+      ;;
+    roce-iptables)
+      iptables -w -I OUTPUT -p udp -d "$address" --dport 4791 \
+        -m comment --comment "$fault_tag" -j DROP
+      ;;
+  esac
 }
 
 stop_group() {
@@ -109,7 +152,7 @@ cleanup() {
 
   set +e
   if ((network_fault_active)); then
-    tc qdisc del dev "$netdev" root 2>/dev/null
+    clear_network_fault
   fi
   for ((index = ${#created_groups[@]} - 1; index >= 0; index--)); do
     stop_group "${created_groups[index]}"
@@ -129,13 +172,34 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 for command in awk cmp date dd dmesg grep insmod kill mount mountpoint openssl \
-  rdma rmmod tail tc timeout wc; do
+  rdma rmmod tail timeout wc; do
   command -v "$command" >/dev/null || fail "missing command: $command"
 done
-[[ -n $module && -n $provider && -n $address ]] ||
-  fail "set INFINISWAP_TEST_MODULE, INFINISWAP_TEST_PROVIDER, and INFINISWAP_TEST_RDMA_ADDRESS"
+[[ -n $module && -n $address ]] ||
+  fail "set INFINISWAP_TEST_MODULE and INFINISWAP_TEST_RDMA_ADDRESS"
+case $external_provider in
+  yes | no) ;;
+  *) fail "INFINISWAP_TEST_EXTERNAL_PROVIDER must be yes or no" ;;
+esac
+case $fault_mode in
+  netem)
+    command -v tc >/dev/null || fail "missing command: tc"
+    ;;
+  roce-iptables)
+    command -v iptables >/dev/null || fail "missing command: iptables"
+    [[ $address != *:* ]] ||
+      fail "roce-iptables fault injection requires an IPv4 Provider address"
+    ;;
+  *) fail "INFINISWAP_TEST_FAULT_MODE must be netem or roce-iptables" ;;
+esac
+if [[ $external_provider == no ]]; then
+  [[ -n $provider ]] || fail "set INFINISWAP_TEST_PROVIDER"
+  [[ -x $provider ]] || fail "Memory Provider is not executable: $provider"
+else
+  [[ -n ${INFINISWAP_TEST_PSK_HEX:-} ]] ||
+    fail "set INFINISWAP_TEST_PSK_HEX for an external Provider"
+fi
 [[ -f $module ]] || fail "Memory Consumer module does not exist: $module"
-[[ -x $provider ]] || fail "Provider executable is not executable: $provider"
 rdma link show "$rail/1" >/dev/null 2>&1 ||
   fail "RDMA Rail is unavailable: $rail"
 if [[ -z $netdev ]]; then
@@ -153,7 +217,12 @@ if [[ -d /sys/module/infiniswap ]]; then
   fail "infiniswap is already loaded; use a dedicated disposable VM"
 fi
 
-psk_hex=$(openssl rand -hex 32)
+psk_hex=${INFINISWAP_TEST_PSK_HEX:-}
+if [[ -z $psk_hex ]]; then
+  psk_hex=$(openssl rand -hex 32)
+fi
+[[ $psk_hex =~ ^[[:xdigit:]]{64}$ ]] ||
+  fail "INFINISWAP_TEST_PSK_HEX must contain exactly 64 hexadecimal digits"
 cat > "$tmp/provider-memory.conf" <<EOF
 version = 1
 host_reserve_gib = 1
@@ -172,12 +241,15 @@ max_committed_gib = 2
 revoked = false
 EOF
 chmod 0600 "$tmp/consumers.conf"
-ulimit -l unlimited 2>/dev/null || fail "could not raise the Provider memlock limit"
-"$provider" :: "$port" "$tmp/provider-memory.conf" \
-  "$tmp/consumers.conf" >"$tmp/provider.log" 2>&1 &
-provider_pid=$!
-sleep 1
-kill -0 "$provider_pid" 2>/dev/null || fail "Provider did not start"
+if [[ $external_provider == no ]]; then
+  ulimit -l unlimited 2>/dev/null ||
+    fail "could not raise the Provider memlock limit"
+  "$provider" :: "$port" "$tmp/provider-memory.conf" \
+    "$tmp/consumers.conf" >"$tmp/provider.log" 2>&1 &
+  provider_pid=$!
+  sleep 1
+  kill -0 "$provider_pid" 2>/dev/null || fail "Provider did not start"
+fi
 
 if ! mountpoint -q "$configfs"; then
   mount -t configfs none "$configfs"
@@ -270,25 +342,22 @@ dd if=/dev/infiniswap-remote-only of="$tmp/boundary-actual" bs=4096 \
 cmp "$tmp/boundary-pattern" "$tmp/boundary-actual" ||
   fail "Remote Chunk boundary I/O mismatched"
 
-# Silent packet loss exercises the idle Remote-Only heartbeat deadline rather
-# than relying on an immediate RDMA CM disconnect.
-tc qdisc replace dev "$netdev" root netem loss 100%
+# Silent RoCE packet loss exercises the idle Remote-Only heartbeat deadline
+# rather than relying on an immediate RDMA CM disconnect.
 network_fault_active=1
-wait_for_value_deadline "$root/infiniswap-remote-only/connection_state" \
-  remote-lost "$failure_deadline_ms"
-tc qdisc del dev "$netdev" root
+inject_network_fault
+wait_for_remote_lost_deadline \
+  "$root/infiniswap-remote-only/connection_state" \
+  "$root/infiniswap-remote-only/operational_state" \
+  "$failure_deadline_ms"
+clear_network_fault
 network_fault_active=0
-wait_for_value "$root/infiniswap-remote-only/operational_state" remote-lost
 [[ $(<"$root/infiniswap-remote-only/remote_lost_transitions_total") == 1 ]] ||
   fail "Remote-Lost transition was not counted exactly once"
-if timeout 5 dd if=/dev/zero of=/dev/infiniswap-remote-only bs=4096 count=1 \
-  oflag=direct status=none; then
-  fail "Remote-Lost accepted a write"
-fi
-if timeout 5 dd if=/dev/infiniswap-remote-only of="$tmp/lost-read" bs=4096 \
-  count=1 iflag=direct status=none; then
-  fail "Remote-Lost returned stale or zero-filled data"
-fi
+expect_explicit_io_failure write dd if=/dev/zero \
+  of=/dev/infiniswap-remote-only bs=4096 count=1 oflag=direct status=none
+expect_explicit_io_failure read dd if=/dev/infiniswap-remote-only \
+  of="$tmp/lost-read" bs=4096 count=1 iflag=direct status=none
 
 stop_group infiniswap-remote-only || fail "Remote-Lost device did not stop"
 new_logs=$(dmesg | tail -n "+$((dmesg_start + 1))")
