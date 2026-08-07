@@ -110,6 +110,7 @@ static int hello_capabilities_valid(const struct is_protocol_message *hello,
   return (negotiated_capabilities & mode_capability) != 0 &&
          (negotiated_capabilities & pool_capability) != 0 &&
          (negotiated_capabilities & IS_PROTOCOL_CAP_FAILURE_DEADLINE) != 0 &&
+         (negotiated_capabilities & IS_PROTOCOL_CAP_STATUS) != 0 &&
          (negotiated_capabilities & IS_PROTOCOL_CAP_AUTH_HMAC_SHA256) != 0;
 }
 

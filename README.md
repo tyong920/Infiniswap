@@ -248,10 +248,12 @@ Remote-Only activation is synchronous: the Provider must atomically grant one
 Committed Remote Chunk for every 1 GiB of advertised capacity before
 `/dev/infiniswap0` appears. Those assignments are excluded from normal pressure
 eviction. Reads are accepted only after successful writes establish remote
-validity; there is no Backing Store fallback. While the device is active, an
-authenticated status heartbeat uses one third of the Provider Failure Deadline
-for its interval and one third for its response, leaving the remaining third as
-scheduler margin for the terminal transition.
+validity; there is no Backing Store fallback. While any Infiniswap Device is
+active, an authenticated status heartbeat uses one third of the Provider
+Failure Deadline for its interval and one third for its response. The Provider
+expires a silent Memory Consumer at the full deadline and returns all of that
+session's Remote Chunks to its pools; the final third provides scheduler margin
+before that reclamation.
 
 Review the create preflight, then create and activate only that configured
 Infiniswap Device:

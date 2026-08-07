@@ -39,7 +39,8 @@ authentication. Each peer advertises only the capabilities its current runtime
 can honor; negotiation selects the intersection, so a Provider without
 Committed Pool accounting rejects a Remote-Only/Committed selection. The
 selected operating mode and pool must both be present in the negotiated set.
-HMAC-SHA256 is required by the Provider.
+Provider Failure Deadline, status reporting, and HMAC-SHA256 are required by the
+Provider so every accepted session has authenticated liveness detection.
 
 ## Messages
 
@@ -99,8 +100,11 @@ Backed Mode selects the Opportunistic Pool and requests individual Hot Ranges.
 Remote-Only Mode selects the Committed Pool and sends one full-capacity
 `CHUNK_REQUEST` before exposing its block device. The Provider admits that
 request transactionally; a short grant is invalid. Committed grants are never
-included in `EVICT` or Provider-originated `RELEASE` requests. After a completed
-Remote-Only reservation, an authenticated status heartbeat runs often enough
-to detect silent loss within the Provider Failure Deadline. Any connection,
-heartbeat, or operation failure makes the Consumer enter terminal Remote-Lost
-and reject subsequent I/O.
+included in `EVICT` or Provider-originated `RELEASE` requests. Every active
+session sends authenticated status heartbeats at one third of the Provider
+Failure Deadline. Each valid authenticated Consumer frame refreshes the
+Provider's liveness deadline; silence through the full deadline disconnects the
+session and returns its Remote Chunks to the applicable pool. A failed Backed
+Mode heartbeat makes the Consumer fall back to its Backing Store, while any
+connection, heartbeat, or operation failure after a Remote-Only reservation
+makes the Consumer enter terminal Remote-Lost and reject subsequent I/O.

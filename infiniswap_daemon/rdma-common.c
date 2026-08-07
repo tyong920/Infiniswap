@@ -87,15 +87,67 @@ static void add_milliseconds(struct timespec *deadline,
   }
 }
 
+static int monotonic_now(struct timespec *now, uint64_t *milliseconds)
+{
+  if (clock_gettime(CLOCK_MONOTONIC, now) != 0 || now->tv_sec < 0 ||
+      (uint64_t)now->tv_sec > UINT64_MAX / UINT64_C(1000))
+    return -1;
+  *milliseconds = (uint64_t)now->tv_sec * UINT64_C(1000) +
+                  (uint64_t)now->tv_nsec / UINT64_C(1000000);
+  return 0;
+}
+
+static int start_connection_liveness(struct connection *conn)
+{
+  struct timespec now;
+  uint64_t now_ms;
+  int result = 0;
+
+  if (monotonic_now(&now, &now_ms) != 0)
+    return -1;
+  pthread_mutex_lock(&conn->lifetime_lock);
+  if (conn->closing) {
+    result = -1;
+  } else {
+    is_consumer_liveness_init(
+        &conn->consumer_liveness,
+        conn->protocol_session.failure_deadline_ms,
+        conn->protocol_session.authenticated_until_unix, now_ms);
+    conn->handshake_complete = 1;
+    pthread_cond_broadcast(&conn->lifetime_idle);
+  }
+  pthread_mutex_unlock(&conn->lifetime_lock);
+  return result;
+}
+
+static int refresh_connection_liveness(struct connection *conn)
+{
+  struct timespec now;
+  uint64_t now_ms;
+  int result = 0;
+
+  if (monotonic_now(&now, &now_ms) != 0)
+    return -1;
+  pthread_mutex_lock(&conn->lifetime_lock);
+  if (conn->closing || !conn->handshake_complete) {
+    result = -1;
+  } else {
+    is_consumer_liveness_refresh(&conn->consumer_liveness, now_ms);
+    pthread_cond_broadcast(&conn->lifetime_idle);
+  }
+  pthread_mutex_unlock(&conn->lifetime_lock);
+  return result;
+}
+
 static void *monitor_connection_deadlines(void *context)
 {
   struct connection *conn = context;
   struct timespec deadline;
-  time_t now;
+  uint64_t now_ms;
   int result = 0;
   int disconnect = 0;
 
-  if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
+  if (monotonic_now(&deadline, &now_ms) != 0) {
     disconnect = 1;
     goto out;
   }
@@ -106,24 +158,27 @@ static void *monitor_connection_deadlines(void *context)
                                     &conn->lifetime_lock, &deadline);
   if (!conn->closing && !conn->handshake_complete)
     disconnect = 1;
-  if (!conn->closing && conn->handshake_complete &&
-      conn->protocol_session.authenticated_until_unix != 0) {
-    now = time(NULL);
-    if (now < 0 || (uint64_t)now >=
-                       conn->protocol_session.authenticated_until_unix) {
+
+  while (!conn->closing && !disconnect) {
+    enum is_consumer_liveness_result liveness_result;
+    uint64_t wait_ms;
+    time_t now_unix = time(NULL);
+
+    if (now_unix < 0 || monotonic_now(&deadline, &now_ms) != 0) {
       disconnect = 1;
-    } else if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
-      disconnect = 1;
-    } else {
-      deadline.tv_sec += (time_t)(
-          conn->protocol_session.authenticated_until_unix - (uint64_t)now);
-      result = 0;
-      while (!conn->closing && result == 0)
-        result = pthread_cond_timedwait(&conn->lifetime_idle,
-                                        &conn->lifetime_lock, &deadline);
-      if (!conn->closing && result == ETIMEDOUT)
-        disconnect = 1;
+      break;
     }
+    liveness_result = is_consumer_liveness_check(
+        &conn->consumer_liveness, now_ms, (uint64_t)now_unix, &wait_ms);
+    if (liveness_result != IS_CONSUMER_LIVENESS_ACTIVE) {
+      disconnect = 1;
+      break;
+    }
+    add_milliseconds(&deadline, (uint32_t)wait_ms);
+    result = pthread_cond_timedwait(&conn->lifetime_idle,
+                                    &conn->lifetime_lock, &deadline);
+    if (result != 0 && result != ETIMEDOUT)
+      disconnect = 1;
   }
   pthread_mutex_unlock(&conn->lifetime_lock);
 out:
@@ -229,7 +284,7 @@ int build_connection(struct rdma_cm_id *id)
   is_provider_session_init(
       &conn->protocol_session, provider_auth_registry,
       IS_PROTOCOL_MINOR_CURRENT, IS_PROVIDER_CAPABILITIES,
-      IS_PROTOCOL_CAP_AUTH_HMAC_SHA256, provider_nonce, session_id);
+      IS_PROVIDER_REQUIRED_CAPABILITIES, provider_nonce, session_id);
   //add to session
   pthread_mutex_lock(&session_lock);
   for (i=0; i<MAX_CLIENT; i++){
@@ -1009,10 +1064,10 @@ void on_completion(struct ibv_wc *wc)
         }
         conn->auth_subscribed = 1;
         conn->memory_connected = 1;
-        pthread_mutex_lock(&conn->lifetime_lock);
-        conn->handshake_complete = 1;
-        pthread_cond_broadcast(&conn->lifetime_idle);
-        pthread_mutex_unlock(&conn->lifetime_lock);
+        if (start_connection_liveness(conn) != 0) {
+          rdma_disconnect(conn->id);
+          goto done;
+        }
       }
       if (submit_encoded_message(
               conn, session_response, outcome.response_size,
@@ -1023,7 +1078,7 @@ void on_completion(struct ibv_wc *wc)
       }
       goto done;
     }
-    if (!outcome.request_ready) {
+    if (!outcome.request_ready || refresh_connection_liveness(conn) != 0) {
       rdma_disconnect(conn->id);
       goto done;
     }

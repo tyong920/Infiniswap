@@ -368,6 +368,41 @@ static int test_handshake_order_replay_and_minor_compatibility(void)
   return 0;
 }
 
+static int test_status_capability_is_required_for_liveness(void)
+{
+  struct is_auth_registry registry;
+  struct is_provider_session session;
+  struct is_provider_session_outcome outcome;
+  struct is_protocol_message hello;
+  struct is_protocol_message response_message;
+  uint8_t provider_nonce[IS_PROTOCOL_NONCE_SIZE] = {0};
+  uint8_t request_frame[IS_PROTOCOL_MAX_FRAME_SIZE];
+  uint8_t response[IS_PROTOCOL_MAX_FRAME_SIZE];
+  size_t request_size = 0;
+
+  is_auth_registry_init(&registry);
+  is_provider_session_init(&session, &registry,
+                           IS_PROTOCOL_MINOR_CURRENT,
+                           IS_PROTOCOL_CAP_KNOWN,
+                           IS_PROTOCOL_CAP_AUTH_HMAC_SHA256,
+                           provider_nonce, 24);
+  init_hello(&hello, IS_PROTOCOL_MINOR_CURRENT);
+  hello.header.capabilities &= ~IS_PROTOCOL_CAP_STATUS;
+  if (encode_message(&hello, request_frame, &request_size) ||
+      is_provider_session_handle(&session, request_frame, request_size,
+                                 response, sizeof(response), &outcome) != 0 ||
+      !outcome.response_ready || !outcome.close_after_response ||
+      is_protocol_decode(response, outcome.response_size,
+                         &response_message) != IS_PROTOCOL_OK ||
+      response_message.payload.error.code != IS_PROTOCOL_ERROR_CAPABILITY) {
+    fprintf(stderr, "Consumer without heartbeat support was accepted\n");
+    is_auth_registry_destroy(&registry);
+    return 1;
+  }
+  is_auth_registry_destroy(&registry);
+  return 0;
+}
+
 static int contains_bytes(const uint8_t *haystack, size_t haystack_size,
                           const uint8_t *needle, size_t needle_size)
 {
@@ -740,6 +775,7 @@ int main(void)
 
   failures += test_hmac_rotation_and_revocation();
   failures += test_handshake_order_replay_and_minor_compatibility();
+  failures += test_status_capability_is_required_for_liveness();
   failures += test_out_of_order_and_failed_authentication();
   failures += test_pool_selection_and_authorization();
   failures += test_allowlist_loader();

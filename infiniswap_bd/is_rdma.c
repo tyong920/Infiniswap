@@ -30,7 +30,8 @@
 	 IS_PROTOCOL_CAP_FAILURE_DEADLINE | IS_PROTOCOL_CAP_STATUS | \
 	 IS_PROTOCOL_CAP_AUTH_HMAC_SHA256)
 #define IS_RDMA_BACKED_REQUIRED_CAPABILITIES \
-	IS_PROTOCOL_CAP_AUTH_HMAC_SHA256
+	(IS_PROTOCOL_CAP_FAILURE_DEADLINE | IS_PROTOCOL_CAP_STATUS | \
+	 IS_PROTOCOL_CAP_AUTH_HMAC_SHA256)
 #define IS_RDMA_REMOTE_ONLY_REQUIRED_CAPABILITIES \
 	(IS_PROTOCOL_CAP_REMOTE_ONLY | IS_PROTOCOL_CAP_COMMITTED_POOL | \
 	 IS_PROTOCOL_CAP_FAILURE_DEADLINE | IS_PROTOCOL_CAP_STATUS | \
@@ -156,6 +157,7 @@ struct is_rdma_session {
 	u64 session_id;
 	u64 next_request_id;
 	u64 pending_request_id;
+	u64 heartbeat_request_id;
 	u32 pending_logical_chunk;
 	u32 pending_chunk_count;
 	u32 release_provider_ids[IS_PROTOCOL_MAX_CHUNKS_PER_FRAME];
@@ -491,25 +493,53 @@ static void is_heartbeat_work(struct work_struct *work)
 	struct is_rdma_session *session = container_of(
 		to_delayed_work(work), struct is_rdma_session, heartbeat_work);
 	struct is_protocol_message *request = &session->outbound_message;
+	bool remote_only;
+	bool timed_out = false;
 	int ret = 0;
 
 	mutex_lock(&session->control_lock);
-	if (READ_ONCE(session->stopping) ||
-	    session->control_state != IS_RDMA_CONTROL_READY ||
-	    !session->reservation_complete)
+	remote_only = is_remote_only(session);
+	if (READ_ONCE(session->stopping))
 		goto out;
+	if (session->control_state != IS_RDMA_CONTROL_READY ||
+	    (!remote_only && (session->pending_request_id ||
+			     session->release_count))) {
+		if (session->control_state != IS_RDMA_CONTROL_FAILED &&
+		    session->control_state != IS_RDMA_CONTROL_STOPPING)
+			is_schedule_heartbeat(session);
+		goto out;
+	}
+	if (remote_only && !session->reservation_complete)
+		goto out;
+	if (!remote_only && session->heartbeat_request_id) {
+		timed_out = true;
+		goto out;
+	}
 	is_init_message(session, request, IS_PROTOCOL_MSG_STATUS_REQUEST,
 		session->next_request_id++, false);
-	session->pending_request_id = request->header.request_id;
-	session->control_state = IS_RDMA_CONTROL_WAIT_HEARTBEAT;
-	ret = is_encode_and_send_timeout(session, request, 0);
-	if (!ret)
-		is_arm_control_deadline_ms(session,
-			is_heartbeat_interval_ms(session));
+	if (remote_only) {
+		session->pending_request_id = request->header.request_id;
+		session->control_state = IS_RDMA_CONTROL_WAIT_HEARTBEAT;
+		ret = is_encode_and_send_timeout(session, request, 0);
+		if (!ret)
+			is_arm_control_deadline_ms(session,
+				is_heartbeat_interval_ms(session));
+	} else {
+		session->heartbeat_request_id = request->header.request_id;
+		ret = is_encode_and_send_timeout(session, request, 0);
+		if (ret)
+			session->heartbeat_request_id = 0;
+		else
+			is_schedule_heartbeat(session);
+	}
 out:
 	mutex_unlock(&session->control_lock);
-	if (ret)
+	if (timed_out) {
+		atomic64_inc(&session->device->provider_timeouts_total);
+		is_fail_after_provider_timeout(session);
+	} else if (ret) {
 		is_rdma_fail(session, ret);
+	}
 }
 
 static int is_compute_auth_tag(struct is_rdma_session *session,
@@ -693,10 +723,10 @@ static void is_mark_session_ready(struct is_rdma_session *session,
 			IS_CONNECTION_CONNECTED);
 	}
 	wake_up_all(&session->control_wait);
-	if (remote_only)
-		is_schedule_heartbeat(session);
-	else
+	if (!remote_only)
 		queue_work(session->control_wq, &session->mapping_work);
+	if (session->negotiated_capabilities & IS_PROTOCOL_CAP_STATUS)
+		is_schedule_heartbeat(session);
 }
 
 static int is_handle_accept(struct is_rdma_session *session,
@@ -774,11 +804,11 @@ static int is_request_remote_only_reservation(
 
 static bool is_status_response_valid(
 	const struct is_rdma_session *session,
-	const struct is_protocol_message *status)
+	const struct is_protocol_message *status, u64 request_id)
 {
 	return is_authenticated_header_valid(session, status) &&
 		(status->header.flags & IS_PROTOCOL_FLAG_RESPONSE) &&
-		status->header.request_id == session->pending_request_id &&
+		status->header.request_id == request_id &&
 		status->payload.status.provider_failure_deadline_ms ==
 			session->device->provider_failure_deadline_ms;
 }
@@ -788,7 +818,8 @@ static int is_handle_status(struct is_rdma_session *session,
 {
 	bool healthy;
 
-	if (!is_status_response_valid(session, status))
+	if (!is_status_response_valid(session, status,
+		    session->pending_request_id))
 		return -EPROTO;
 	healthy = (status->payload.status.flags & IS_PROTOCOL_STATUS_HEALTHY) != 0;
 	if (is_remote_only(session)) {
@@ -809,11 +840,31 @@ static int is_handle_status(struct is_rdma_session *session,
 static int is_handle_heartbeat(struct is_rdma_session *session,
 			       const struct is_protocol_message *status)
 {
-	if (!is_status_response_valid(session, status))
+	if (!is_status_response_valid(session, status,
+		    session->pending_request_id))
 		return -EPROTO;
 	if (!(status->payload.status.flags & IS_PROTOCOL_STATUS_HEALTHY))
 		return -EIO;
 	is_mark_session_ready(session, session->chunk_count);
+	return 0;
+}
+
+static int is_handle_backed_heartbeat(
+	struct is_rdma_session *session,
+	const struct is_protocol_message *status)
+{
+	if (!session->heartbeat_request_id ||
+	    !is_status_response_valid(session, status,
+		    session->heartbeat_request_id))
+		return -EPROTO;
+	session->heartbeat_request_id = 0;
+	if (!(status->payload.status.flags & IS_PROTOCOL_STATUS_HEALTHY))
+		return -EIO;
+	session->remote_chunk_limit = min_t(unsigned int,
+		status->payload.status.available_opportunistic_chunks,
+		session->chunk_count);
+	is_schedule_heartbeat(session);
+	queue_work(session->control_wq, &session->mapping_work);
 	return 0;
 }
 
@@ -1075,6 +1126,10 @@ static void is_receive_work(struct work_struct *work)
 		break;
 	case IS_RDMA_CONTROL_READY:
 		switch (message->header.type) {
+		case IS_PROTOCOL_MSG_STATUS_RESPONSE:
+			ret = is_remote_only(session) ? -EPROTO :
+				is_handle_backed_heartbeat(session, message);
+			break;
 		case IS_PROTOCOL_MSG_CHUNK_GRANT:
 			ret = is_handle_chunk_grant(session, message);
 			break;
@@ -1118,7 +1173,8 @@ static void is_mapping_work(struct work_struct *work)
 
 	mutex_lock(&session->control_lock);
 	if (session->control_state != IS_RDMA_CONTROL_READY ||
-	    session->pending_request_id || session->release_count ||
+	    session->pending_request_id || session->heartbeat_request_id ||
+	    session->release_count ||
 	    (unsigned int)atomic_read(&session->device->mapped_remote_chunks) >=
 		    session->remote_chunk_limit)
 		goto out;

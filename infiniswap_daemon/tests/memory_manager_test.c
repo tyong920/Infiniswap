@@ -486,6 +486,11 @@ static int test_connection_quota_eviction_disconnect_and_shutdown(void)
       status.consumer_assigned_opportunistic_chunks != 3 ||
       is_memory_manager_disconnect(manager, &owner_a) != IS_MEMORY_OK ||
       expect_status(manager, &owner_b, 3, 1, 0, 0) ||
+      is_memory_manager_acquire(manager, &owner_b,
+                                IS_MEMORY_POOL_OPPORTUNISTIC, 2,
+                                NULL, &registration, grants, 2) !=
+          IS_MEMORY_OK ||
+      expect_status(manager, &owner_b, 3, 3, 0, 0) ||
       is_memory_manager_disconnect(manager, &owner_b) != IS_MEMORY_OK ||
       expect_status(manager, NULL, 3, 0, 0, 0)) {
     fprintf(stderr, "eviction or disconnect accounting did not reconcile\n");

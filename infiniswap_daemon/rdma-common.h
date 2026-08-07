@@ -18,6 +18,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "infiniswap_consumer_liveness.h"
 #include "infiniswap_memory_manager.h"
 #include "infiniswap_provider_session.h"
 
@@ -50,6 +51,9 @@ _Static_assert((int)IS_MEMORY_POOL_OPPORTUNISTIC ==
   (IS_PROTOCOL_CAP_BACKED | IS_PROTOCOL_CAP_REMOTE_ONLY |                 \
    IS_PROTOCOL_CAP_OPPORTUNISTIC_POOL | IS_PROTOCOL_CAP_COMMITTED_POOL |  \
    IS_PROTOCOL_CAP_FAILURE_DEADLINE | IS_PROTOCOL_CAP_STATUS |            \
+   IS_PROTOCOL_CAP_AUTH_HMAC_SHA256)
+#define IS_PROVIDER_REQUIRED_CAPABILITIES                                 \
+  (IS_PROTOCOL_CAP_FAILURE_DEADLINE | IS_PROTOCOL_CAP_STATUS |            \
    IS_PROTOCOL_CAP_AUTH_HMAC_SHA256)
 #define PROVIDER_HANDSHAKE_TIMEOUT_MS 5000U
 
@@ -119,6 +123,7 @@ struct connection {
   struct control_message recv_message;
   struct control_message send_message;
   struct is_provider_session protocol_session;
+  struct is_consumer_liveness consumer_liveness;
   uint64_t active_request_id;
   uint64_t next_provider_request_id;
   uint64_t pending_evict_request_id;

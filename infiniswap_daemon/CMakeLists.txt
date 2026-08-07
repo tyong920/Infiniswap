@@ -41,6 +41,13 @@ target_include_directories(
 target_link_libraries(
   infiniswap-control PUBLIC infiniswap-protocol PkgConfig::CRYPTO)
 
+add_library(infiniswap-consumer-liveness STATIC infiniswap_consumer_liveness.c)
+target_compile_features(infiniswap-consumer-liveness PUBLIC c_std_11)
+target_compile_options(
+  infiniswap-consumer-liveness PRIVATE -Wall -Wextra -Wpedantic -Werror)
+target_include_directories(
+  infiniswap-consumer-liveness PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
 add_library(infiniswap-provider-core STATIC rdma-common.c)
 target_compile_features(infiniswap-provider-core PUBLIC c_std_11)
 target_compile_definitions(
@@ -59,6 +66,7 @@ target_link_libraries(
     PkgConfig::RDMACM
     PkgConfig::CRYPTO
     Threads::Threads
+    infiniswap-consumer-liveness
     infiniswap-control
     infiniswap-memory)
 
@@ -121,6 +129,13 @@ if(BUILD_TESTING)
   target_compile_options(memory-manager-test PRIVATE -Wall -Wextra -Wpedantic -Werror)
   target_link_libraries(memory-manager-test PRIVATE infiniswap-memory)
   add_test(NAME memory-manager COMMAND memory-manager-test)
+
+  add_executable(consumer-liveness-test tests/consumer_liveness_test.c)
+  target_compile_options(
+    consumer-liveness-test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  target_link_libraries(
+    consumer-liveness-test PRIVATE infiniswap-consumer-liveness)
+  add_test(NAME consumer-liveness COMMAND consumer-liveness-test)
 
   add_executable(rdma-common-test tests/rdma_common_test.c)
   target_compile_options(rdma-common-test PRIVATE -Wall -Wextra -Wpedantic -Werror)
