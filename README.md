@@ -419,8 +419,26 @@ sudo prlimit --memlock=unlimited:unlimited -- \
   /tmp/provider-memory.conf /tmp/consumers.conf
 ```
 
-Then run the focused test on the Consumer, replacing the PSK and Provider
-address:
+Then run the focused reconnect test on the Consumer, replacing the PSK and
+Provider address:
+
+```bash
+sudo INFINISWAP_TEST_DESTRUCTIVE=yes \
+  INFINISWAP_TEST_CASE=reconnect \
+  INFINISWAP_TEST_MODULE="$PWD/infiniswap_bd/infiniswap.ko" \
+  INFINISWAP_TEST_EXTERNAL_PROVIDER=yes \
+  INFINISWAP_TEST_PSK_HEX="<PSK printed by Provider setup>" \
+  INFINISWAP_TEST_RDMA_DEVICE=rxe0 \
+  INFINISWAP_TEST_RDMA_ADDRESS="<Provider IPv4 address>" \
+  infiniswap_bd/tests/remote-only-test.sh
+```
+
+This focused case reserves and releases one Committed Remote Chunk, then
+immediately repeats activation. It verifies that graceful disconnect completion
+prevents the replacement session from being rejected as a stale RDMA
+connection.
+
+To test the Remote-Lost network transition, run the focused fault case:
 
 ```bash
 sudo INFINISWAP_TEST_DESTRUCTIVE=yes \
@@ -435,12 +453,12 @@ sudo INFINISWAP_TEST_DESTRUCTIVE=yes \
   infiniswap_bd/tests/remote-only-test.sh
 ```
 
-The focused test reserves one Committed Remote Chunk and requires an observed
-Provider timeout before it waits for both device states to become Remote-Lost.
-It also verifies the transition count and explicit read/write failure. `netem`
-briefly interrupts other Consumer traffic on the same netdev. Set
-`INFINISWAP_TEST_FAULT_MODE=roce-iptables` to drop only UDP/4791 traffic to an
-IPv4 Provider when the management connection must remain unaffected.
+The network-fault test reserves one Committed Remote Chunk and requires an
+observed Provider timeout before it waits for both device states to become
+Remote-Lost. It also verifies the transition count and explicit read/write
+failure. `netem` briefly interrupts other Consumer traffic on the same netdev.
+Set `INFINISWAP_TEST_FAULT_MODE=roce-iptables` to drop only UDP/4791 traffic to
+an IPv4 Provider when the management connection must remain unaffected.
 
 `setup/install.sh bd` only builds and installs the module. It does not load the
 module, create an Infiniswap Device, format swap, or alter active swap.

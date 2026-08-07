@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR BSD-3-Clause
 #include <crypto/hash.h>
 #include <linux/bitmap.h>
+#include <linux/completion.h>
 #include <linux/crypto.h>
 #include <linux/dma-direction.h>
 #include <linux/inet.h>
@@ -98,6 +99,7 @@ struct is_rdma_session {
 	struct ib_qp *qp;
 	bool qp_has_work;
 	bool connect_started;
+	struct completion disconnect_complete;
 
 	struct mutex control_lock;
 	spinlock_t chunk_lock;
@@ -1342,6 +1344,8 @@ static int is_rdma_cm_event(struct rdma_cm_id *id,
 	struct is_rdma_session *session = id->context;
 	int ret = 0;
 
+	if (event->event == RDMA_CM_EVENT_DISCONNECTED)
+		complete_all(&session->disconnect_complete);
 	if (READ_ONCE(session->stopping) ||
 	    READ_ONCE(session->control_state) == IS_RDMA_CONTROL_FAILED)
 		return 0;
@@ -1424,6 +1428,7 @@ int is_rdma_start(struct is_device *device)
 	if (!session)
 		return -ENOMEM;
 	session->device = device;
+	init_completion(&session->disconnect_complete);
 	session->chunk_count = device->capacity_bytes / IS_CHUNK_BYTES;
 	session->next_request_id = 1;
 	session->negotiated_minor = IS_PROTOCOL_MINOR_CURRENT;
@@ -1570,8 +1575,17 @@ void is_rdma_stop(struct is_device *device)
 	cancel_delayed_work_sync(&session->control_deadline_work);
 	cancel_delayed_work_sync(&session->heartbeat_work);
 	cancel_work_sync(&session->connect_work);
-	if (session->connect_started)
-		rdma_disconnect(session->cm_id);
+	if (session->connect_started) {
+		int ret = rdma_disconnect(session->cm_id);
+
+		if (!ret && READ_ONCE(session->ever_connected) &&
+		    !READ_ONCE(session->failure_started)) {
+			/* Do not race a replacement session with stale peer CM state. */
+			wait_for_completion_timeout(&session->disconnect_complete,
+				msecs_to_jiffies(session->device->
+					provider_failure_deadline_ms));
+		}
+	}
 	cancel_work_sync(&session->hello_work);
 	cancel_work_sync(&session->receive_work);
 	cancel_work_sync(&session->mapping_work);

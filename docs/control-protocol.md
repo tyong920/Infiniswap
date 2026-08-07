@@ -94,7 +94,11 @@ capabilities, and a request ID greater than the previous request. Malformed,
 replayed, unauthenticated, revoked, unsupported, and out-of-order messages
 receive a structured `ERROR`, after which the Provider closes the connection.
 Connection teardown deregisters every Remote Memory region owned by that
-session, so a protocol failure cannot leave a grant active.
+session, so a protocol failure cannot leave a grant active. During a graceful
+Consumer stop, the Consumer waits a bounded interval for RDMA CM to report the
+disconnection before destroying its local connection identifier. This keeps an
+immediately recreated session from racing transport-level stale-connection
+state; failure teardown remains bounded and does not wait for a silent peer.
 
 Backed Mode selects the Opportunistic Pool and requests individual Hot Ranges.
 Remote-Only Mode selects the Committed Pool and sends one full-capacity

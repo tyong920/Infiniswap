@@ -198,18 +198,19 @@ done
 [[ -n $module && -n $address ]] ||
   fail "set INFINISWAP_TEST_MODULE and INFINISWAP_TEST_RDMA_ADDRESS"
 case $test_case in
-  all | network-fault) ;;
-  *) fail "INFINISWAP_TEST_CASE must be all or network-fault" ;;
+  all | network-fault | reconnect) ;;
+  *) fail "INFINISWAP_TEST_CASE must be all, network-fault, or reconnect" ;;
 esac
 case $external_provider in
   yes | no) ;;
   *) fail "INFINISWAP_TEST_EXTERNAL_PROVIDER must be yes or no" ;;
 esac
-if [[ $test_case == network-fault && $external_provider != yes ]]; then
-  fail "network-fault requires INFINISWAP_TEST_EXTERNAL_PROVIDER=yes"
+if [[ $test_case != all && $external_provider != yes ]]; then
+  fail "$test_case requires INFINISWAP_TEST_EXTERNAL_PROVIDER=yes"
 fi
 network_test_enabled=0
-if [[ $test_case == network-fault || $external_provider == yes ]]; then
+if [[ $test_case == network-fault ||
+      ($test_case == all && $external_provider == yes) ]]; then
   network_test_enabled=1
 fi
 case $fault_mode in
@@ -353,6 +354,44 @@ test_network_fault() {
     "$transition_elapsed" "$(<"$group/connection_state")" "$timeouts"
 }
 
+check_kernel_diagnostics() {
+  local new_logs
+
+  new_logs=$(dmesg | tail -n "+$((dmesg_start + 1))")
+  if grep -Eqi 'BUG:|Oops:|kernel panic|KASAN:|use-after-free|general protection fault' \
+    <<<"$new_logs"; then
+    fail "kernel log contains a fatal diagnostic"
+  fi
+}
+
+test_reconnect() {
+  local iteration name group
+  local started_ms
+
+  started_ms=$(date +%s%3N)
+  for iteration in 1 2; do
+    name="infiniswap-reconnect-$iteration"
+    group=$root/$name
+    configure_group "$name" "$chunk_bytes" 1
+    printf 'activate\n' > "$group/state"
+    wait_for_path "/dev/$name" present
+    wait_for_value "$group/connection_state" connected
+    [[ $(<"$group/mapped_remote_chunks") == 1 ]] ||
+      fail "$name did not reserve its Committed Remote Chunk"
+    [[ $(<"$group/remote_capacity_bytes") == "$chunk_bytes" ]] ||
+      fail "$name exposed partial committed capacity"
+    stop_group "$name" || fail "$name did not complete disconnect cleanup"
+  done
+  printf 'reconnect elapsed_ms=%s\n' "$(($(date +%s%3N) - started_ms))"
+}
+
+if [[ $test_case == reconnect ]]; then
+  test_reconnect
+  check_kernel_diagnostics
+  echo "focused Remote-Only reconnect verification passed"
+  exit 0
+fi
+
 if [[ $test_case == network-fault ]]; then
   configure_group infiniswap-remote-only "$chunk_bytes" 1
   printf 'activate\n' > "$root/infiniswap-remote-only/state"
@@ -363,6 +402,7 @@ if [[ $test_case == network-fault ]]; then
   test_network_fault infiniswap-remote-only
   stop_group infiniswap-remote-only ||
     fail "Remote-Lost device did not stop"
+  check_kernel_diagnostics
   echo "focused Remote-Only network interruption verification passed"
   exit 0
 fi
@@ -430,10 +470,6 @@ if [[ $external_provider == yes ]]; then
 fi
 
 stop_group infiniswap-remote-only || fail "Remote-Only device did not stop"
-new_logs=$(dmesg | tail -n "+$((dmesg_start + 1))")
-if grep -Eqi 'BUG:|Oops:|kernel panic|KASAN:|use-after-free|general protection fault' \
-  <<<"$new_logs"; then
-  fail "kernel log contains a fatal diagnostic"
-fi
+check_kernel_diagnostics
 
 echo "Remote-Only Mode test passed"
