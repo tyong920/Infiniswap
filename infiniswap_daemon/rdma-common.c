@@ -18,8 +18,11 @@ static void *monitor_connection_deadlines(void *context);
 static void on_completion(struct ibv_wc *);
 static void * poll_cq(void *);
 static void post_receives(struct connection *conn);
+static void prepare_connection_close(struct connection *conn);
 static void register_memory(struct connection *conn);
 static void send_message(struct connection *conn, int repost_receive);
+static void wait_for_connection_references(struct connection *conn,
+                                           unsigned int remaining);
 
 struct rdma_session session;
 
@@ -71,8 +74,8 @@ static void connection_put_reference(struct connection *conn)
   pthread_mutex_lock(&conn->lifetime_lock);
   if (conn->references > 0)
     conn->references--;
-  if (conn->closing && conn->references == 0)
-    pthread_cond_signal(&conn->lifetime_idle);
+  if (conn->closing)
+    pthread_cond_broadcast(&conn->lifetime_idle);
   pthread_mutex_unlock(&conn->lifetime_lock);
 }
 
@@ -182,8 +185,13 @@ static void *monitor_connection_deadlines(void *context)
   }
   pthread_mutex_unlock(&conn->lifetime_lock);
 out:
-  if (disconnect)
-    rdma_disconnect(conn->id);
+  if (disconnect) {
+    (void)rdma_disconnect(conn->id);
+    prepare_connection_close(conn);
+    wait_for_connection_references(conn, 1);
+    if (reclaim_connection_memory(conn) != IS_MEMORY_OK)
+      die("could not reclaim silent Consumer Remote Chunks");
+  }
   connection_put_reference(conn);
   return NULL;
 }
@@ -354,16 +362,22 @@ void build_qp_attr(struct ibv_qp_init_attr *qp_attr)
   qp_attr->cap.max_recv_sge = 1;
 }
 
-void destroy_connection(void *context)
+static void prepare_connection_close(struct connection *conn)
 {
-  struct connection *conn = (struct connection *)context;
   struct ibv_qp_attr qp_attr;
   struct ibv_qp_init_attr qp_init_attr;
+  int prepare = 0;
 
   pthread_mutex_lock(&conn->lifetime_lock);
-  conn->closing = 1;
+  if (!conn->closing) {
+    conn->closing = 1;
+    prepare = 1;
+  }
   pthread_cond_broadcast(&conn->lifetime_idle);
   pthread_mutex_unlock(&conn->lifetime_lock);
+  if (!prepare)
+    return;
+
   sem_post(&conn->evict_sem);
   sem_post(&conn->stop_sem);
   memset(&qp_attr, 0, sizeof(qp_attr));
@@ -375,10 +389,37 @@ void destroy_connection(void *context)
     if (ibv_modify_qp(conn->qp, &qp_attr, IBV_QP_STATE) != 0)
       die("could not drain a disconnected control queue");
   }
+}
+
+static void wait_for_connection_references(struct connection *conn,
+                                           unsigned int remaining)
+{
   pthread_mutex_lock(&conn->lifetime_lock);
-  while (conn->references != 0)
+  while (conn->references > remaining)
     pthread_cond_wait(&conn->lifetime_idle, &conn->lifetime_lock);
   pthread_mutex_unlock(&conn->lifetime_lock);
+}
+
+enum is_memory_result reclaim_connection_memory(struct connection *conn)
+{
+  enum is_memory_result result;
+
+  if (!conn || !conn->memory_connected)
+    return IS_MEMORY_OK;
+  result = is_memory_manager_disconnect(session.memory_manager, conn);
+  if (result == IS_MEMORY_OK || result == IS_MEMORY_NOT_CONNECTED) {
+    conn->memory_connected = 0;
+    return IS_MEMORY_OK;
+  }
+  return result;
+}
+
+void destroy_connection(void *context)
+{
+  struct connection *conn = (struct connection *)context;
+
+  prepare_connection_close(conn);
+  wait_for_connection_references(conn, 0);
   TEST_NZ(pthread_join(conn->deadline_thread, NULL));
   if (conn->auth_subscribed) {
     is_auth_registry_unsubscribe(provider_auth_registry, conn);
@@ -393,11 +434,8 @@ void destroy_connection(void *context)
   free(conn->pending_send_frame);
   free(conn->recv_frame);
 
-  if (conn->memory_connected &&
-      is_memory_manager_disconnect(session.memory_manager, conn) !=
-          IS_MEMORY_OK)
+  if (reclaim_connection_memory(conn) != IS_MEMORY_OK)
     die("could not release registered Remote Memory");
-  conn->memory_connected = 0;
 
   pthread_mutex_lock(&session_lock);
   session.conns[conn->conn_index] = NULL;

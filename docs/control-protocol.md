@@ -103,8 +103,11 @@ request transactionally; a short grant is invalid. Committed grants are never
 included in `EVICT` or Provider-originated `RELEASE` requests. Every active
 session sends authenticated status heartbeats at one third of the Provider
 Failure Deadline. Each valid authenticated Consumer frame refreshes the
-Provider's liveness deadline; silence through the full deadline disconnects the
-session and returns its Remote Chunks to the applicable pool. A failed Backed
-Mode heartbeat makes the Consumer fall back to its Backing Store, while any
-connection, heartbeat, or operation failure after a Remote-Only reservation
-makes the Consumer enter terminal Remote-Lost and reject subsequent I/O.
+Provider's liveness deadline. At the full deadline, the Provider closes the
+silent session's local work queue, drains in-flight completions, and immediately
+returns its Remote Chunks to the applicable pool without waiting for the peer's
+disconnect acknowledgement. The transport object is destroyed when RDMA CM
+later reports disconnection. A failed Backed Mode heartbeat makes the Consumer
+fall back to its Backing Store, while any connection, heartbeat, or operation
+failure after a Remote-Only reservation makes the Consumer enter terminal
+Remote-Lost and reject subsequent I/O.

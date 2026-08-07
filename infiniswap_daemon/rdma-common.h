@@ -208,6 +208,7 @@ void set_provider_auth_registry(struct is_auth_registry *registry);
 int build_connection(struct rdma_cm_id *id);
 void build_params(struct rdma_conn_param *params);
 void destroy_connection(void *context);
+enum is_memory_result reclaim_connection_memory(struct connection *conn);
 void on_connect(void *context);
 void send_mr(void *context, int n);
 int send_stop(void *context, int n);

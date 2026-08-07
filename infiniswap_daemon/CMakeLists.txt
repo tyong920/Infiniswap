@@ -140,5 +140,7 @@ if(BUILD_TESTING)
   add_executable(rdma-common-test tests/rdma_common_test.c)
   target_compile_options(rdma-common-test PRIVATE -Wall -Wextra -Wpedantic -Werror)
   target_link_libraries(rdma-common-test PRIVATE infiniswap-provider-core)
+  target_link_options(
+    rdma-common-test PRIVATE "-Wl,--wrap=is_memory_manager_disconnect")
   add_test(NAME rdma-common COMMAND rdma-common-test)
 endif()

@@ -7,6 +7,19 @@
 
 volatile sig_atomic_t running;
 
+static unsigned int disconnect_calls;
+static struct is_memory_manager *disconnected_manager;
+static void *disconnected_owner;
+
+enum is_memory_result __wrap_is_memory_manager_disconnect(
+    struct is_memory_manager *manager, void *owner)
+{
+  disconnect_calls++;
+  disconnected_manager = manager;
+  disconnected_owner = owner;
+  return IS_MEMORY_OK;
+}
+
 static int test_connection_params(void)
 {
   struct rdma_conn_param params;
@@ -63,11 +76,40 @@ static int test_exact_control_response_correlation(void)
   return 0;
 }
 
+static int test_silent_connection_reclaims_memory_once(void)
+{
+  static int manager_token;
+  struct is_memory_manager *manager =
+      (struct is_memory_manager *)(void *)&manager_token;
+  struct connection connection;
+
+  memset(&connection, 0, sizeof(connection));
+  connection.memory_connected = 1;
+  rdma_session_init(&session, manager);
+  disconnect_calls = 0;
+  disconnected_manager = NULL;
+  disconnected_owner = NULL;
+
+  if (reclaim_connection_memory(&connection) != IS_MEMORY_OK ||
+      connection.memory_connected || disconnect_calls != 1 ||
+      disconnected_manager != manager || disconnected_owner != &connection) {
+    fprintf(stderr, "silent connection did not reclaim its Remote Chunks\n");
+    return 1;
+  }
+  if (reclaim_connection_memory(&connection) != IS_MEMORY_OK ||
+      disconnect_calls != 1) {
+    fprintf(stderr, "Remote Chunk reclamation was not idempotent\n");
+    return 1;
+  }
+  return 0;
+}
+
 int main(void)
 {
   return test_connection_params() == 0 &&
                  test_provider_capabilities() == 0 &&
-                 test_exact_control_response_correlation() == 0
+                 test_exact_control_response_correlation() == 0 &&
+                 test_silent_connection_reclaims_memory_once() == 0
              ? 0
              : 1;
 }
