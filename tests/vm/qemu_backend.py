@@ -462,7 +462,8 @@ class QemuBackend:
             "if=virtio,format=qcow2,file=%s,cache=none,discard=unmap"
             % guest.root_image,
             "-drive",
-            "if=virtio,format=raw,file=%s,readonly=on" % guest.seed_image,
+            "if=ide,media=cdrom,format=raw,file=%s,readonly=on"
+            % guest.seed_image,
             "-netdev",
             "user,id=mgmt,hostfwd=tcp:127.0.0.1:%d-:22" % guest.ssh_port,
             "-device",
@@ -1303,7 +1304,7 @@ class QemuBackend:
             "-o",
             "ServerAliveInterval=15",
             "-o",
-            "ServerAliveCountMax=4",
+            "ServerAliveCountMax=20",
             "-o",
             "StrictHostKeyChecking=no",
             "-o",

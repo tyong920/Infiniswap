@@ -247,11 +247,16 @@ heat_ranges() {
 }
 
 run_fio() {
-  local label=$1 duration=${2:-0} args
+  local label=$1 duration=${2:-0} rw=randrw
+  local -a args
+  [[ $label == *remote-only* ]] && rw=write
   args=(--name="$label" --filename="$device" --direct=1 --ioengine=libaio
-    --rw=randrw --rwmixread=60 --bs=4k --iodepth=32 --size=64m
+    --rw="$rw" --bs=4k --iodepth=32 --size=64m
     --verify=crc32c --do_verify=1 --verify_fatal=1 --group_reporting
     --output-format=json --output="$artifacts/fio-$label.json")
+  if [[ $rw == randrw ]]; then
+    args+=(--rwmixread=60)
+  fi
   if ((duration > 0)); then
     args+=(--time_based=1 --runtime="$duration")
   fi
@@ -280,7 +285,10 @@ swap_pressure() {
   mkswap -f "$device" >"$artifacts/mkswap.txt"
   swapon --priority 100 "$device"
   before=$(awk '/^pswpout / {print $2}' /proc/vmstat)
-  python3 - "$artifacts/swap-pressure.json" <<'PY'
+  systemd-run --quiet --wait --pipe --collect \
+    --unit="infiniswap-vm-pressure-$$" \
+    --property=MemoryMax=512M --property=MemorySwapMax=512M \
+    python3 - "$artifacts/swap-pressure.json" <<'PY'
 import json
 import os
 import sys
@@ -301,16 +309,15 @@ def device_swap_used_bytes():
 
 with open("/proc/meminfo", encoding="ascii") as source:
     values = {line.split(":", 1)[0]: int(line.split()[1]) for line in source}
-available = values["MemAvailable"] * 1024
 swap_free_start = values["SwapFree"] * 1024
 device_used_start = device_swap_used_bytes()
-limit = available + min(512 * 1024 * 1024, swap_free_start // 2)
+bytes_target = 768 * 1024 * 1024
 chunks = []
 status = "no-swap-observed"
 try:
     with open("/proc/self/oom_score_adj", "w", encoding="ascii") as target:
         target.write("1000\n")
-    for _ in range(max(1, limit // chunk_size)):
+    for _ in range(bytes_target // chunk_size):
         chunk = bytearray(chunk_size)
         for offset in range(0, len(chunk), 4096):
             chunk[offset] = 0x5A
