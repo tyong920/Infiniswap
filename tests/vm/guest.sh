@@ -208,21 +208,21 @@ create_device() {
 }
 
 write_pattern() {
-  local label=$1 block=${2:-0} flush=${3:-yes}
-  dd if=/dev/urandom of="$artifacts/$label.pattern" bs=4096 count=64 status=none
+  local label=$1 block=${2:-0} flush=${3:-yes} count=${4:-64}
+  dd if=/dev/urandom of="$artifacts/$label.pattern" bs=4096 count="$count" status=none
   sync "$artifacts/$label.pattern"
   if [[ $flush == yes ]]; then
-    timeout 20 dd if="$artifacts/$label.pattern" of="$device" bs=4096 count=64 \
+    timeout 20 dd if="$artifacts/$label.pattern" of="$device" bs=4096 count="$count" \
       seek="$block" oflag=direct conv=fsync status=none
   else
-    timeout 20 dd if="$artifacts/$label.pattern" of="$device" bs=4096 count=64 \
+    timeout 20 dd if="$artifacts/$label.pattern" of="$device" bs=4096 count="$count" \
       seek="$block" oflag=direct status=none
   fi
 }
 
 read_pattern() {
-  local label=$1 block=${2:-0}
-  timeout 20 dd if="$device" of="$artifacts/$label.actual" bs=4096 count=64 \
+  local label=$1 block=${2:-0} count=${3:-64}
+  timeout 20 dd if="$device" of="$artifacts/$label.actual" bs=4096 count="$count" \
     skip="$block" iflag=direct status=none
   cmp "$artifacts/$label.pattern" "$artifacts/$label.actual" ||
     fail "$label data mismatch"

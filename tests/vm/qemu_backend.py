@@ -990,6 +990,7 @@ class QemuBackend:
                 "backing-fault",
                 "32",
                 "no-flush",
+                "1",
             )
             self._helper(
                 handle,
@@ -1006,6 +1007,7 @@ class QemuBackend:
                 "read-pattern",
                 "backing-fault",
                 "32",
+                "1",
             )
             self._helper(
                 handle,
@@ -1052,16 +1054,28 @@ class QemuBackend:
             handle, handle.consumer, "status-before-reboot", "snapshot", "before-reboot"
         )
         self._check_kernel(handle)
-        self._ssh_shell(
+        boot_id = self._ssh_shell(
             handle,
             handle.consumer,
-            "force-reboot",
-            "sync; systemctl reboot --force --force",
-            sudo=True,
-            timeout=15,
-            check=False,
-        )
-        self._wait_for_reboot(handle, handle.consumer)
+            "boot-id-before-reboot",
+            "cat /proc/sys/kernel/random/boot_id",
+        ).stdout.strip()
+        if not boot_id:
+            raise BoundaryError("guest boot ID is empty before reboot")
+        try:
+            self._ssh_shell(
+                handle,
+                handle.consumer,
+                "force-reboot",
+                "sync; systemctl reboot --force --force",
+                sudo=True,
+                timeout=15,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            # A force reboot can stop sshd before SSH observes the disconnect.
+            pass
+        self._wait_for_reboot(handle, handle.consumer, boot_id)
         self._reset_provider_guests(handle)
         for link in handle.consumer.links:
             self._helper(
@@ -1209,21 +1223,26 @@ class QemuBackend:
         for index in range(len(handle.providers)):
             self._start_provider(handle, index)
 
-    def _wait_for_reboot(self, handle, guest) -> None:
+    def _wait_for_reboot(self, handle, guest, previous_boot_id: str) -> None:
         deadline = time.monotonic() + 180
-        observed_down = False
         while time.monotonic() < deadline:
-            result = self._ssh_shell(
-                handle,
-                guest,
-                "reboot-wait",
-                "true",
-                timeout=8,
-                check=False,
-            )
-            if result.returncode != 0:
-                observed_down = True
-            elif observed_down:
+            try:
+                result = self._ssh_shell(
+                    handle,
+                    guest,
+                    "reboot-wait",
+                    "cat /proc/sys/kernel/random/boot_id",
+                    timeout=8,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                result = None
+            if (
+                result is not None
+                and result.returncode == 0
+                and result.stdout.strip()
+                and result.stdout.strip() != previous_boot_id
+            ):
                 return
             time.sleep(2)
         raise BoundaryError("guest reboot did not complete")

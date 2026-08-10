@@ -1,15 +1,93 @@
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 VM_DIR = Path(__file__).resolve().parent
 if str(VM_DIR) not in sys.path:
     sys.path.insert(0, str(VM_DIR))
 
 import infiniswap_vm  # noqa: E402
+import qemu_backend  # noqa: E402
+
+
+class ScenarioRecordingBackend(qemu_backend.QemuBackend):
+    def __init__(self):
+        self.helper_calls = []
+        self.waited_for_reboot = False
+        self.previous_boot_id = None
+
+    def _helper(self, handle, guest, label, *args, **kwargs):
+        self.helper_calls.append((label, args, kwargs))
+
+    def _create_device(self, *args, **kwargs):
+        pass
+
+    def _stop_device(self, handle):
+        pass
+
+    def _check_kernel(self, handle):
+        pass
+
+    def _ssh_shell(self, handle, guest, label, command, **kwargs):
+        if label == "force-reboot":
+            raise subprocess.TimeoutExpired("ssh", 15)
+        return SimpleNamespace(returncode=0, stdout="old-boot-id\n")
+
+    def _wait_for_reboot(self, handle, guest, previous_boot_id=None):
+        self.waited_for_reboot = True
+        self.previous_boot_id = previous_boot_id
+
+    def _reset_provider_guests(self, handle):
+        pass
+
+
+class QemuScenarioTest(unittest.TestCase):
+    def test_remote_first_verifies_only_the_write_that_observes_backing_failure(self):
+        backend = ScenarioRecordingBackend()
+        handle = SimpleNamespace(consumer=object())
+
+        result = backend._scenario_backing_error(handle)
+
+        calls = {label: args for label, args, _kwargs in backend.helper_calls}
+        self.assertEqual(result.status, "passed")
+        self.assertEqual(
+            calls["backing-write"],
+            ("write-pattern", "backing-fault", "32", "no-flush", "1"),
+        )
+        self.assertEqual(
+            calls["backing-read"],
+            ("read-pattern", "backing-fault", "32", "1"),
+        )
+
+    def test_reboot_command_timeout_still_waits_for_guest_restart(self):
+        backend = ScenarioRecordingBackend()
+        handle = SimpleNamespace(consumer=SimpleNamespace(links=[]))
+
+        result = backend._scenario_guest_reboot(handle)
+
+        self.assertEqual(result.status, "passed")
+        self.assertTrue(backend.waited_for_reboot)
+        self.assertEqual(backend.previous_boot_id, "old-boot-id")
+
+    def test_changed_boot_id_completes_reboot_without_observing_ssh_down(self):
+        backend = object.__new__(qemu_backend.QemuBackend)
+        backend._ssh_shell = mock.Mock(
+            return_value=SimpleNamespace(returncode=0, stdout="new-boot-id\n")
+        )
+        handle = SimpleNamespace()
+        guest = object()
+
+        with mock.patch.object(
+            qemu_backend.time, "monotonic", side_effect=(0, 0, 181)
+        ), mock.patch.object(qemu_backend.time, "sleep"):
+            backend._wait_for_reboot(handle, guest, "old-boot-id")
+
 
 
 class FixedEnvironment:
