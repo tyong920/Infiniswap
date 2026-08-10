@@ -375,11 +375,11 @@ network_fault() {
   local action=$1 address=$2
   case $action in
     add)
-      iptables -w -I OUTPUT -p udp -d "$address" --dport 4791 \
+      iptables -w -I INPUT -p udp -s "$address" --dport 4791 \
         -m comment --comment "$fault_comment" -j DROP
       ;;
     clear)
-      while iptables -w -D OUTPUT -p udp -d "$address" --dport 4791 \
+      while iptables -w -D INPUT -p udp -s "$address" --dport 4791 \
         -m comment --comment "$fault_comment" -j DROP 2>/dev/null; do :; done
       ;;
     *) fail "unknown network fault action: $action" ;;
