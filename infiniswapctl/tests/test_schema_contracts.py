@@ -22,6 +22,7 @@ class SchemaContractTest(unittest.TestCase):
                 snapshot_directory / "status-v2.json",
                 snapshot_directory / "status-v3.json",
                 snapshot_directory / "status-v4.json",
+                snapshot_directory / "status-v5.json",
             )
         )
         for path in paths:
@@ -57,7 +58,8 @@ class SchemaContractTest(unittest.TestCase):
             ("status-v1.schema.json", "status-v1.json"),
             ("status-v2.schema.json", "status-v2.json"),
             ("status-v3.schema.json", "status-v3.json"),
-            ("status.schema.json", "status-v4.json"),
+            ("status-v4.schema.json", "status-v4.json"),
+            ("status.schema.json", "status-v5.json"),
         )
         for schema_name, snapshot_name in status_contracts:
             with self.subTest(schema=schema_name):

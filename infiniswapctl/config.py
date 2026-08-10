@@ -16,6 +16,8 @@ HOT_RANGE_WEIGHT_MAX = 1000000
 HOT_RANGE_THRESHOLD_DEFAULT = 8
 HOT_RANGE_READ_WEIGHT_DEFAULT = 1
 HOT_RANGE_WRITE_WEIGHT_DEFAULT = 4
+PLACEMENT_SAMPLE_DEFAULT = 2
+PLACEMENT_MAX_PROVIDERS = 64
 PSK_MIN_BYTES = 32
 PSK_MAX_BYTES = 64
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
@@ -68,6 +70,7 @@ class ConsumerConfig:
     hot_range_write_weight: int
     provider_directory: str
     providers: Tuple[ProviderDirectoryEntry, ...]
+    placement_sample_size: int
     swap_priority: int
 
 
@@ -477,7 +480,7 @@ def load_consumer(path: str, system: Any) -> ConsumerConfig:
         "providers",
         "swap_priority",
     }
-    optional = {"acknowledgement_policy", "backing_store"}
+    optional = {"acknowledgement_policy", "backing_store", "placement_sample_size"}
     if schema_version >= 2:
         optional.add("hot_range")
     _strict_fields(device, "device", required, optional)
@@ -581,8 +584,10 @@ def load_consumer(path: str, system: Any) -> ConsumerConfig:
         raise ConfigError("device.providers must be a non-empty list")
     if len(set(selected_value)) != len(selected_value):
         raise ConfigError("device.providers must be unique")
-    if len(selected_value) != 1:
-        raise ConfigError("this milestone requires exactly one Provider")
+    if len(selected_value) > PLACEMENT_MAX_PROVIDERS:
+        raise ConfigError(
+            "device.providers must contain 1-%d Providers" % PLACEMENT_MAX_PROVIDERS
+        )
     selected: List[ProviderDirectoryEntry] = []
     if mode == "remote-only":
         required_capabilities = {
@@ -650,6 +655,21 @@ def load_consumer(path: str, system: Any) -> ConsumerConfig:
     if len(serialized_providers) + 1 >= CONFIGFS_VALUE_SIZE:
         raise ConfigError("Provider selection is too large for configfs")
 
+    if "placement_sample_size" in device:
+        placement_sample_size = _integer(
+            device["placement_sample_size"],
+            "device.placement_sample_size",
+            1,
+            len(selected),
+        )
+    else:
+        placement_sample_size = min(PLACEMENT_SAMPLE_DEFAULT, len(selected))
+    if placement_sample_size < 1 or placement_sample_size > len(selected):
+        raise ConfigError(
+            "device.placement_sample_size must be between 1 and %d"
+            % len(selected)
+        )
+
     swap_priority = _integer(device["swap_priority"], "device.swap_priority", 0, 32767)
     return ConsumerConfig(
         path=path,
@@ -666,5 +686,6 @@ def load_consumer(path: str, system: Any) -> ConsumerConfig:
         hot_range_write_weight=hot_range_write_weight,
         provider_directory=directory_path,
         providers=tuple(selected),
+        placement_sample_size=placement_sample_size,
         swap_priority=swap_priority,
     )

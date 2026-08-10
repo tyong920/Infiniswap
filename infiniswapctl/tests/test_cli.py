@@ -337,7 +337,34 @@ class CliValidationTest(unittest.TestCase):
                 self.assertIn(message, stderr)
                 self.assertEqual(system.mutations, [])
 
-    def test_create_rejects_multiple_providers_before_system_mutation(self):
+    def test_create_accepts_two_allowlisted_providers(self):
+        directory = json.loads(self.provider_directory_path.read_text(encoding="utf-8"))
+        directory["providers"]["provider-b"] = json.loads(
+            json.dumps(directory["providers"]["provider-a"])
+        )
+        directory["providers"]["provider-b"]["placement_weight"] = 50
+        self.provider_directory_path.write_text(json.dumps(directory), encoding="utf-8")
+        system = FakeSystem()
+        system.file_stats["/etc/infiniswap/keys/provider-a.psk"] = SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o600, st_uid=0
+        )
+        system.secrets["/etc/infiniswap/keys/provider-a.psk"] = b"p" * 32
+
+        result, stdout, stderr, used = self.invoke_create(
+            self.write_consumer(
+                providers=["provider-a", "provider-b"],
+                placement_sample_size=2,
+            ),
+            system,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("Providers: provider-a, provider-b", stdout)
+        self.assertIn("Power-of-d sample size: 2", stdout)
+        self.assertEqual(used.mutations, [])
+
+    def test_create_rejects_invalid_placement_sample_size(self):
         directory = json.loads(self.provider_directory_path.read_text(encoding="utf-8"))
         directory["providers"]["provider-b"] = json.loads(
             json.dumps(directory["providers"]["provider-a"])
@@ -345,12 +372,15 @@ class CliValidationTest(unittest.TestCase):
         self.provider_directory_path.write_text(json.dumps(directory), encoding="utf-8")
 
         result, stdout, stderr, system = self.invoke_create(
-            self.write_consumer(providers=["provider-a", "provider-b"])
+            self.write_consumer(
+                providers=["provider-a", "provider-b"],
+                placement_sample_size=3,
+            )
         )
 
         self.assertEqual(result, 2)
         self.assertEqual(stdout, "")
-        self.assertIn("exactly one Provider", stderr)
+        self.assertIn("placement_sample_size must be between 1 and 2", stderr)
         self.assertEqual(system.mutations, [])
 
     def test_create_rejects_invalid_hot_range_scoring(self):
@@ -416,12 +446,12 @@ class CliValidationTest(unittest.TestCase):
         self.assertIn("32-64 byte PSK", stderr)
         self.assertEqual(system.mutations, [])
 
-    def test_create_rejects_provider_selection_beyond_single_provider_scope(self):
+    def test_create_rejects_provider_selection_beyond_directory_limit(self):
         directory = json.loads(self.provider_directory_path.read_text(encoding="utf-8"))
         template = directory["providers"]["provider-a"]
-        provider_names = ["p%062d" % index for index in range(64)]
+        provider_names = ["p%062d" % index for index in range(65)]
         directory["providers"] = {
-            name: json.loads(json.dumps(template)) for name in provider_names
+            name: json.loads(json.dumps(template)) for name in provider_names[:64]
         }
         self.provider_directory_path.write_text(json.dumps(directory), encoding="utf-8")
 
@@ -431,7 +461,12 @@ class CliValidationTest(unittest.TestCase):
 
         self.assertEqual(result, 2)
         self.assertEqual(stdout, "")
-        self.assertIn("exactly one Provider", stderr)
+        self.assertTrue(
+            "untrusted Provider" in stderr
+            or "1-64 Providers" in stderr
+            or "must be unique" in stderr
+            or "must be a non-empty list" in stderr
+        )
         self.assertEqual(system.mutations, [])
 
     def test_create_dry_run_reports_validated_plan_without_mutation(self):
@@ -485,6 +520,8 @@ class CliValidationTest(unittest.TestCase):
                 ("write_attribute", "infiniswap0", "hot_range_write_weight", "4"),
                 ("write_attribute", "infiniswap0", "consumer_id", "consumer-a"),
                 ("write_attribute", "infiniswap0", "providers", "provider-a"),
+                ("write_attribute", "infiniswap0", "placement_sample_size", "1"),
+                ("write_attribute", "infiniswap0", "provider_bind", "provider-a"),
                 ("write_attribute", "infiniswap0", "provider_address", "192.0.2.10"),
                 ("write_attribute", "infiniswap0", "provider_port", "9400"),
                 ("write_attribute", "infiniswap0", "rdma_device", "mlx5_ib2"),
@@ -497,6 +534,7 @@ class CliValidationTest(unittest.TestCase):
                     "provider_psk",
                     (b"p" * 32).hex(),
                 ),
+                ("write_attribute", "infiniswap0", "placement_weight", "100"),
                 ("write_attribute", "infiniswap0", "swap_priority", "100"),
                 ("write_attribute", "infiniswap0", "state", "activate"),
             ],
@@ -654,6 +692,9 @@ class LifecycleCommandTest(unittest.TestCase):
             "mapped_hot_ranges": "1",
             "consumer_id": "consumer-a",
             "providers": "provider-a",
+            "placement_sample_size": "1",
+            "remote_chunk_placements": "0:provider-a",
+            "provider_exclusions": "",
             "swap_priority": "100",
             "connection_state": "not-connected",
             "backing_state": "healthy",
@@ -757,7 +798,7 @@ class LifecycleCommandTest(unittest.TestCase):
             stderr=stderr,
         )
 
-        snapshot = (Path(__file__).parent / "snapshots" / "status-v4.json").read_text(
+        snapshot = (Path(__file__).parent / "snapshots" / "status-v5.json").read_text(
             encoding="utf-8"
         )
         self.assertEqual((result, stderr.getvalue()), (0, ""))
@@ -771,6 +812,11 @@ class LifecycleCommandTest(unittest.TestCase):
                 "chunk_size_bytes": GIB,
                 "mapped_remote_chunks": 1,
                 "mapped_hot_ranges": 1,
+                "placement_sample_size": 1,
+                "placements": [
+                    {"logical_chunk": 0, "provider_id": "provider-a"}
+                ],
+                "excluded_providers": [],
                 "read_weight": 1,
                 "threshold": 8,
                 "write_weight": 4,
@@ -781,6 +827,7 @@ class LifecycleCommandTest(unittest.TestCase):
         self.assertEqual((result, error), (0, ""))
         self.assertIn("infiniswap0: active (backed, strict)", human)
         self.assertIn("connection: not-connected (0/1 Providers healthy)", human)
+        self.assertIn("placements: 0→provider-a", human)
         self.assertIn("swap: enabled at priority 100", human)
         self.assertIn("backing: healthy", human)
         self.assertIn("last error: none", human)
@@ -845,7 +892,7 @@ class LifecycleCommandTest(unittest.TestCase):
 
         self.assertEqual((result, error), (0, ""))
         status = json.loads(output)
-        self.assertEqual(status["schema_version"], 4)
+        self.assertEqual(status["schema_version"], 5)
         self.assertEqual(status["device"]["operational_state"], "remote-lost")
         self.assertEqual(status["connection"]["state"], "remote-lost")
         self.assertEqual(status["capacity"]["backing_bytes"], 0)

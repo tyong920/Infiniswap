@@ -41,4 +41,10 @@ void is_rdma_note_activity(struct is_device *device, sector_t sector,
 			   unsigned int bytes, bool write);
 void is_rdma_mapping_parameters_changed(struct is_device *device);
 
+ssize_t is_rdma_remote_chunk_placements_show(struct is_device *device,
+					     char *page);
+ssize_t is_rdma_provider_exclusions_show(struct is_device *device,
+					 char *page);
+unsigned int is_fabric_mapped_chunk_count(struct is_device *device);
+
 #endif /* INFINISWAP_RDMA_H */

@@ -10,6 +10,7 @@
 #include <linux/string.h>
 
 #include "infiniswap.h"
+#include "is_rdma.h"
 
 static struct configfs_subsystem is_subsystem;
 
@@ -231,6 +232,71 @@ static ssize_t is_device_providers_store(struct config_item *item,
 	return is_store_result(device, ret, count);
 }
 
+static ssize_t is_device_provider_bind_store(struct config_item *item,
+					      const char *page, size_t count)
+{
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_provider_bind(device, page, count);
+
+	return is_store_result(device, ret, count);
+}
+
+static ssize_t is_device_placement_sample_size_show(struct config_item *item,
+						     char *page)
+{
+	return sysfs_emit(page, "%u\n",
+			  to_is_device(item)->placement_sample_size);
+}
+
+static ssize_t is_device_placement_sample_size_store(struct config_item *item,
+						      const char *page,
+						      size_t count)
+{
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_placement_sample_size(device, page, count);
+
+	return is_store_result(device, ret, count);
+}
+
+static ssize_t is_device_placement_seed_show(struct config_item *item,
+					      char *page)
+{
+	return sysfs_emit(page, "%llu\n", to_is_device(item)->placement_seed);
+}
+
+static ssize_t is_device_placement_seed_store(struct config_item *item,
+						const char *page, size_t count)
+{
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_placement_seed(device, page, count);
+
+	return is_store_result(device, ret, count);
+}
+
+static ssize_t is_device_placement_weight_show(struct config_item *item,
+						char *page)
+{
+	struct is_device *device = to_is_device(item);
+	u32 weight = IS_PLACEMENT_WEIGHT_DEFAULT;
+
+	mutex_lock(&device->lifecycle_lock);
+	if (device->provider_count &&
+	    device->provider_bind_index < device->provider_count)
+		weight = device->provider_endpoints[device->provider_bind_index]
+				 .placement_weight;
+	mutex_unlock(&device->lifecycle_lock);
+	return sysfs_emit(page, "%u\n", weight);
+}
+
+static ssize_t is_device_placement_weight_store(struct config_item *item,
+						 const char *page, size_t count)
+{
+	struct is_device *device = to_is_device(item);
+	int ret = is_device_set_placement_weight(device, page, count);
+
+	return is_store_result(device, ret, count);
+}
+
 static ssize_t is_device_provider_address_show(struct config_item *item,
 						char *page)
 {
@@ -391,18 +457,32 @@ static ssize_t is_device_remote_capacity_bytes_show(struct config_item *item,
 static ssize_t is_device_mapped_remote_chunks_show(struct config_item *item,
 						    char *page)
 {
-	return sysfs_emit(page, "%d\n",
-		atomic_read(&to_is_device(item)->mapped_remote_chunks));
+	struct is_device *device = to_is_device(item);
+
+	return sysfs_emit(page, "%u\n", is_fabric_mapped_chunk_count(device));
 }
 
 static ssize_t is_device_mapped_hot_ranges_show(struct config_item *item,
 						 char *page)
 {
 	struct is_device *device = to_is_device(item);
-	int mapped = device->mode == IS_DEVICE_MODE_BACKED ?
-		atomic_read(&device->mapped_remote_chunks) : 0;
+	unsigned int mapped = 0;
 
-	return sysfs_emit(page, "%d\n", mapped);
+	if (device->mode == IS_DEVICE_MODE_BACKED)
+		mapped = is_fabric_mapped_chunk_count(device);
+	return sysfs_emit(page, "%u\n", mapped);
+}
+
+static ssize_t is_device_remote_chunk_placements_show(struct config_item *item,
+						      char *page)
+{
+	return is_rdma_remote_chunk_placements_show(to_is_device(item), page);
+}
+
+static ssize_t is_device_provider_exclusions_show(struct config_item *item,
+						  char *page)
+{
+	return is_rdma_provider_exclusions_show(to_is_device(item), page);
 }
 
 static ssize_t is_device_backing_state_show(struct config_item *item,
@@ -503,6 +583,10 @@ CONFIGFS_ATTR(is_device_, hot_range_read_weight);
 CONFIGFS_ATTR(is_device_, hot_range_write_weight);
 CONFIGFS_ATTR(is_device_, consumer_id);
 CONFIGFS_ATTR(is_device_, providers);
+CONFIGFS_ATTR_WO(is_device_, provider_bind);
+CONFIGFS_ATTR(is_device_, placement_sample_size);
+CONFIGFS_ATTR(is_device_, placement_seed);
+CONFIGFS_ATTR(is_device_, placement_weight);
 CONFIGFS_ATTR(is_device_, provider_address);
 CONFIGFS_ATTR(is_device_, provider_port);
 CONFIGFS_ATTR(is_device_, rdma_device);
@@ -515,6 +599,8 @@ CONFIGFS_ATTR_RO(is_device_, connection_state);
 CONFIGFS_ATTR_RO(is_device_, remote_capacity_bytes);
 CONFIGFS_ATTR_RO(is_device_, mapped_remote_chunks);
 CONFIGFS_ATTR_RO(is_device_, mapped_hot_ranges);
+CONFIGFS_ATTR_RO(is_device_, remote_chunk_placements);
+CONFIGFS_ATTR_RO(is_device_, provider_exclusions);
 CONFIGFS_ATTR_RO(is_device_, backing_state);
 CONFIGFS_ATTR_RO(is_device_, operational_state);
 CONFIGFS_ATTR_RO(is_device_, backing_failures_total);
@@ -541,6 +627,10 @@ static struct configfs_attribute *is_device_attrs[] = {
 	&is_device_attr_hot_range_write_weight,
 	&is_device_attr_consumer_id,
 	&is_device_attr_providers,
+	&is_device_attr_provider_bind,
+	&is_device_attr_placement_sample_size,
+	&is_device_attr_placement_seed,
+	&is_device_attr_placement_weight,
 	&is_device_attr_provider_address,
 	&is_device_attr_provider_port,
 	&is_device_attr_rdma_device,
@@ -553,6 +643,8 @@ static struct configfs_attribute *is_device_attrs[] = {
 	&is_device_attr_remote_capacity_bytes,
 	&is_device_attr_mapped_remote_chunks,
 	&is_device_attr_mapped_hot_ranges,
+	&is_device_attr_remote_chunk_placements,
+	&is_device_attr_provider_exclusions,
 	&is_device_attr_backing_state,
 	&is_device_attr_operational_state,
 	&is_device_attr_backing_failures_total,

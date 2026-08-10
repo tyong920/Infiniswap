@@ -76,6 +76,10 @@ void is_device_init(struct is_device *device, const char *name)
 	device->hot_range_threshold = IS_HOT_RANGE_THRESHOLD_DEFAULT;
 	device->hot_range_read_weight = IS_HOT_RANGE_READ_WEIGHT_DEFAULT;
 	device->hot_range_write_weight = IS_HOT_RANGE_WRITE_WEIGHT_DEFAULT;
+	device->placement_sample_size = IS_PLACEMENT_SAMPLE_DEFAULT;
+	device->placement_seed = 0;
+	device->provider_count = 0;
+	device->provider_bind_index = 0;
 	device->rdma_numa_node = NUMA_NO_NODE;
 	device->swap_priority = -1;
 	device->state = IS_DEVICE_CREATED;
@@ -313,12 +317,47 @@ static bool is_provider_list_valid(char *providers)
 {
 	char *cursor = providers;
 	char *provider;
+	unsigned int count = 0;
 
 	while ((provider = strsep(&cursor, ",")) != NULL) {
-		if (!is_runtime_identifier_valid(provider))
+		if (!provider[0] || !is_runtime_identifier_valid(provider))
+			return false;
+		count++;
+		if (count > IS_MAX_PROVIDERS)
 			return false;
 	}
-	return true;
+	return count > 0;
+}
+
+static void is_sync_bound_provider_mirror(struct is_device *device)
+{
+	struct is_provider_endpoint *endpoint;
+
+	if (device->provider_count == 0 ||
+	    device->provider_bind_index >= device->provider_count)
+		return;
+	endpoint = &device->provider_endpoints[device->provider_bind_index];
+	strscpy(device->provider_address, endpoint->address,
+		sizeof(device->provider_address));
+	device->provider_port = endpoint->port;
+	strscpy(device->rdma_device, endpoint->rdma_device,
+		sizeof(device->rdma_device));
+	device->rdma_port = endpoint->rdma_port;
+	device->rdma_numa_node = endpoint->rdma_numa_node;
+	strscpy(device->provider_key_id, endpoint->key_id,
+		sizeof(device->provider_key_id));
+	memzero_explicit(device->provider_psk, sizeof(device->provider_psk));
+	memcpy(device->provider_psk, endpoint->psk, endpoint->psk_size);
+	device->provider_psk_size = endpoint->psk_size;
+}
+
+static struct is_provider_endpoint *is_bound_provider(struct is_device *device)
+{
+	if (device->provider_count == 0)
+		return NULL;
+	if (device->provider_bind_index >= device->provider_count)
+		return NULL;
+	return &device->provider_endpoints[device->provider_bind_index];
 }
 
 int is_device_set_providers(struct is_device *device, const char *buf,
@@ -327,6 +366,11 @@ int is_device_set_providers(struct is_device *device, const char *buf,
 	char *candidate;
 	char *providers;
 	char *validation_copy;
+	char *parse_copy;
+	char *cursor;
+	char *provider;
+	unsigned int provider_count = 0;
+	unsigned int index;
 	int ret = 0;
 
 	if (!count || count >= IS_PROVIDER_LIST_SIZE)
@@ -335,10 +379,6 @@ int is_device_set_providers(struct is_device *device, const char *buf,
 	if (!candidate)
 		return -ENOMEM;
 	providers = strim(candidate);
-	if (strchr(providers, ',')) {
-		ret = -EOPNOTSUPP;
-		goto out;
-	}
 	validation_copy = kstrdup(providers, GFP_KERNEL);
 	if (!validation_copy) {
 		ret = -ENOMEM;
@@ -349,17 +389,172 @@ int is_device_set_providers(struct is_device *device, const char *buf,
 		goto free_validation;
 	}
 
+	parse_copy = kstrdup(providers, GFP_KERNEL);
+	if (!parse_copy) {
+		ret = -ENOMEM;
+		goto free_validation;
+	}
+	cursor = parse_copy;
+	while ((provider = strsep(&cursor, ",")) != NULL) {
+		for (index = 0; index < provider_count; index++) {
+			if (!strcmp(device->provider_endpoints[index].name,
+				    provider)) {
+				ret = -EINVAL;
+				goto free_parse;
+			}
+		}
+		provider_count++;
+	}
+	kfree(parse_copy);
+	parse_copy = kstrdup(providers, GFP_KERNEL);
+	if (!parse_copy) {
+		ret = -ENOMEM;
+		goto free_validation;
+	}
+
 	mutex_lock(&device->lifecycle_lock);
-	if (!is_device_configurable(device))
+	if (!is_device_configurable(device)) {
 		ret = -EBUSY;
-	else
-		strscpy(device->providers, providers, sizeof(device->providers));
+		goto unlock;
+	}
+	memset(device->provider_endpoints, 0, sizeof(device->provider_endpoints));
+	device->provider_count = 0;
+	device->provider_bind_index = 0;
+	cursor = parse_copy;
+	while ((provider = strsep(&cursor, ",")) != NULL) {
+		struct is_provider_endpoint *endpoint =
+			&device->provider_endpoints[device->provider_count];
+
+		strscpy(endpoint->name, provider, sizeof(endpoint->name));
+		endpoint->placement_weight = IS_PLACEMENT_WEIGHT_DEFAULT;
+		endpoint->rdma_numa_node = NUMA_NO_NODE;
+		device->provider_count++;
+	}
+	strscpy(device->providers, providers, sizeof(device->providers));
+	if (device->placement_sample_size > device->provider_count)
+		device->placement_sample_size = device->provider_count ?
+			device->provider_count : IS_PLACEMENT_SAMPLE_DEFAULT;
+	is_sync_bound_provider_mirror(device);
+unlock:
 	mutex_unlock(&device->lifecycle_lock);
 
+free_parse:
+	kfree(parse_copy);
 free_validation:
 	kfree(validation_copy);
 out:
 	kfree(candidate);
+	return ret;
+}
+
+int is_device_set_provider_bind(struct is_device *device, const char *buf,
+				size_t count)
+{
+	char *candidate;
+	char *name;
+	unsigned int index;
+	int ret = 0;
+
+	if (!count || count >= IS_PROVIDER_NAME_SIZE)
+		return -ENAMETOOLONG;
+	candidate = kstrndup(buf, count, GFP_KERNEL);
+	if (!candidate)
+		return -ENOMEM;
+	name = strim(candidate);
+	if (!is_runtime_identifier_valid(name)) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	mutex_lock(&device->lifecycle_lock);
+	if (!is_device_configurable(device)) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+	for (index = 0; index < device->provider_count; index++) {
+		if (!strcmp(device->provider_endpoints[index].name, name)) {
+			device->provider_bind_index = index;
+			is_sync_bound_provider_mirror(device);
+			goto unlock;
+		}
+	}
+	ret = -ENOENT;
+unlock:
+	mutex_unlock(&device->lifecycle_lock);
+out:
+	kfree(candidate);
+	return ret;
+}
+
+int is_device_set_placement_sample_size(struct is_device *device,
+					const char *buf, size_t count)
+{
+	u32 sample_size;
+	int ret;
+
+	(void)count;
+	ret = kstrtou32(buf, 0, &sample_size);
+	if (ret)
+		return ret;
+	mutex_lock(&device->lifecycle_lock);
+	if (!is_device_configurable(device))
+		ret = -EBUSY;
+	else if (sample_size == 0 || sample_size > IS_MAX_PROVIDERS ||
+		 (device->provider_count && sample_size > device->provider_count))
+		ret = -ERANGE;
+	else {
+		device->placement_sample_size = sample_size;
+		ret = 0;
+	}
+	mutex_unlock(&device->lifecycle_lock);
+	return ret;
+}
+
+int is_device_set_placement_seed(struct is_device *device, const char *buf,
+				 size_t count)
+{
+	u64 seed;
+	int ret;
+
+	(void)count;
+	ret = kstrtou64(buf, 0, &seed);
+	if (ret)
+		return ret;
+	mutex_lock(&device->lifecycle_lock);
+	if (!is_device_configurable(device))
+		ret = -EBUSY;
+	else {
+		device->placement_seed = seed;
+		ret = 0;
+	}
+	mutex_unlock(&device->lifecycle_lock);
+	return ret;
+}
+
+int is_device_set_placement_weight(struct is_device *device, const char *buf,
+				   size_t count)
+{
+	struct is_provider_endpoint *endpoint;
+	u32 weight;
+	int ret;
+
+	(void)count;
+	ret = kstrtou32(buf, 0, &weight);
+	if (ret)
+		return ret;
+	if (weight < IS_PLACEMENT_WEIGHT_MIN || weight > IS_PLACEMENT_WEIGHT_MAX)
+		return -ERANGE;
+	mutex_lock(&device->lifecycle_lock);
+	endpoint = is_bound_provider(device);
+	if (!is_device_configurable(device))
+		ret = -EBUSY;
+	else if (!endpoint)
+		ret = -EINVAL;
+	else {
+		endpoint->placement_weight = weight;
+		ret = 0;
+	}
+	mutex_unlock(&device->lifecycle_lock);
 	return ret;
 }
 
@@ -370,6 +565,7 @@ static int is_device_set_config_string(struct is_device *device,
 {
 	char *candidate;
 	char *value;
+	struct is_provider_endpoint *endpoint;
 	int ret = 0;
 
 	if (!count || count > target_size)
@@ -387,8 +583,26 @@ static int is_device_set_config_string(struct is_device *device,
 	mutex_lock(&device->lifecycle_lock);
 	if (!is_device_configurable(device))
 		ret = -EBUSY;
-	else
+	else {
 		strscpy(target, value, target_size);
+		endpoint = is_bound_provider(device);
+		if (endpoint) {
+			if (target == device->provider_address)
+				strscpy(endpoint->address, value,
+					sizeof(endpoint->address));
+			else if (target == device->rdma_device)
+				strscpy(endpoint->rdma_device, value,
+					sizeof(endpoint->rdma_device));
+			else if (target == device->provider_key_id)
+				strscpy(endpoint->key_id, value,
+					sizeof(endpoint->key_id));
+			endpoint->configured =
+				endpoint->address[0] && endpoint->port &&
+				endpoint->rdma_device[0] && endpoint->rdma_port &&
+				endpoint->key_id[0] &&
+				endpoint->psk_size >= IS_PSK_MIN_SIZE;
+		}
+	}
 	mutex_unlock(&device->lifecycle_lock);
 out:
 	kfree(candidate);
@@ -419,6 +633,7 @@ int is_device_set_provider_key_id(struct is_device *device, const char *buf,
 int is_device_set_provider_port(struct is_device *device, const char *buf,
 				size_t count)
 {
+	struct is_provider_endpoint *endpoint;
 	u16 port;
 	int ret;
 
@@ -433,6 +648,15 @@ int is_device_set_provider_port(struct is_device *device, const char *buf,
 		ret = -EBUSY;
 	else {
 		device->provider_port = port;
+		endpoint = is_bound_provider(device);
+		if (endpoint) {
+			endpoint->port = port;
+			endpoint->configured =
+				endpoint->address[0] && endpoint->port &&
+				endpoint->rdma_device[0] && endpoint->rdma_port &&
+				endpoint->key_id[0] &&
+				endpoint->psk_size >= IS_PSK_MIN_SIZE;
+		}
 		ret = 0;
 	}
 	mutex_unlock(&device->lifecycle_lock);
@@ -442,6 +666,7 @@ int is_device_set_provider_port(struct is_device *device, const char *buf,
 int is_device_set_rdma_port(struct is_device *device, const char *buf,
 			    size_t count)
 {
+	struct is_provider_endpoint *endpoint;
 	u8 port;
 	int ret;
 
@@ -456,6 +681,15 @@ int is_device_set_rdma_port(struct is_device *device, const char *buf,
 		ret = -EBUSY;
 	else {
 		device->rdma_port = port;
+		endpoint = is_bound_provider(device);
+		if (endpoint) {
+			endpoint->rdma_port = port;
+			endpoint->configured =
+				endpoint->address[0] && endpoint->port &&
+				endpoint->rdma_device[0] && endpoint->rdma_port &&
+				endpoint->key_id[0] &&
+				endpoint->psk_size >= IS_PSK_MIN_SIZE;
+		}
 		ret = 0;
 	}
 	mutex_unlock(&device->lifecycle_lock);
@@ -465,6 +699,7 @@ int is_device_set_rdma_port(struct is_device *device, const char *buf,
 int is_device_set_rdma_numa_node(struct is_device *device, const char *buf,
 				 size_t count)
 {
+	struct is_provider_endpoint *endpoint;
 	int numa_node;
 	int ret;
 
@@ -479,6 +714,9 @@ int is_device_set_rdma_numa_node(struct is_device *device, const char *buf,
 		ret = -EBUSY;
 	else {
 		device->rdma_numa_node = numa_node;
+		endpoint = is_bound_provider(device);
+		if (endpoint)
+			endpoint->rdma_numa_node = numa_node;
 		ret = 0;
 	}
 	mutex_unlock(&device->lifecycle_lock);
@@ -488,6 +726,7 @@ int is_device_set_rdma_numa_node(struct is_device *device, const char *buf,
 int is_device_set_provider_psk(struct is_device *device, const char *buf,
 			       size_t count)
 {
+	struct is_provider_endpoint *endpoint;
 	u8 secret[IS_PSK_MAX_SIZE];
 	char *candidate;
 	char *encoded;
@@ -516,6 +755,17 @@ int is_device_set_provider_psk(struct is_device *device, const char *buf,
 				 sizeof(device->provider_psk));
 		memcpy(device->provider_psk, secret, encoded_size / 2U);
 		device->provider_psk_size = encoded_size / 2U;
+		endpoint = is_bound_provider(device);
+		if (endpoint) {
+			memzero_explicit(endpoint->psk, sizeof(endpoint->psk));
+			memcpy(endpoint->psk, secret, encoded_size / 2U);
+			endpoint->psk_size = encoded_size / 2U;
+			endpoint->configured =
+				endpoint->address[0] && endpoint->port &&
+				endpoint->rdma_device[0] && endpoint->rdma_port &&
+				endpoint->key_id[0] &&
+				endpoint->psk_size >= IS_PSK_MIN_SIZE;
+		}
 	}
 	mutex_unlock(&device->lifecycle_lock);
 out:
@@ -1046,10 +1296,10 @@ static struct bio *is_alloc_owned_bio(struct is_remote_request *remote)
 
 #ifdef INFINISWAP_HAVE_BIO_ALLOC_CLONE
 	bio = bio_alloc_bioset(remote->device->backing_bdev,
-		remote->owned_page_count, remote->command_flags, GFP_NOIO,
+		remote->owned_page_count, remote->command_flags, GFP_KERNEL,
 		&remote->device->bio_set);
 #else
-	bio = bio_alloc_bioset(GFP_NOIO, remote->owned_page_count,
+	bio = bio_alloc_bioset(GFP_KERNEL, remote->owned_page_count,
 		&remote->device->bio_set);
 	if (bio) {
 		bio_set_dev(bio, remote->device->backing_bdev);
@@ -1105,9 +1355,9 @@ static int is_prepare_owned_pages(struct is_remote_request *remote, bool copy)
 		    segment.bv_len > PAGE_SIZE)
 			return -E2BIG;
 		page = remote->device->rdma_numa_node == NUMA_NO_NODE ?
-			alloc_page(GFP_NOIO) :
+			alloc_page(GFP_KERNEL) :
 			alloc_pages_node(remote->device->rdma_numa_node,
-				GFP_NOIO, 0);
+				GFP_KERNEL, 0);
 		if (!page)
 			return -ENOMEM;
 		remote->owned_pages[remote->owned_page_count] = page;
@@ -1138,9 +1388,9 @@ static struct is_remote_request *is_alloc_remote_request(
 	struct is_remote_request *remote;
 
 	if (device->rdma_numa_node == NUMA_NO_NODE)
-		remote = kzalloc(sizeof(*remote), GFP_NOIO);
+		remote = kzalloc(sizeof(*remote), GFP_KERNEL);
 	else
-		remote = kzalloc_node(sizeof(*remote), GFP_NOIO,
+		remote = kzalloc_node(sizeof(*remote), GFP_KERNEL,
 			device->rdma_numa_node);
 
 	if (!remote)
@@ -1393,6 +1643,17 @@ static void is_issue_flush(struct is_device *device, struct request *request)
 	is_complete_accepted_request(device, request, status);
 }
 
+static bool is_mapped_remote_first_write(struct is_device *device,
+					 struct request *request)
+{
+	return device->mode == IS_DEVICE_MODE_BACKED &&
+	       req_op(request) == REQ_OP_WRITE &&
+	       device->acknowledgement_policy ==
+			IS_ACKNOWLEDGEMENT_POLICY_REMOTE_FIRST &&
+	       is_rdma_range_mapped(device, blk_rq_pos(request),
+				    blk_rq_bytes(request));
+}
+
 static void is_dispatch_backing_work(struct work_struct *work)
 {
 	struct is_request_ctx *ctx = container_of(work, struct is_request_ctx,
@@ -1404,6 +1665,11 @@ static void is_dispatch_backing_work(struct work_struct *work)
 		is_issue_flush(device, request);
 	} else if (is_dispatch_remote(device, request)) {
 		return;
+	} else if (is_mapped_remote_first_write(device, request) &&
+		   is_dispatch_remote(device, request)) {
+		return;
+	} else if (is_mapped_remote_first_write(device, request)) {
+		is_complete_accepted_request(device, request, BLK_STS_RESOURCE);
 	} else if (device->mode == IS_DEVICE_MODE_REMOTE_ONLY) {
 		is_complete_accepted_request(device, request, BLK_STS_IOERR);
 	} else if (req_op(request) == REQ_OP_READ &&
@@ -1629,10 +1895,29 @@ int is_device_activate(struct is_device *device)
 		!(device->capacity_bytes % IS_REMOTE_CHUNK_BYTES) &&
 		device->capacity_bytes <=
 			IS_REMOTE_CHUNK_BYTES * IS_MAX_REMOTE_CHUNKS &&
-		device->provider_address[0] && device->provider_port &&
-		device->rdma_device[0] && device->rdma_port &&
-		device->provider_key_id[0] &&
-		device->provider_psk_size >= IS_PSK_MIN_SIZE;
+		device->provider_count > 0 &&
+		device->placement_sample_size >= 1 &&
+		device->placement_sample_size <= device->provider_count;
+	if (remote_configured) {
+		unsigned int index;
+
+		for (index = 0; index < device->provider_count; index++) {
+			if (!device->provider_endpoints[index].configured) {
+				remote_configured = false;
+				break;
+			}
+		}
+	}
+	if (!remote_configured && device->provider_count == 0) {
+		remote_configured =
+			!(device->capacity_bytes % IS_REMOTE_CHUNK_BYTES) &&
+			device->capacity_bytes <=
+				IS_REMOTE_CHUNK_BYTES * IS_MAX_REMOTE_CHUNKS &&
+			device->provider_address[0] && device->provider_port &&
+			device->rdma_device[0] && device->rdma_port &&
+			device->provider_key_id[0] &&
+			device->provider_psk_size >= IS_PSK_MIN_SIZE;
+	}
 	if (atomic_read(&device->remote_lost) ||
 	    (device->mode == IS_DEVICE_MODE_BACKED &&
 	     !is_backing_healthy(device))) {

@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/tyong920/Infiniswap/config/status.schema.json",
-  "title": "Infiniswap Device Status v5",
+  "title": "Infiniswap Device Status v4",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -16,7 +16,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": 5
+      "const": 4
     },
     "kind": {
       "const": "infiniswap.device-status"
@@ -198,9 +198,6 @@
         "chunk_size_bytes",
         "mapped_hot_ranges",
         "mapped_remote_chunks",
-        "placement_sample_size",
-        "placements",
-        "excluded_providers",
         "read_weight",
         "threshold",
         "write_weight"
@@ -230,59 +227,6 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 128
-        },
-        "placement_sample_size": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 64
-        },
-        "placements": {
-          "type": "array",
-          "maxItems": 128,
-          "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": [
-              "logical_chunk",
-              "provider_id"
-            ],
-            "properties": {
-              "logical_chunk": {
-                "type": "integer",
-                "minimum": 0,
-                "maximum": 127
-              },
-              "provider_id": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 63
-              }
-            }
-          }
-        },
-        "excluded_providers": {
-          "type": "array",
-          "maxItems": 64,
-          "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": [
-              "provider_id",
-              "reason"
-            ],
-            "properties": {
-              "provider_id": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 63
-              },
-              "reason": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 63
-              }
-            }
-          }
         }
       }
     },

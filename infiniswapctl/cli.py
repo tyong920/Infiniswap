@@ -54,7 +54,6 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _print_create_preflight(config: ConsumerConfig, stdout: IO[str]) -> None:
-    provider = config.providers[0]
     providers = ", ".join(entry.name for entry in config.providers)
     print("Preflight create " + config.name, file=stdout)
     print("  mode: " + config.mode, file=stdout)
@@ -70,12 +69,27 @@ def _print_create_preflight(config: ConsumerConfig, stdout: IO[str]) -> None:
         print("  Backing Store: " + config.backing_store, file=stdout)
     print("  capacity bytes: " + str(config.capacity_bytes), file=stdout)
     print("  Providers: " + providers, file=stdout)
-    print("  Provider endpoint: %s:%d" % (provider.address, provider.port), file=stdout)
     print(
-        "  RDMA Rail: %s port %d, NUMA node %d"
-        % (provider.rail_device, provider.rail_port, provider.numa_node),
+        "  Power-of-d sample size: %d" % config.placement_sample_size,
         file=stdout,
     )
+    for provider in config.providers:
+        print(
+            "  Provider %s endpoint: %s:%d"
+            % (provider.name, provider.address, provider.port),
+            file=stdout,
+        )
+        print(
+            "  Provider %s RDMA Rail: %s port %d, NUMA node %d, weight %d"
+            % (
+                provider.name,
+                provider.rail_device,
+                provider.rail_port,
+                provider.numa_node,
+                provider.placement_weight,
+            ),
+            file=stdout,
+        )
     print("  explicit swap priority: " + str(config.swap_priority), file=stdout)
     print(
         "  Provider Failure Deadline: %d ms" % config.provider_failure_deadline_ms,
@@ -100,7 +114,6 @@ def _create(config: ConsumerConfig, system: Any, stdout: IO[str]) -> None:
 
     system.create_group(config.name)
     try:
-        provider = config.providers[0]
         attributes = [("mode", config.mode)]
         if config.mode == "remote-only":
             attributes.append(("remote_only_eligible", "1"))
@@ -131,14 +144,29 @@ def _create(config: ConsumerConfig, system: Any, stdout: IO[str]) -> None:
         attributes.extend(
             (
                 ("consumer_id", config.consumer_id),
-                ("providers", provider.name),
-                ("provider_address", provider.address),
-                ("provider_port", str(provider.port)),
-                ("rdma_device", provider.rail_device),
-                ("rdma_port", str(provider.rail_port)),
-                ("rdma_numa_node", str(provider.numa_node)),
-                ("provider_key_id", provider.key_id),
-                ("provider_psk", provider.psk.hex()),
+                (
+                    "providers",
+                    ",".join(provider.name for provider in config.providers),
+                ),
+                ("placement_sample_size", str(config.placement_sample_size)),
+            )
+        )
+        for provider in config.providers:
+            attributes.extend(
+                (
+                    ("provider_bind", provider.name),
+                    ("provider_address", provider.address),
+                    ("provider_port", str(provider.port)),
+                    ("rdma_device", provider.rail_device),
+                    ("rdma_port", str(provider.rail_port)),
+                    ("rdma_numa_node", str(provider.numa_node)),
+                    ("provider_key_id", provider.key_id),
+                    ("provider_psk", provider.psk.hex()),
+                    ("placement_weight", str(provider.placement_weight)),
+                )
+            )
+        attributes.extend(
+            (
                 ("swap_priority", str(config.swap_priority)),
                 ("state", "activate"),
             )
@@ -239,6 +267,32 @@ def _run_lifecycle_command(
     print("Completed %s for %s" % (args.command, args.device), file=stdout)
 
 
+def _parse_chunk_placements(raw: str) -> List[Dict[str, Any]]:
+    placements: List[Dict[str, Any]] = []
+    for token in raw.split():
+        if ":" not in token:
+            continue
+        logical, provider_id = token.split(":", 1)
+        if not logical.isdigit() or not provider_id:
+            continue
+        placements.append(
+            {"logical_chunk": int(logical), "provider_id": provider_id}
+        )
+    return placements
+
+
+def _parse_excluded_providers(raw: str) -> List[Dict[str, str]]:
+    excluded: List[Dict[str, str]] = []
+    for token in raw.split():
+        if ":" not in token:
+            continue
+        provider_id, reason = token.split(":", 1)
+        if not provider_id or not reason:
+            continue
+        excluded.append({"provider_id": provider_id, "reason": reason})
+    return excluded
+
+
 def _device_status(name: str, system: Any) -> Dict[str, Any]:
     path, lifecycle = _inspect_device(name, system)
     mode = system.read_attribute(name, "mode")
@@ -253,10 +307,39 @@ def _device_status(name: str, system: Any) -> Dict[str, Any]:
     connection_state = system.read_attribute(name, "connection_state")
     operational_state = system.read_attribute(name, "operational_state")
     remote_capacity_bytes = int(system.read_attribute(name, "remote_capacity_bytes"))
-    provider_names = sorted(
+    provider_names = list(
         filter(None, system.read_attribute(name, "providers").split(","))
     )
-    healthy_providers = len(provider_names) if connection_state == "connected" else 0
+    try:
+        placement_sample_size = int(
+            system.read_attribute(name, "placement_sample_size")
+        )
+    except (KeyError, OSError, ValueError):
+        placement_sample_size = min(2, max(1, len(provider_names) or 1))
+    try:
+        placements = _parse_chunk_placements(
+            system.read_attribute(name, "remote_chunk_placements")
+        )
+    except (KeyError, OSError):
+        placements = []
+    try:
+        excluded_providers = _parse_excluded_providers(
+            system.read_attribute(name, "provider_exclusions")
+        )
+    except (KeyError, OSError):
+        excluded_providers = []
+    excluded_ids = {entry["provider_id"] for entry in excluded_providers}
+    if connection_state == "connected":
+        healthy_providers = sum(
+            1 for provider in provider_names if provider not in excluded_ids
+        )
+    elif connection_state == "degraded":
+        healthy_providers = max(
+            0,
+            sum(1 for provider in provider_names if provider not in excluded_ids),
+        )
+    else:
+        healthy_providers = 0
     swap_enabled = system.is_swap_enabled(path)
     priority = system.swap_priority(path) if swap_enabled else None
     configured_priority = int(system.read_attribute(name, "swap_priority"))
@@ -284,8 +367,16 @@ def _device_status(name: str, system: Any) -> Dict[str, Any]:
         )
     }
 
+    provider_states = []
+    for provider in provider_names:
+        if provider in excluded_ids:
+            state = "not-connected"
+        else:
+            state = connection_state
+        provider_states.append({"provider_id": provider, "state": state})
+
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "kind": "infiniswap.device-status",
         "device": {
             "name": name,
@@ -305,10 +396,7 @@ def _device_status(name: str, system: Any) -> Dict[str, Any]:
             "state": connection_state,
             "total_providers": len(provider_names),
             "healthy_providers": healthy_providers,
-            "providers": [
-                {"provider_id": provider, "state": connection_state}
-                for provider in provider_names
-            ],
+            "providers": provider_states,
         },
         "capacity": {
             "advertised_bytes": capacity_bytes,
@@ -322,6 +410,9 @@ def _device_status(name: str, system: Any) -> Dict[str, Any]:
             "write_weight": write_weight,
             "mapped_remote_chunks": mapped_remote_chunks,
             "mapped_hot_ranges": mapped_hot_ranges,
+            "placement_sample_size": placement_sample_size,
+            "placements": placements,
+            "excluded_providers": excluded_providers,
         },
         "metrics": metrics,
         "last_error": last_error,
@@ -410,6 +501,25 @@ def _print_status(status: Dict[str, Any], json_output: bool, stdout: IO[str]) ->
         ),
         file=stdout,
     )
+    mapping = status["mapping"]
+    if mapping["placements"]:
+        print(
+            "  placements: "
+            + ", ".join(
+                "%d→%s" % (entry["logical_chunk"], entry["provider_id"])
+                for entry in mapping["placements"]
+            ),
+            file=stdout,
+        )
+    if mapping["excluded_providers"]:
+        print(
+            "  excluded Providers: "
+            + ", ".join(
+                "%s (%s)" % (entry["provider_id"], entry["reason"])
+                for entry in mapping["excluded_providers"]
+            ),
+            file=stdout,
+        )
     if status["last_error"] is None:
         print("  last error: none", file=stdout)
     else:

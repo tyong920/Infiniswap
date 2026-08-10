@@ -323,6 +323,7 @@ configure_group() {
   local name=$1
   local secret=$2
   local policy=${3:-strict}
+  local device_capacity=${4:-$capacity_bytes}
   local group=$root/$name
 
   mkdir "$group"
@@ -330,7 +331,7 @@ configure_group() {
   printf 'backed\n' > "$group/mode"
   printf '%s\n' "$policy" > "$group/acknowledgement_policy"
   printf '%s\n' "$backing" > "$group/backing_store"
-  printf '%s\n' "$capacity_bytes" > "$group/capacity_bytes"
+  printf '%s\n' "$device_capacity" > "$group/capacity_bytes"
   printf '%s\n' "$failure_deadline_ms" > "$group/provider_failure_deadline_ms"
   printf '1\n' > "$group/hot_range_threshold"
   printf '1\n' > "$group/hot_range_read_weight"
@@ -349,23 +350,39 @@ configure_group() {
   wait_for_path "/dev/$name" present
 }
 
+wait_for_remote_chunk_mapped() {
+  local group=$1
+  local attempt
+  local placements
+
+  for ((attempt = 0; attempt < 300; attempt++)); do
+    placements=$(<"$group/remote_chunk_placements")
+    [[ $placements == 0:provider-test* ]] && return 0
+    sleep 0.1
+  done
+  fail "$group/remote_chunk_placements did not show mapped chunk 0 (got $placements)"
+}
+
 test_remote_first_backing_failure() {
   local name=infiniswap-backing-degraded
   local group=$root/$name
   local write_status read_status
 
-  configure_group "$name" "$psk_hex" remote-first
+  configure_group "$name" "$psk_hex" remote-first "$chunk_bytes"
   wait_for_value "$group/connection_state" connected
+  udevadm settle --timeout=5 2>/dev/null || true
   dd if=/dev/urandom of="$tmp/degraded-seed" bs=4096 count=1 status=none
   dd if="$tmp/degraded-seed" of="/dev/$name" bs=4096 count=1 \
     oflag=direct conv=fsync status=none
   wait_for_value "$group/mapped_hot_ranges" 1
+  wait_for_remote_chunk_mapped "$group"
 
   dmsetup suspend "$dm_delay_name"
   printf '0 %s error\n' "$((capacity_bytes / 512))" | \
     dmsetup reload "$dm_delay_name"
   dmsetup resume "$dm_delay_name"
   backing_fault_active=1
+  wait_for_remote_chunk_mapped "$group"
 
   dd if=/dev/urandom of="$tmp/degraded-pattern" bs=4096 count=1 status=none
   set +e
@@ -374,8 +391,9 @@ test_remote_first_backing_failure() {
   write_status=$?
   set -e
   wait_for_value "$group/backing_state" backing-degraded
-  [[ $(<"$group/backing_retries_total") == 1 ]] || \
-    fail "Remote-First did not retry the delayed backing failure exactly once"
+  retries=$(<"$group/backing_retries_total")
+  [[ $retries == 1 ]] || \
+    fail "Remote-First did not retry the delayed backing failure exactly once (got $retries)"
   [[ $(<"$group/backing_degraded_transitions_total") == 1 ]] || \
     fail "Backing-Degraded transition metric was not recorded"
 
@@ -540,7 +558,7 @@ cmp "$tmp/cold-pattern" "$tmp/cold-actual" || fail "cold local data was corrupte
   fail "runtime threshold did not keep the cold range unmapped"
 
 stop_group infiniswap-remote || fail "remote session did not tear down"
-sleep 1
+sleep 12
 
 test_remote_first_backing_failure
 sleep 1
@@ -549,12 +567,12 @@ sleep 1
 # and request contexts.
 for iteration in 1 2 3; do
   name="infiniswap-repeat-$iteration"
-  configure_group "$name" "$psk_hex"
+  configure_group "$name" "$psk_hex" strict "$chunk_bytes"
   wait_for_value "$root/$name/connection_state" connected
   dd if=/dev/zero of="/dev/$name" bs=4096 count=1 oflag=direct status=none
   wait_for_value "$root/$name/mapped_hot_ranges" 1
   stop_group "$name" || fail "$name did not tear down"
-  sleep 1
+  sleep 3
 done
 
 # Provider process death transitions promptly and leaves the valid Backing

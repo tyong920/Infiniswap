@@ -1189,6 +1189,11 @@ void on_connect(void *context)
   conn->connected = 1;
   pthread_cond_broadcast(&conn->lifetime_idle);
   pthread_mutex_unlock(&conn->lifetime_lock);
+  /*
+   * Soft-RoCE may drop receive WRs posted before the QP reaches RTS.
+   * Re-arm after ESTABLISHED so the Consumer HELLO is not met with RNR.
+   */
+  post_receives(conn);
 }
 
 void *poll_cq(void *ctx)
