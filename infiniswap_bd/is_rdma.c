@@ -327,6 +327,8 @@ static is_placement_u32 is_fabric_rand(void *ctx, is_placement_u32 limit)
 {
 	struct is_rdma_fabric *fabric = ctx;
 	struct is_device *device = fabric->device;
+	u32 threshold;
+	u32 value;
 
 	if (!limit)
 		return 0;
@@ -336,7 +338,12 @@ static is_placement_u32 is_fabric_rand(void *ctx, is_placement_u32 limit)
 		return (is_placement_u32)((fabric->placement_rng_state >> 33) %
 					  limit);
 	}
-	return (is_placement_u32)prandom_u32_max(limit);
+	/* Rejection sampling avoids modulo bias on both supported kernels. */
+	threshold = (u32)(-limit) % limit;
+	do {
+		value = get_random_u32();
+	} while (value < threshold);
+	return (is_placement_u32)(value % limit);
 }
 
 static unsigned int is_session_available_chunks(struct is_rdma_session *session)

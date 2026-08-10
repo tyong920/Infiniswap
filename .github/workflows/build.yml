@@ -90,7 +90,8 @@ jobs:
               ("status-v1.schema.json", "status-v1.json"),
               ("status-v2.schema.json", "status-v2.json"),
               ("status-v3.schema.json", "status-v3.json"),
-              ("status.schema.json", "status-v4.json"),
+              ("status-v4.schema.json", "status-v4.json"),
+              ("status.schema.json", "status-v5.json"),
           )
           for schema_name, snapshot_name in status_pairs:
               schema = json.loads((config / schema_name).read_text())
@@ -105,6 +106,13 @@ jobs:
           python3 -m compileall -q infiniswapctl
           python3 -m unittest discover -s infiniswapctl/tests -v
           bin/infiniswapctl --help >/dev/null
+
+      - name: Test VM harness contracts
+        run: |
+          python3 -m unittest discover -s tests/vm -p 'test_*.py' -v
+          python3 -m py_compile tests/vm/infiniswap_vm.py tests/vm/qemu_backend.py
+          bash -n tests/vm/run tests/vm/guest.sh
+          tests/vm/run --help >/dev/null
 
       - name: Test Memory Consumer completion policy
         run: |

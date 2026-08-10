@@ -279,7 +279,7 @@ sudo bin/infiniswapctl enable infiniswap0 --priority 100
 ```
 
 Human-readable status is the default. `--json` emits deterministic schema
-version 4 data covering lifecycle, operational state (including Remote-Lost),
+version 5 data covering lifecycle, operational state (including Remote-Lost),
 mode, policy, swap state, Provider connections, local/remote capacity, Hot Range
 scoring, mapped-range count, correctness/failover metrics, and the last kernel
 control error. It never includes key identifiers, PSK paths, PSKs, or
@@ -459,6 +459,57 @@ Remote-Lost. It also verifies the transition count and explicit read/write
 failure. `netem` briefly interrupts other Consumer traffic on the same netdev.
 Set `INFINISWAP_TEST_FAULT_MODE=roce-iptables` to drop only UDP/4791 traffic to
 an IPv4 Provider when the management connection must remain unaffected.
+
+### Automated KVM validation
+
+`tests/vm/run` is the release-gate harness for Ubuntu 22.04/Linux 5.15 and
+Ubuntu 24.04/Linux 6.8. Its default invocation runs the two-VM topology (one
+Memory Consumer and one Memory Provider) and three-VM topology (one Consumer
+and two Providers), including a 24-hour verified-I/O soak for every matrix
+entry:
+
+```bash
+tests/vm/run
+```
+
+The host needs x86-64 KVM access, QEMU, `qemu-img`, `cloud-localds`, OpenSSH,
+`nice`, and `ionice`. On Ubuntu, the non-base packages are available as
+`qemu-system-x86 qemu-utils cloud-image-utils openssh-client`. Preflight runs
+before cloud-image download or VM startup and requires the selected aggregate
+profile plus a 2 GiB host-memory and 8 GiB cache/artifact reserve to fit. The
+default profile requests and caps 6 vCPU, 48 GiB RAM, and 100 GiB sparse disk.
+`--large` requests and caps 16 vCPU, 128 GiB RAM, and 160 GiB sparse disk.
+
+The harness verifies Ubuntu's published SHA-256 checksum before caching each
+cloud image. QEMU runs at nice level 10 with idle I/O priority, KVM, ordinary
+anonymous guest RAM (no hugepages), SLIRP management networking, and private
+localhost QEMU socket networks for guest RXE. It never passes through a host
+RDMA device and snapshots host swap, protected RDMA/Infiniswap modules, and
+image attachments before and after the run. All module, RXE, Backing Store,
+and swap operations occur inside disposable guests.
+
+Each matrix entry builds from the current checkout and exercises Backed and
+Remote-Only verified `fio`, multi-Provider placement, guest-only swap pressure,
+normal device shutdown, Provider `SIGKILL`, RXE packet interruption, a
+Device Mapper Backing Store error, Consumer reboot, safe module reload, and the
+soak. Data mismatch, Provider deadline failure, unexpected I/O success, kernel
+warning/oops/panic, hung I/O, cleanup failure, or leaked QEMU process/socket/disk
+fails the machine-readable `report.json`. Guest journal, dmesg, status,
+configfs metrics, `fio` JSON, QEMU serial output, and command logs are retained
+under the reported `results/vm/<run-id>/` directory.
+
+Use `--keep-on-failure` to retain failed guests and their QMP sockets/disks for
+inspection. A focused smoke run may lower resources within the selected cap and
+set the soak to zero, but its report is marked non-certifiable:
+
+```bash
+tests/vm/run --kernel 6.8 --topology 2 --soak-hours 0 \
+  --memory-gib 8 --disk-gib 24 --keep-on-failure
+```
+
+Run `tests/vm/run --preflight-only --json` to validate a host without creating
+or downloading anything. A release-gate report is certifiable only with the
+full selected profile and at least 24 soak hours.
 
 `setup/install.sh bd` only builds and installs the module. It does not load the
 module, create an Infiniswap Device, format swap, or alter active swap.
