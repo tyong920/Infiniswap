@@ -92,6 +92,7 @@ struct is_rdma_fabric {
 	unsigned int reservation_next_logical;
 	unsigned int planned_count;
 	unsigned int next_resolve_index;
+	DECLARE_BITMAP(failed_sessions, IS_MAX_PROVIDERS);
 	struct delayed_work start_next_session_work;
 };
 
@@ -539,7 +540,9 @@ static void is_fabric_refresh_connection_state(struct is_rdma_fabric *fabric)
 		struct is_rdma_session *session = fabric->sessions[index];
 
 		if (!session) {
-			if (index >= fabric->next_resolve_index)
+			if (test_bit(index, fabric->failed_sessions))
+				failed++;
+			else
 				pending++;
 			continue;
 		}
@@ -588,7 +591,9 @@ static void is_fabric_start_next_session(struct is_rdma_fabric *fabric)
 
 	session = is_kzalloc_numa(device, sizeof(*session), GFP_KERNEL);
 	if (!session) {
+		set_bit(index, fabric->failed_sessions);
 		is_fabric_refresh_connection_state(fabric);
+		queue_work(system_wq, &fabric->mapping_work);
 		is_fabric_schedule_next_session(fabric);
 		return;
 	}
@@ -600,7 +605,9 @@ static void is_fabric_start_next_session(struct is_rdma_fabric *fabric)
 	ret = is_session_init(fabric, session, index, remote_only);
 	if (ret) {
 		kfree(session);
+		set_bit(index, fabric->failed_sessions);
 		is_fabric_refresh_connection_state(fabric);
+		queue_work(system_wq, &fabric->mapping_work);
 		is_fabric_schedule_next_session(fabric);
 		return;
 	}
@@ -650,6 +657,7 @@ static void is_failure_work(struct work_struct *work)
 	mutex_unlock(&session->control_lock);
 	is_unmap_session_chunks(session);
 	is_fabric_refresh_connection_state(session->fabric);
+	queue_work(system_wq, &session->fabric->mapping_work);
 	is_fabric_schedule_next_session(session->fabric);
 	wake_up_all(&session->control_wait);
 }
@@ -1792,7 +1800,8 @@ static void is_fabric_mapping_work(struct work_struct *work)
 	unsigned int index;
 	int ret = 0;
 
-	if (is_remote_only_device(device) || READ_ONCE(fabric->stopping))
+	if (is_remote_only_device(device) || READ_ONCE(fabric->stopping) ||
+	    atomic_read(&device->connection_state) == IS_CONNECTION_CONNECTING)
 		return;
 
 	for (index = 0; index < fabric->session_count; index++) {
