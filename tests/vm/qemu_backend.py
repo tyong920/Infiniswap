@@ -989,6 +989,7 @@ class QemuBackend:
                 "write-pattern",
                 "backing-fault",
                 "32",
+                "no-flush",
             )
             self._helper(
                 handle,

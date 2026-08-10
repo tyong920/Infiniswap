@@ -208,11 +208,16 @@ create_device() {
 }
 
 write_pattern() {
-  local label=$1 block=${2:-0}
+  local label=$1 block=${2:-0} flush=${3:-yes}
   dd if=/dev/urandom of="$artifacts/$label.pattern" bs=4096 count=64 status=none
   sync "$artifacts/$label.pattern"
-  timeout 20 dd if="$artifacts/$label.pattern" of="$device" bs=4096 count=64 \
-    seek="$block" oflag=direct conv=fsync status=none
+  if [[ $flush == yes ]]; then
+    timeout 20 dd if="$artifacts/$label.pattern" of="$device" bs=4096 count=64 \
+      seek="$block" oflag=direct conv=fsync status=none
+  else
+    timeout 20 dd if="$artifacts/$label.pattern" of="$device" bs=4096 count=64 \
+      seek="$block" oflag=direct status=none
+  fi
 }
 
 read_pattern() {
