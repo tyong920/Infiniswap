@@ -251,6 +251,26 @@ heat_ranges() {
   fi
 }
 
+verify_remote_only_heartbeats() {
+  local intervals=${1:-5} deadline_ms heartbeat_ms wait_ms
+  deadline_ms=$(<"$group/provider_failure_deadline_ms")
+  heartbeat_ms=$((deadline_ms / 3))
+  ((heartbeat_ms > 0)) || heartbeat_ms=1
+  wait_ms=$((heartbeat_ms * intervals))
+  python3 - "$wait_ms" <<'PY'
+import sys
+import time
+
+time.sleep(int(sys.argv[1]) / 1000)
+PY
+  [[ $(<"$group/connection_state") == connected ]] ||
+    fail "Remote-Only disconnected while heartbeats were expected"
+  [[ $(<"$group/operational_state") == healthy ]] ||
+    fail "Remote-Only left its healthy operational state"
+  [[ $(<"$group/provider_timeouts_total") == 0 ]] ||
+    fail "Remote-Only heartbeat validation observed a Provider timeout"
+}
+
 run_fio() {
   local label=$1 duration=${2:-0} rw=randrw
   local -a args
@@ -487,6 +507,7 @@ case $command in
   read-pattern) read_pattern "$@" ;;
   heat-ranges) heat_ranges "$@" ;;
   fio) run_fio "$@" ;;
+  verify-remote-only-heartbeats) verify_remote_only_heartbeats "$@" ;;
   snapshot) snapshot "$@" ;;
   swap-pressure) swap_pressure ;;
   backing-create) backing_create ;;

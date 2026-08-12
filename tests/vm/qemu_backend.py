@@ -739,6 +739,14 @@ class QemuBackend:
             timeout=180,
         )
         self._helper(
+            handle,
+            handle.consumer,
+            "heartbeat-remote-only",
+            "verify-remote-only-heartbeats",
+            "5",
+            timeout=30,
+        )
+        self._helper(
             handle, handle.consumer, "fio-remote-only", "fio", "remote-only"
         )
         self._helper(

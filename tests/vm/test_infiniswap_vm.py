@@ -65,6 +65,31 @@ class QemuScenarioTest(unittest.TestCase):
             ("read-pattern", "backing-fault", "32", "1"),
         )
 
+    def test_remote_only_fio_crosses_multiple_heartbeat_intervals(self):
+        backend = ScenarioRecordingBackend()
+        handle = SimpleNamespace(consumer=object(), providers=[object()])
+
+        result = backend._scenario_fio(handle)
+
+        calls = {label: args for label, args, _kwargs in backend.helper_calls}
+        self.assertEqual(result.status, "passed")
+        self.assertEqual(
+            calls["heartbeat-remote-only"],
+            ("verify-remote-only-heartbeats", "5"),
+        )
+        self.assertEqual(calls["fio-remote-only"], ("fio", "remote-only"))
+        heartbeat_index = next(
+            index
+            for index, call in enumerate(backend.helper_calls)
+            if call[0] == "heartbeat-remote-only"
+        )
+        fio_index = next(
+            index
+            for index, call in enumerate(backend.helper_calls)
+            if call[0] == "fio-remote-only"
+        )
+        self.assertLess(heartbeat_index, fio_index)
+
     def test_reboot_command_timeout_still_waits_for_guest_restart(self):
         backend = ScenarioRecordingBackend()
         handle = SimpleNamespace(consumer=SimpleNamespace(links=[]))

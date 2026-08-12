@@ -1171,8 +1171,6 @@ static void is_mark_session_ready(struct is_rdma_session *session,
 	session->healthy = true;
 	session->compatible = true;
 	session->exclude_reason = IS_PLACEMENT_EXCLUDE_NONE;
-	if (remote_only)
-		session->reservation_complete = false;
 	if (remote_only) {
 		if (session->failure_started) {
 			is_mark_session_remote_lost(session,
