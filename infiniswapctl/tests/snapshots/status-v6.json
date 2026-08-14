@@ -1,0 +1,74 @@
+{
+  "capacity": {
+    "advertised_bytes": 8589934592,
+    "backing_bytes": 8589934592,
+    "remote_bytes": 0
+  },
+  "connection": {
+    "healthy_providers": 0,
+    "providers": [
+      {
+        "available_chunks": 7,
+        "last_error": null,
+        "mapped_chunks": 1,
+        "provider_id": "provider-a",
+        "state": "not-connected"
+      }
+    ],
+    "state": "not-connected",
+    "total_providers": 1
+  },
+  "device": {
+    "acknowledgement_policy": "strict",
+    "lifecycle": "active",
+    "mode": "backed",
+    "name": "infiniswap0",
+    "operational_state": "healthy",
+    "path": "/dev/infiniswap0",
+    "provider_failure_deadline_ms": 2000,
+    "swap": {
+      "configured_priority": 100,
+      "enabled": true,
+      "priority": 100
+    }
+  },
+  "io": {
+    "completed_total": 12,
+    "errors_total": 0,
+    "in_flight": 0,
+    "oldest_in_flight_ms": 0,
+    "requests_total": 12
+  },
+  "kind": "infiniswap.device-status",
+  "last_error": null,
+  "mapping": {
+    "chunk_size_bytes": 1073741824,
+    "excluded_providers": [],
+    "mapped_hot_ranges": 1,
+    "mapped_remote_chunks": 1,
+    "placement_sample_size": 1,
+    "placements": [
+      {
+        "logical_chunk": 0,
+        "provider_id": "provider-a"
+      }
+    ],
+    "read_weight": 1,
+    "threshold": 8,
+    "write_weight": 4
+  },
+  "metrics": {
+    "admission_rejections_total": 0,
+    "authentication_failures_total": 0,
+    "backing_degraded_transitions_total": 0,
+    "backing_failures_total": 0,
+    "backing_invalid_sectors": 0,
+    "backing_retries_total": 0,
+    "late_rdma_completions_total": 0,
+    "local_only_writes_total": 0,
+    "provider_timeouts_total": 0,
+    "rejected_writes_total": 0,
+    "remote_lost_transitions_total": 0
+  },
+  "schema_version": 6
+}

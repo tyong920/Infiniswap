@@ -1,0 +1,98 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/tyong920/Infiniswap/config/provider-status.schema.json",
+  "title": "Infiniswap Provider Status v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "provider", "pools", "chunks", "consumers", "metrics", "last_error"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "infiniswap.provider-status"},
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider_id", "state", "active_connections"],
+      "properties": {
+        "provider_id": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"},
+        "state": {"enum": ["healthy", "degraded"]},
+        "active_connections": {"type": "integer", "minimum": 0, "maximum": 64}
+      }
+    },
+    "pools": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "max_chunks", "allocated_chunks", "assigned_chunks", "available_chunks"],
+        "properties": {
+          "name": {"enum": ["opportunistic", "committed"]},
+          "max_chunks": {"type": "integer", "minimum": 0, "maximum": 128},
+          "allocated_chunks": {"type": "integer", "minimum": 0, "maximum": 128},
+          "assigned_chunks": {"type": "integer", "minimum": 0, "maximum": 128},
+          "available_chunks": {"type": "integer", "minimum": 0, "maximum": 128}
+        }
+      }
+    },
+    "chunks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["size_bytes", "host_reserve_chunks", "allocated_chunks", "assigned_chunks", "quarantined_chunks"],
+      "properties": {
+        "size_bytes": {"const": 1073741824},
+        "host_reserve_chunks": {"type": "integer", "minimum": 0, "maximum": 128},
+        "allocated_chunks": {"type": "integer", "minimum": 0, "maximum": 128},
+        "assigned_chunks": {"type": "integer", "minimum": 0, "maximum": 128},
+        "quarantined_chunks": {"type": "integer", "minimum": 0, "maximum": 128}
+      }
+    },
+    "consumers": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["consumer_id", "state", "mode", "pool", "failure_deadline_ms", "connection_count", "assigned_opportunistic_chunks", "assigned_committed_chunks", "inflight_control_requests", "last_error_code"],
+        "properties": {
+          "consumer_id": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"},
+          "state": {"enum": ["connecting", "ready", "degraded", "closed"]},
+          "mode": {"enum": ["backed", "remote-only", "unknown"]},
+          "pool": {"enum": ["opportunistic", "committed", "unknown"]},
+          "failure_deadline_ms": {"type": "integer", "minimum": 500, "maximum": 30000},
+          "connection_count": {"type": "integer", "minimum": 0, "maximum": 64},
+          "assigned_opportunistic_chunks": {"type": "integer", "minimum": 0, "maximum": 128},
+          "assigned_committed_chunks": {"type": "integer", "minimum": 0, "maximum": 128},
+          "inflight_control_requests": {"type": "integer", "minimum": 0},
+          "last_error_code": {"type": "integer", "minimum": 0}
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["admissions_total", "admission_rejections_total", "pressure_reclaims_total", "authentication_failures_total", "deadline_expiries_total", "connections_total", "disconnections_total", "control_errors_total"],
+      "properties": {
+        "admissions_total": {"type": "integer", "minimum": 0},
+        "admission_rejections_total": {"type": "integer", "minimum": 0},
+        "pressure_reclaims_total": {"type": "integer", "minimum": 0},
+        "authentication_failures_total": {"type": "integer", "minimum": 0},
+        "deadline_expiries_total": {"type": "integer", "minimum": 0},
+        "connections_total": {"type": "integer", "minimum": 0},
+        "disconnections_total": {"type": "integer", "minimum": 0},
+        "control_errors_total": {"type": "integer", "minimum": 0}
+      }
+    },
+    "last_error": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code"],
+          "properties": {"code": {"type": "string", "minLength": 1, "maxLength": 63}}
+        }
+      ]
+    }
+  }
+}

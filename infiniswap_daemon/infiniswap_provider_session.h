@@ -27,6 +27,7 @@ struct is_provider_session {
   uint64_t authenticated_until_unix;
   uint64_t authorization_version;
   uint32_t failure_deadline_ms;
+  uint16_t last_error_code;
   uint8_t selected_mode;
   uint8_t selected_pool;
   uint8_t provider_nonce[IS_PROTOCOL_NONCE_SIZE];

@@ -140,6 +140,7 @@ struct is_device {
 	u64 capacity_bytes;
 	u64 remote_capacity_bytes;
 	sector_t capacity_sectors;
+	unsigned long oldest_inflight_started;
 	int minor;
 	atomic_t openers;
 	atomic_t inflight;
@@ -148,6 +149,11 @@ struct is_device {
 	atomic_t remote_lost;
 	atomic_t mapped_remote_chunks;
 	atomic64_t next_io_generation;
+	atomic64_t io_requests_total;
+	atomic64_t io_completed_total;
+	atomic64_t io_errors_total;
+	atomic64_t authentication_failures_total;
+	atomic64_t admission_rejections_total;
 	atomic64_t backing_failures_total;
 	atomic64_t backing_retries_total;
 	atomic64_t backing_degraded_transitions_total;

@@ -99,8 +99,22 @@ stop_device() {
   rmdir "$group"
 }
 
+psk_corrupt() {
+  local path=$1
+  cp -- "$path" "$path.correct"
+  printf '%064d\n' 0 >"$path"
+  chmod 0600 "$path"
+}
+
+psk_restore() {
+  local path=$1
+  [[ -f $path.correct ]] || fail "PSK backup is absent"
+  mv -- "$path.correct" "$path"
+  chmod 0600 "$path"
+}
+
 provider_start() {
-  local port=$1 psk_file=$2 psk
+  local port=$1 psk_file=$2 provider_id=${3:-provider-vm} psk
   psk=$(<"$psk_file")
   [[ $psk =~ ^[[:xdigit:]]{64}$ ]] || fail "invalid Provider PSK file"
   cat > /etc/infiniswap-vm-memory.conf <<'EOF'
@@ -124,7 +138,8 @@ EOF
   systemctl stop infiniswap-vm-provider.service 2>/dev/null || true
   systemctl reset-failed infiniswap-vm-provider.service 2>/dev/null || true
   systemd-run --quiet --unit=infiniswap-vm-provider \
-    --property=LimitMEMLOCK=infinity --property=Nice=5 -- \
+    --property=LimitMEMLOCK=infinity --property=Nice=5 \
+    --setenv="INFINISWAP_PROVIDER_ID=$provider_id" -- \
     "$daemon" :: "$port" /etc/infiniswap-vm-memory.conf \
     /etc/infiniswap-vm-consumers.conf
   for _ in {1..100}; do
@@ -288,17 +303,41 @@ run_fio() {
   timeout "$((duration + 300))" fio "${args[@]}"
 }
 
+assert_alert() {
+  local label=$1 alert_name=$2 expected=$3
+  local output="$artifacts/alerts-$label.json"
+  "$repo/bin/infiniswapctl" alerts "$name" --json >"$output"
+  python3 - "$output" "$alert_name" "$expected" <<'PY'
+import json
+import sys
+
+path, alert_name, expected = sys.argv[1:]
+with open(path, encoding="ascii") as source:
+    names = {alert["name"] for alert in json.load(source)["alerts"]}
+present = alert_name in names
+if present != (expected == "present"):
+    raise SystemExit(
+        "alert %s was %s; expected %s" %
+        (alert_name, "present" if present else "absent", expected)
+    )
+PY
+}
+
 snapshot() {
   local label=$1
   if [[ -d $group ]]; then
     "$repo/bin/infiniswapctl" status "$name" --json >"$artifacts/status-$label.json"
+    "$repo/bin/infiniswapctl" metrics "$name" >"$artifacts/metrics-$label.prom"
+    "$repo/bin/infiniswapctl" alerts "$name" --json >"$artifacts/alerts-$label.json"
     (
       cd "$group"
       for attribute in state operational_state connection_state backing_state \
-        provider_exclusions remote_chunk_placements mapped_remote_chunks \
-        remote_capacity_bytes provider_timeouts_total \
+        provider_exclusions provider_runtime_status remote_chunk_placements \
+        mapped_remote_chunks remote_capacity_bytes provider_timeouts_total \
         remote_lost_transitions_total backing_degraded_transitions_total \
-        rejected_writes_total last_error; do
+        rejected_writes_total authentication_failures_total \
+        admission_rejections_total io_requests_total io_completed_total \
+        io_errors_total inflight_io oldest_inflight_ms last_error; do
         [[ -r $attribute ]] && printf '%s=%s\n' "$attribute" "$(<$attribute)"
       done
     ) >"$artifacts/configfs-$label.txt"
@@ -464,6 +503,12 @@ collect() {
   lsmod >"$artifacts/modules.txt" || true
   systemctl status infiniswap-vm-provider.service --no-pager \
     >"$artifacts/provider-service.txt" 2>&1 || true
+  if systemctl is-active --quiet infiniswap-vm-provider.service; then
+    "$repo/bin/infiniswapctl" provider-status --json \
+      >"$artifacts/provider-status.json" 2>"$artifacts/provider-status.error.txt" || true
+    "$repo/bin/infiniswapctl" provider-metrics \
+      >"$artifacts/provider-metrics.prom" 2>"$artifacts/provider-metrics.error.txt" || true
+  fi
 }
 
 cleanup_guest() {
@@ -489,6 +534,8 @@ shift || true
 case $command in
   setup-rxe) setup_rxe "$@" ;;
   provider-start) provider_start "$@" ;;
+  psk-corrupt) psk_corrupt "$@" ;;
+  psk-restore) psk_restore "$@" ;;
   provider-stop) systemctl stop infiniswap-vm-provider.service ;;
   provider-kill)
     pid=$(systemctl show -p MainPID --value infiniswap-vm-provider.service)
@@ -509,6 +556,7 @@ case $command in
   fio) run_fio "$@" ;;
   verify-remote-only-heartbeats) verify_remote_only_heartbeats "$@" ;;
   snapshot) snapshot "$@" ;;
+  assert-alert) assert_alert "$@" ;;
   swap-pressure) swap_pressure ;;
   backing-create) backing_create ;;
   backing-fail) backing_fail ;;

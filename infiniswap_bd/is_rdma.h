@@ -45,6 +45,8 @@ ssize_t is_rdma_remote_chunk_placements_show(struct is_device *device,
 					     char *page);
 ssize_t is_rdma_provider_exclusions_show(struct is_device *device,
 					 char *page);
+ssize_t is_rdma_provider_runtime_status_show(struct is_device *device,
+					     char *page);
 unsigned int is_fabric_mapped_chunk_count(struct is_device *device);
 
 #endif /* INFINISWAP_RDMA_H */

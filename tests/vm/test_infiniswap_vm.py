@@ -48,6 +48,41 @@ class ScenarioRecordingBackend(qemu_backend.QemuBackend):
 
 
 class QemuScenarioTest(unittest.TestCase):
+    def test_build_deploy_exercises_and_clears_authentication_alert(self):
+        backend = ScenarioRecordingBackend()
+        consumer = SimpleNamespace(
+            links=[{"provider_ip": "192.0.2.2", "consumer_rail": "rxe0"}]
+        )
+        handle = SimpleNamespace(
+            consumer=consumer,
+            providers=[SimpleNamespace(name="provider-0")],
+            image_sha256="fixture-sha",
+            guests=[consumer, object()],
+        )
+
+        result = backend._scenario_build_deploy(handle)
+
+        calls = {label: args for label, args, _kwargs in backend.helper_calls}
+        self.assertEqual(result.status, "passed")
+        self.assertEqual(
+            calls["alert-auth-failure"],
+            (
+                "assert-alert",
+                "auth-failure",
+                "InfiniswapAuthenticationFailure",
+                "present",
+            ),
+        )
+        self.assertEqual(
+            calls["alert-auth-cleared"],
+            (
+                "assert-alert",
+                "auth-cleared",
+                "InfiniswapAuthenticationFailure",
+                "absent",
+            ),
+        )
+
     def test_remote_first_verifies_only_the_write_that_observes_backing_failure(self):
         backend = ScenarioRecordingBackend()
         handle = SimpleNamespace(consumer=object())
@@ -63,6 +98,24 @@ class QemuScenarioTest(unittest.TestCase):
         self.assertEqual(
             calls["backing-read"],
             ("read-pattern", "backing-fault", "32", "1"),
+        )
+        self.assertEqual(
+            calls["alert-backing-degraded"],
+            (
+                "assert-alert",
+                "backing-degraded",
+                "InfiniswapBackingDegraded",
+                "present",
+            ),
+        )
+        self.assertEqual(
+            calls["alert-backing-cleared"],
+            (
+                "assert-alert",
+                "backing-cleared",
+                "InfiniswapBackingDegraded",
+                "absent",
+            ),
         )
 
     def test_remote_only_fio_crosses_multiple_heartbeat_intervals(self):

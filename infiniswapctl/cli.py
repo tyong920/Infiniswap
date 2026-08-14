@@ -15,6 +15,7 @@ from .config import (
     load_provider_directory,
     validate_device_name,
 )
+from .observability import evaluate_consumer_alerts, render_consumer_metrics
 from .system import LocalSystem
 
 
@@ -45,12 +46,52 @@ def _parser() -> argparse.ArgumentParser:
     status.add_argument("device")
     status.add_argument("--json", action="store_true")
 
+    metrics = commands.add_parser("metrics")
+    metrics.add_argument("device")
+
+    alerts = commands.add_parser("alerts")
+    alerts.add_argument("device")
+    alerts.add_argument("--json", action="store_true")
+
+    audit = commands.add_parser("audit")
+    audit.add_argument("event", choices=("key-rotated", "key-revoked", "cutover"))
+    audit.add_argument("--subject", required=True)
+    audit.add_argument("--change-id", required=True)
+    audit.add_argument(
+        "--outcome",
+        required=True,
+        choices=("started", "completed", "rolled-back", "failed"),
+    )
+    audit.add_argument("--dry-run", action="store_true")
+
+    provider_status = commands.add_parser("provider-status")
+    provider_status.add_argument(
+        "--endpoint", default="http://127.0.0.1:9401"
+    )
+    provider_status.add_argument("--json", action="store_true")
+
+    provider_metrics = commands.add_parser("provider-metrics")
+    provider_metrics.add_argument(
+        "--endpoint", default="http://127.0.0.1:9401"
+    )
+
     validate = commands.add_parser("validate")
     validate.add_argument(
         "kind", choices=("consumer", "provider", "provider-directory")
     )
     validate.add_argument("--config", required=True)
     return parser
+
+
+def _validate_audit_identifier(value: str, field: str) -> str:
+    if not value or len(value) > 63 or any(
+        not (character.isalnum() or character in "._-") for character in value
+    ):
+        raise ConfigError(
+            "%s must be 1-63 letters, digits, periods, underscores, or hyphens"
+            % field
+        )
+    return value
 
 
 def _print_create_preflight(config: ConsumerConfig, stdout: IO[str]) -> None:
@@ -293,6 +334,56 @@ def _parse_excluded_providers(raw: str) -> List[Dict[str, str]]:
     return excluded
 
 
+def _error_status(error_number: int) -> Optional[Dict[str, Any]]:
+    if not error_number:
+        return None
+    positive_error = abs(error_number)
+    return {
+        "code": errno.errorcode.get(positive_error, "EUNKNOWN"),
+        "errno": positive_error,
+    }
+
+
+def _optional_int_attribute(
+    system: Any, name: str, attribute: str, default: int = 0
+) -> int:
+    try:
+        return int(system.read_attribute(name, attribute))
+    except (KeyError, OSError, ValueError):
+        return default
+
+
+def _parse_provider_runtime_status(raw: str) -> Dict[str, Dict[str, Any]]:
+    providers: Dict[str, Dict[str, Any]] = {}
+    valid_states = {
+        "not-connected",
+        "connecting",
+        "connected",
+        "degraded",
+        "remote-lost",
+    }
+    for line in raw.splitlines():
+        fields = line.split()
+        if len(fields) != 5 or fields[1] not in valid_states:
+            continue
+        try:
+            available_chunks = int(fields[2])
+            mapped_chunks = int(fields[3])
+            error_number = int(fields[4])
+        except ValueError:
+            continue
+        if available_chunks < 0 or mapped_chunks < 0 or not fields[0]:
+            continue
+        providers[fields[0]] = {
+            "provider_id": fields[0],
+            "state": fields[1],
+            "available_chunks": available_chunks,
+            "mapped_chunks": mapped_chunks,
+            "last_error": _error_status(error_number),
+        }
+    return providers
+
+
 def _device_status(name: str, system: Any) -> Dict[str, Any]:
     path, lifecycle = _inspect_device(name, system)
     mode = system.read_attribute(name, "mode")
@@ -329,54 +420,86 @@ def _device_status(name: str, system: Any) -> Dict[str, Any]:
     except (KeyError, OSError):
         excluded_providers = []
     excluded_ids = {entry["provider_id"] for entry in excluded_providers}
-    if connection_state == "connected":
-        healthy_providers = sum(
-            1 for provider in provider_names if provider not in excluded_ids
-        )
-    elif connection_state == "degraded":
-        healthy_providers = max(
-            0,
-            sum(1 for provider in provider_names if provider not in excluded_ids),
-        )
-    else:
-        healthy_providers = 0
     swap_enabled = system.is_swap_enabled(path)
     priority = system.swap_priority(path) if swap_enabled else None
     configured_priority = int(system.read_attribute(name, "swap_priority"))
-    error_number = int(system.read_attribute(name, "last_error"))
-    last_error = None
-    if error_number:
-        positive_error = abs(error_number)
-        last_error = {
-            "code": errno.errorcode.get(positive_error, "EUNKNOWN"),
-            "errno": positive_error,
-        }
+    last_error = _error_status(int(system.read_attribute(name, "last_error")))
 
+    metric_names = (
+        "admission_rejections_total",
+        "authentication_failures_total",
+        "backing_degraded_transitions_total",
+        "backing_failures_total",
+        "backing_invalid_sectors",
+        "backing_retries_total",
+        "late_rdma_completions_total",
+        "local_only_writes_total",
+        "provider_timeouts_total",
+        "remote_lost_transitions_total",
+        "rejected_writes_total",
+    )
     metrics = {
-        metric: int(system.read_attribute(name, metric))
-        for metric in (
-            "backing_degraded_transitions_total",
-            "backing_failures_total",
-            "backing_invalid_sectors",
-            "backing_retries_total",
-            "late_rdma_completions_total",
-            "local_only_writes_total",
-            "provider_timeouts_total",
-            "remote_lost_transitions_total",
-            "rejected_writes_total",
-        )
+        metric: _optional_int_attribute(system, name, metric) for metric in metric_names
+    }
+    io_status = {
+        "in_flight": _optional_int_attribute(
+            system,
+            name,
+            "inflight_io",
+            _optional_int_attribute(system, name, "inflight", 0),
+        ),
+        "oldest_in_flight_ms": _optional_int_attribute(
+            system, name, "oldest_inflight_ms"
+        ),
+        "requests_total": _optional_int_attribute(
+            system, name, "io_requests_total"
+        ),
+        "completed_total": _optional_int_attribute(
+            system, name, "io_completed_total"
+        ),
+        "errors_total": _optional_int_attribute(system, name, "io_errors_total"),
     }
 
+    try:
+        runtime_status = _parse_provider_runtime_status(
+            system.read_attribute(name, "provider_runtime_status")
+        )
+    except (KeyError, OSError):
+        runtime_status = {}
+    mapped_by_provider: Dict[str, int] = {}
+    for placement in placements:
+        provider_id = placement["provider_id"]
+        mapped_by_provider[provider_id] = mapped_by_provider.get(provider_id, 0) + 1
+
     provider_states = []
-    for provider in provider_names:
+    for provider_index, provider in enumerate(provider_names):
+        runtime = runtime_status.get(provider)
+        if runtime is None:
+            runtime = runtime_status.get(str(provider_index))
+        if runtime is not None:
+            runtime = dict(runtime)
+            runtime["provider_id"] = provider
+            provider_states.append(runtime)
+            continue
         if provider in excluded_ids:
             state = "not-connected"
         else:
             state = connection_state
-        provider_states.append({"provider_id": provider, "state": state})
+        provider_states.append(
+            {
+                "provider_id": provider,
+                "state": state,
+                "available_chunks": 0,
+                "mapped_chunks": mapped_by_provider.get(provider, 0),
+                "last_error": None,
+            }
+        )
+    healthy_providers = sum(
+        1 for provider in provider_states if provider["state"] == "connected"
+    )
 
     return {
-        "schema_version": 5,
+        "schema_version": 6,
         "kind": "infiniswap.device-status",
         "device": {
             "name": name,
@@ -414,6 +537,7 @@ def _device_status(name: str, system: Any) -> Dict[str, Any]:
             "placements": placements,
             "excluded_providers": excluded_providers,
         },
+        "io": io_status,
         "metrics": metrics,
         "last_error": last_error,
     }
@@ -442,6 +566,27 @@ def _print_status(status: Dict[str, Any], json_output: bool, stdout: IO[str]) ->
         % (capacity["advertised_bytes"], capacity["remote_bytes"]),
         file=stdout,
     )
+    print(
+        "  Provider Failure Deadline: %d ms"
+        % device["provider_failure_deadline_ms"],
+        file=stdout,
+    )
+    io_status = status["io"]
+    print(
+        "  I/O: %d in flight, %d completed, %d errors"
+        % (
+            io_status["in_flight"],
+            io_status["completed_total"],
+            io_status["errors_total"],
+        ),
+        file=stdout,
+    )
+    if io_status["in_flight"]:
+        print(
+            "  oldest in-flight I/O: %d ms"
+            % io_status["oldest_in_flight_ms"],
+            file=stdout,
+        )
     if device["mode"] == "remote-only":
         print(
             "  Remote Chunks: %d mapped" % status["mapping"]["mapped_remote_chunks"],
@@ -501,6 +646,24 @@ def _print_status(status: Dict[str, Any], json_output: bool, stdout: IO[str]) ->
         ),
         file=stdout,
     )
+    for provider in connection["providers"]:
+        provider_error = provider["last_error"]
+        error_suffix = (
+            ", last error %(code)s (%(errno)d)" % provider_error
+            if provider_error
+            else ""
+        )
+        print(
+            "  Provider %s: %s, %d chunks available, %d mapped%s"
+            % (
+                provider["provider_id"],
+                provider["state"],
+                provider["available_chunks"],
+                provider["mapped_chunks"],
+                error_suffix,
+            ),
+            file=stdout,
+        )
     mapping = status["mapping"]
     if mapping["placements"]:
         print(
@@ -526,6 +689,112 @@ def _print_status(status: Dict[str, Any], json_output: bool, stdout: IO[str]) ->
         print("  last error: %(code)s (%(errno)d)" % status["last_error"], file=stdout)
 
 
+def _contains_secret_field(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            normalized = key.lower().replace("-", "_")
+            if "psk" in normalized or normalized in {
+                "key_id",
+                "authentication_tag",
+                "secret",
+            }:
+                return True
+            if _contains_secret_field(nested):
+                return True
+    elif isinstance(value, list):
+        return any(_contains_secret_field(item) for item in value)
+    return False
+
+
+def _provider_status(endpoint: str, system: Any) -> Dict[str, Any]:
+    try:
+        status = json.loads(system.fetch_observability(endpoint, "/status"))
+        if (
+            not isinstance(status, dict)
+            or status.get("schema_version") != 1
+            or status.get("kind") != "infiniswap.provider-status"
+            or not isinstance(status["provider"], dict)
+            or not isinstance(status["pools"], list)
+            or len(status["pools"]) != 2
+            or not isinstance(status["consumers"], list)
+            or len(status["consumers"]) > 64
+            or _contains_secret_field(status)
+        ):
+            raise ValueError("invalid Provider status contract")
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ConfigError("Provider returned invalid status JSON") from exc
+    return status
+
+
+def _print_provider_status(status: Dict[str, Any], stdout: IO[str]) -> None:
+    provider = status["provider"]
+    connection_count = provider["active_connections"]
+    print(
+        "%s: %s (%d active Consumer connection%s)"
+        % (
+            provider["provider_id"],
+            provider["state"],
+            connection_count,
+            "" if connection_count == 1 else "s",
+        ),
+        file=stdout,
+    )
+    for pool in status["pools"]:
+        print(
+            "  %s Pool: %d assigned, %d available, %d maximum Remote Chunks"
+            % (
+                pool["name"].capitalize(),
+                pool["assigned_chunks"],
+                pool["available_chunks"],
+                pool["max_chunks"],
+            ),
+            file=stdout,
+        )
+    chunks = status["chunks"]
+    print(
+        "  chunks: %d allocated, %d assigned, %d quarantined; Host Reserve %d"
+        % (
+            chunks["allocated_chunks"],
+            chunks["assigned_chunks"],
+            chunks["quarantined_chunks"],
+            chunks["host_reserve_chunks"],
+        ),
+        file=stdout,
+    )
+    for consumer in status["consumers"]:
+        consumer_error = (
+            ", last control error code %d" % consumer["last_error_code"]
+            if consumer["last_error_code"]
+            else ""
+        )
+        print(
+            "  Consumer %s: %s, %s, %s, deadline %d ms%s"
+            % (
+                consumer["consumer_id"],
+                consumer["state"],
+                consumer["mode"],
+                consumer["pool"],
+                consumer["failure_deadline_ms"],
+                consumer_error,
+            ),
+            file=stdout,
+        )
+        print(
+            "    Remote Chunks: %d opportunistic, %d committed; "
+            "in-flight control requests: %d"
+            % (
+                consumer["assigned_opportunistic_chunks"],
+                consumer["assigned_committed_chunks"],
+                consumer["inflight_control_requests"],
+            ),
+            file=stdout,
+        )
+    if status["last_error"] is None:
+        print("  last error: none", file=stdout)
+    else:
+        print("  last error: " + status["last_error"]["code"], file=stdout)
+
+
 def run(
     argv: Optional[List[str]] = None,
     *,
@@ -545,6 +814,16 @@ def run(
                 print("Dry run: no changes made", file=stdout)
                 return 0
             _create(config, system, stdout)
+            system.record_audit_event(
+                "device.created",
+                config.name,
+                {
+                    "acknowledgement_policy": config.acknowledgement_policy,
+                    "mode": config.mode,
+                    "provider_count": len(config.providers),
+                    "remote_only_eligible": config.remote_only_eligible,
+                },
+            )
             return 0
 
         if args.command in ("format", "enable", "disable", "drain", "destroy"):
@@ -556,11 +835,103 @@ def run(
                 print("Dry run: no changes made", file=stdout)
                 return 0
             _run_lifecycle_command(args, path, system, stdout)
+            if args.command == "enable":
+                event = "swap.activated"
+                details = {"priority": args.priority, "scope": "host-wide"}
+            elif args.command == "disable":
+                event = "swap.deactivated"
+                details = {"scope": "host-wide"}
+            else:
+                event = "device.%s" % (
+                    "formatted" if args.command == "format" else args.command
+                )
+                details = {}
+            system.record_audit_event(event, args.device, details)
             return 0
 
         if args.command == "status":
             status = _device_status(validate_device_name(args.device), system)
             _print_status(status, args.json, stdout)
+            return 0
+
+        if args.command == "metrics":
+            status = _device_status(validate_device_name(args.device), system)
+            stdout.write(render_consumer_metrics(status))
+            return 0
+
+        if args.command == "alerts":
+            status = _device_status(validate_device_name(args.device), system)
+            alerts = evaluate_consumer_alerts(status)
+            if args.json:
+                json.dump(
+                    {
+                        "schema_version": 1,
+                        "kind": "infiniswap.alert-state",
+                        "device": status["device"]["name"],
+                        "alerts": alerts,
+                    },
+                    stdout,
+                    indent=2,
+                    sort_keys=True,
+                )
+                stdout.write("\n")
+            elif not alerts:
+                print("No active Infiniswap alerts", file=stdout)
+            else:
+                for alert in alerts:
+                    print(
+                        "%s [%s]: %s (%s)"
+                        % (
+                            alert["name"],
+                            alert["severity"],
+                            alert["summary"],
+                            alert["runbook"],
+                        ),
+                        file=stdout,
+                    )
+            return 0
+
+        if args.command == "audit":
+            subject = _validate_audit_identifier(args.subject, "subject")
+            change_id = _validate_audit_identifier(args.change_id, "change-id")
+            if not args.dry_run and not system.is_root():
+                raise ConfigError("audit recording must run as root")
+            print(
+                "Preflight audit %s for %s (%s)"
+                % (args.event, subject, args.outcome),
+                file=stdout,
+            )
+            if args.dry_run:
+                print("Dry run: no changes made", file=stdout)
+                return 0
+            event = args.event.replace("-", ".")
+            system.record_audit_event(
+                event,
+                subject,
+                {"change_id": change_id, "outcome": args.outcome},
+            )
+            print("Recorded %s audit event" % event, file=stdout)
+            return 0
+
+        if args.command == "provider-status":
+            status = _provider_status(args.endpoint, system)
+            if args.json:
+                json.dump(status, stdout, indent=2, sort_keys=True)
+                stdout.write("\n")
+            else:
+                _print_provider_status(status, stdout)
+            return 0
+
+        if args.command == "provider-metrics":
+            metrics = system.fetch_observability(args.endpoint, "/metrics")
+            if (
+                not metrics.startswith("# infiniswap_metrics_schema_version 1\n")
+                or not metrics.endswith("# EOF\n")
+                or "psk" in metrics.lower()
+                or "key_id" in metrics.lower()
+            ):
+                raise ConfigError("Provider returned invalid OpenMetrics data")
+            stdout.write(metrics)
             return 0
 
         if args.command == "validate":

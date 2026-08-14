@@ -199,6 +199,7 @@ struct is_rdma_session {
 	u16 release_count;
 
 	unsigned int remote_chunk_limit;
+	int last_error;
 	bool healthy;
 	bool compatible;
 	enum is_placement_exclude_reason exclude_reason;
@@ -705,6 +706,7 @@ static void is_rdma_fail(struct is_rdma_session *session, int error)
 				IS_PLACEMENT_EXCLUDE_UNHEALTHY);
 	}
 	session->failure_started = true;
+	WRITE_ONCE(session->last_error, -error);
 	WRITE_ONCE(session->device->last_error, -error);
 	terminal = is_remote_only(session) &&
 		(session->fabric->reservation_complete ||
@@ -1643,6 +1645,12 @@ static void is_receive_work(struct work_struct *work)
 	    message->header.request_id == session->pending_request_id)
 		is_cancel_control_deadline(session);
 	if (message->header.type == IS_PROTOCOL_MSG_ERROR) {
+		if (message->payload.error.code ==
+		    IS_PROTOCOL_ERROR_AUTHENTICATION ||
+		    message->payload.error.code == IS_PROTOCOL_ERROR_REVOKED)
+			atomic64_inc(&session->device->authentication_failures_total);
+		else if (message->payload.error.code == IS_PROTOCOL_ERROR_RESOURCE)
+			atomic64_inc(&session->device->admission_rejections_total);
 		ret = -EREMOTEIO;
 		goto out;
 	}
@@ -2790,5 +2798,50 @@ ssize_t is_rdma_provider_exclusions_show(struct is_device *device, char *page)
 	}
 	if (!emitted)
 		written += sysfs_emit(page, "\n");
+	return written;
+}
+
+static const char *is_session_runtime_state(struct is_rdma_session *session)
+{
+	if (atomic_read(&session->device->remote_lost))
+		return "remote-lost";
+	if (READ_ONCE(session->healthy) && READ_ONCE(session->compatible) &&
+	    READ_ONCE(session->control_state) == IS_RDMA_CONTROL_READY)
+		return "connected";
+	if (READ_ONCE(session->failure_started))
+		return READ_ONCE(session->ever_connected) ?
+			"degraded" : "not-connected";
+	if (READ_ONCE(session->connect_started))
+		return "connecting";
+	return "not-connected";
+}
+
+ssize_t is_rdma_provider_runtime_status_show(struct is_device *device,
+					     char *page)
+{
+	struct is_rdma_fabric *fabric = is_device_fabric(device);
+	ssize_t written = 0;
+	unsigned long flags;
+	unsigned int index;
+
+	if (!fabric)
+		return sysfs_emit(page, "\n");
+	spin_lock_irqsave(&fabric->chunk_lock, flags);
+	for (index = 0; index < fabric->session_count; index++) {
+		struct is_rdma_session *session = fabric->sessions[index];
+		unsigned int mapped = fabric->mapped_per_session[index];
+		unsigned int advertised = READ_ONCE(session->available_chunks);
+		unsigned int available = advertised > mapped ?
+			advertised - mapped : 0;
+
+		if (written >= PAGE_SIZE - 128)
+			break;
+		written += sysfs_emit_at(page, written, "%u %s %u %u %d\n",
+			index, is_session_runtime_state(session), available, mapped,
+			READ_ONCE(session->last_error));
+	}
+	spin_unlock_irqrestore(&fabric->chunk_lock, flags);
+	if (!written)
+		written = sysfs_emit(page, "\n");
 	return written;
 }

@@ -159,8 +159,11 @@ static void *monitor_connection_deadlines(void *context)
   while (!conn->closing && !conn->handshake_complete && result == 0)
     result = pthread_cond_timedwait(&conn->lifetime_idle,
                                     &conn->lifetime_lock, &deadline);
-  if (!conn->closing && !conn->handshake_complete)
+  if (!conn->closing && !conn->handshake_complete) {
+    __atomic_fetch_add(&conn->sess->deadline_expiries_total, UINT64_C(1),
+                         __ATOMIC_RELAXED);
     disconnect = 1;
+  }
 
   while (!conn->closing && !disconnect) {
     enum is_consumer_liveness_result liveness_result;
@@ -174,6 +177,8 @@ static void *monitor_connection_deadlines(void *context)
     liveness_result = is_consumer_liveness_check(
         &conn->consumer_liveness, now_ms, (uint64_t)now_unix, &wait_ms);
     if (liveness_result != IS_CONSUMER_LIVENESS_ACTIVE) {
+      __atomic_fetch_add(&conn->sess->deadline_expiries_total, UINT64_C(1),
+                         __ATOMIC_RELAXED);
       disconnect = 1;
       break;
     }
@@ -214,8 +219,11 @@ static int wait_for_control_response(struct connection *conn,
   closing = conn->closing;
   pthread_mutex_unlock(&conn->lifetime_lock);
   if (result != 0 || closing) {
-    if (!closing)
+    if (!closing) {
+      __atomic_fetch_add(&conn->sess->deadline_expiries_total, UINT64_C(1),
+                         __ATOMIC_RELAXED);
       rdma_disconnect(conn->id);
+    }
     return -1;
   }
   return 0;
@@ -275,6 +283,7 @@ int build_connection(struct rdma_cm_id *id)
   atomic_set(&conn->cq_qp_state, CQ_QP_BUSY);
   pthread_mutex_init(&conn->send_lock, NULL);
   pthread_mutex_init(&conn->control_lock, NULL);
+  pthread_mutex_init(&conn->protocol_lock, NULL);
   pthread_mutex_init(&conn->lifetime_lock, NULL);
   TEST_NZ(pthread_condattr_init(&condition_attributes));
   TEST_NZ(pthread_condattr_setclock(&condition_attributes, CLOCK_MONOTONIC));
@@ -304,6 +313,8 @@ int build_connection(struct rdma_cm_id *id)
     } 
   }
   session.conn_num += 1;
+  __atomic_fetch_add(&session.connections_total, UINT64_C(1),
+                     __ATOMIC_RELAXED);
   pthread_mutex_unlock(&session_lock);
 
   if (connection_get_reference(conn) != 0)
@@ -441,6 +452,8 @@ void destroy_connection(void *context)
   session.conns[conn->conn_index] = NULL;
   session.conns_state[conn->conn_index] = CONN_IDLE;
   session.conn_num -= 1;
+  __atomic_fetch_add(&session.disconnections_total, UINT64_C(1),
+                     __ATOMIC_RELAXED);
   pthread_mutex_unlock(&session_lock);
   rdma_destroy_id(conn->id);
   sem_destroy(&conn->stop_sem);
@@ -448,6 +461,7 @@ void destroy_connection(void *context)
   pthread_mutex_destroy(&conn->cq_qp_state.mutex);
   pthread_mutex_destroy(&conn->send_lock);
   pthread_mutex_destroy(&conn->control_lock);
+  pthread_mutex_destroy(&conn->protocol_lock);
   pthread_cond_destroy(&conn->lifetime_idle);
   pthread_mutex_destroy(&conn->lifetime_lock);
 
@@ -473,6 +487,151 @@ int provider_connection_count(void)
   count = session.conn_num;
   pthread_mutex_unlock(&session_lock);
   return count;
+}
+
+static struct is_provider_consumer_snapshot *find_consumer_snapshot(
+    struct is_provider_observability_snapshot *snapshot,
+    const char *consumer_id)
+{
+  size_t index;
+
+  for (index = 0; index < snapshot->consumer_count; index++) {
+    if (strcmp(snapshot->consumers[index].consumer_id, consumer_id) == 0)
+      return &snapshot->consumers[index];
+  }
+  if (snapshot->consumer_count >= IS_PROVIDER_OBSERVABILITY_MAX_CONSUMERS)
+    return NULL;
+  return &snapshot->consumers[snapshot->consumer_count++];
+}
+
+int provider_observability_snapshot(
+    const char *provider_id,
+    struct is_provider_observability_snapshot *snapshot)
+{
+  struct is_memory_manager_status memory_status;
+  struct connection *connections[MAX_CLIENT] = {0};
+  size_t provider_id_size;
+  int connection_count = 0;
+  int index;
+
+  if (!provider_id || !snapshot)
+    return -1;
+  provider_id_size = strnlen(provider_id,
+                             IS_PROVIDER_OBSERVABILITY_ID_MAX + 1U);
+  if (provider_id_size == 0 ||
+      provider_id_size > IS_PROVIDER_OBSERVABILITY_ID_MAX ||
+      is_memory_manager_get_status(session.memory_manager, NULL,
+                                   &memory_status) != IS_MEMORY_OK)
+    return -1;
+  memset(snapshot, 0, sizeof(*snapshot));
+  memcpy(snapshot->provider_id, provider_id, provider_id_size);
+  snapshot->healthy = memory_status.healthy;
+  snapshot->host_reserve_chunks = memory_status.host_reserve_chunks;
+  snapshot->max_opportunistic_chunks =
+      memory_status.max_opportunistic_chunks;
+  snapshot->max_committed_chunks = memory_status.max_committed_chunks;
+  snapshot->allocated_opportunistic_chunks =
+      memory_status.allocated_opportunistic_chunks;
+  snapshot->assigned_opportunistic_chunks =
+      memory_status.assigned_opportunistic_chunks;
+  snapshot->allocated_committed_chunks =
+      memory_status.allocated_committed_chunks;
+  snapshot->assigned_committed_chunks =
+      memory_status.assigned_committed_chunks;
+  snapshot->available_opportunistic_chunks =
+      memory_status.available_opportunistic_chunks;
+  snapshot->available_committed_chunks =
+      memory_status.available_committed_chunks;
+  snapshot->quarantined_chunks = memory_status.quarantined_chunks;
+  snapshot->active_connections = memory_status.active_connections;
+  snapshot->admissions_total = memory_status.admissions;
+  snapshot->admission_rejections_total = memory_status.rejections;
+  snapshot->pressure_reclaims_total = memory_status.pressure_reclaims;
+  snapshot->last_rejection = memory_status.last_rejection;
+  snapshot->authentication_failures_total =
+      __atomic_load_n(&session.authentication_failures_total, __ATOMIC_RELAXED);
+  snapshot->deadline_expiries_total =
+      __atomic_load_n(&session.deadline_expiries_total, __ATOMIC_RELAXED);
+  snapshot->connections_total = __atomic_load_n(&session.connections_total, __ATOMIC_RELAXED);
+  snapshot->disconnections_total =
+      __atomic_load_n(&session.disconnections_total, __ATOMIC_RELAXED);
+  snapshot->control_errors_total = __atomic_load_n(&session.control_errors_total, __ATOMIC_RELAXED);
+
+  pthread_mutex_lock(&session_lock);
+  for (index = 0; index < MAX_CLIENT; index++) {
+    struct connection *conn = session.conns[index];
+
+    if (!conn || connection_get_reference(conn) != 0)
+      continue;
+    connections[connection_count++] = conn;
+  }
+  pthread_mutex_unlock(&session_lock);
+
+  for (index = 0; index < connection_count; index++) {
+    struct connection *conn = connections[index];
+    struct is_provider_consumer_snapshot *consumer;
+    struct is_memory_manager_status consumer_memory;
+    struct is_provider_session protocol_session;
+    enum is_provider_consumer_state state;
+    uint32_t inflight;
+    int closing;
+    int handshake_complete;
+
+    pthread_mutex_lock(&conn->lifetime_lock);
+    closing = conn->closing;
+    handshake_complete = conn->handshake_complete;
+    pthread_mutex_unlock(&conn->lifetime_lock);
+    pthread_mutex_lock(&conn->protocol_lock);
+    protocol_session = conn->protocol_session;
+    pthread_mutex_unlock(&conn->protocol_lock);
+    if (!protocol_session.consumer_id[0]) {
+      connection_put_reference(conn);
+      continue;
+    }
+    if (closing)
+      state = IS_PROVIDER_CONSUMER_DEGRADED;
+    else if (protocol_session.state == IS_PROVIDER_SESSION_READY &&
+             handshake_complete)
+      state = IS_PROVIDER_CONSUMER_READY;
+    else
+      state = IS_PROVIDER_CONSUMER_CONNECTING;
+    pthread_mutex_lock(&conn->control_lock);
+    inflight = (conn->pending_evict_request_id != 0 ? 1U : 0U) +
+               (conn->pending_release_request_id != 0 ? 1U : 0U);
+    pthread_mutex_unlock(&conn->control_lock);
+
+    consumer = find_consumer_snapshot(snapshot,
+                                      protocol_session.consumer_id);
+    if (!consumer) {
+      connection_put_reference(conn);
+      continue;
+    }
+    if (consumer->connection_count == 0) {
+      size_t consumer_id_size = strlen(protocol_session.consumer_id);
+
+      memcpy(consumer->consumer_id, protocol_session.consumer_id,
+             consumer_id_size + 1U);
+      consumer->state = state;
+      consumer->mode = protocol_session.selected_mode;
+      consumer->pool = protocol_session.selected_pool;
+      consumer->failure_deadline_ms = protocol_session.failure_deadline_ms;
+      consumer->last_error_code = protocol_session.last_error_code;
+      if (is_memory_manager_get_status(
+              session.memory_manager, conn,
+              &consumer_memory) == IS_MEMORY_OK) {
+        consumer->assigned_opportunistic_chunks =
+            consumer_memory.consumer_assigned_opportunistic_chunks;
+        consumer->assigned_committed_chunks =
+            consumer_memory.consumer_assigned_committed_chunks;
+      }
+    } else if (state == IS_PROVIDER_CONSUMER_READY) {
+      consumer->state = state;
+    }
+    consumer->connection_count++;
+    consumer->inflight_control_requests += inflight;
+    connection_put_reference(conn);
+  }
+  return 0;
 }
 
 void disconnect_provider_connections(void)
@@ -868,6 +1027,17 @@ static int submit_encoded_message(struct connection *conn,
   return result;
 }
 
+static void record_protocol_error(struct connection *conn,
+                                  enum is_protocol_error_code code)
+{
+  __atomic_fetch_add(&conn->sess->control_errors_total, UINT64_C(1),
+                     __ATOMIC_RELAXED);
+  if (code == IS_PROTOCOL_ERROR_AUTHENTICATION ||
+      code == IS_PROTOCOL_ERROR_REVOKED)
+    __atomic_fetch_add(&conn->sess->authentication_failures_total,
+                       UINT64_C(1), __ATOMIC_RELAXED);
+}
+
 static void send_protocol_error(struct connection *conn,
                                 uint64_t request_id,
                                 uint16_t offending_type,
@@ -876,10 +1046,17 @@ static void send_protocol_error(struct connection *conn,
   uint8_t frame[IS_PROTOCOL_MAX_FRAME_SIZE];
   size_t frame_size = 0;
 
+  record_protocol_error(conn, code);
+  pthread_mutex_lock(&conn->protocol_lock);
   if (is_provider_session_fail(&conn->protocol_session, request_id,
                                offending_type, code, frame,
-                               sizeof(frame), &frame_size) != 0 ||
-      submit_encoded_message(conn, frame, frame_size, 1, 0) != 0)
+                               sizeof(frame), &frame_size) != 0) {
+    pthread_mutex_unlock(&conn->protocol_lock);
+    rdma_disconnect(conn->id);
+    return;
+  }
+  pthread_mutex_unlock(&conn->protocol_lock);
+  if (submit_encoded_message(conn, frame, frame_size, 1, 0) != 0)
     rdma_disconnect(conn->id);
 }
 
@@ -1064,13 +1241,21 @@ void on_completion(struct ibv_wc *wc)
     struct is_provider_session_outcome outcome;
     uint8_t session_response[IS_PROTOCOL_MAX_FRAME_SIZE];
 
+    pthread_mutex_lock(&conn->protocol_lock);
     if (is_provider_session_handle(
             &conn->protocol_session, conn->recv_frame, wc->byte_len,
             session_response, sizeof(session_response), &outcome) != 0) {
+      pthread_mutex_unlock(&conn->protocol_lock);
       rdma_disconnect(conn->id);
       goto done;
     }
+    pthread_mutex_unlock(&conn->protocol_lock);
     if (outcome.response_ready) {
+      if (conn->protocol_session.state == IS_PROVIDER_SESSION_CLOSED &&
+          conn->protocol_session.last_error_code != 0)
+        record_protocol_error(
+            conn,
+            (enum is_protocol_error_code)conn->protocol_session.last_error_code);
       if (conn->protocol_session.state == IS_PROVIDER_SESSION_READY &&
           !conn->auth_subscribed) {
         enum is_auth_result result;

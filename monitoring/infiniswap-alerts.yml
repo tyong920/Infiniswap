@@ -1,0 +1,78 @@
+groups:
+  - name: infiniswap-production
+    interval: 30s
+    rules:
+      - alert: InfiniswapProviderDisconnected
+        expr: infiniswap_consumer_provider_connected == 0 and on(device) infiniswap_consumer_active == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: A configured Memory Provider is disconnected.
+          runbook: docs/runbooks/provider-disconnected.md
+      - alert: InfiniswapProviderDeadlineExpired
+        expr: increase(infiniswap_consumer_provider_timeouts_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: A Provider Failure Deadline expired.
+          runbook: docs/runbooks/provider-deadline-expired.md
+      - alert: InfiniswapProviderDegraded
+        expr: infiniswap_provider_healthy == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: A Memory Provider memory manager is degraded.
+          runbook: docs/runbooks/provider-degraded.md
+      - alert: InfiniswapBackingDegraded
+        expr: infiniswap_consumer_operational_state{state="backing-degraded"} == 1
+        labels:
+          severity: critical
+        annotations:
+          summary: A Backing Store can no longer preserve recovery copies.
+          runbook: docs/runbooks/backing-degraded.md
+      - alert: InfiniswapRemoteLost
+        expr: infiniswap_consumer_operational_state{state="remote-lost"} == 1
+        labels:
+          severity: critical
+        annotations:
+          summary: A Remote-Only Mode device has lost Remote Memory.
+          runbook: docs/runbooks/remote-lost.md
+      - alert: InfiniswapPoolPressure
+        expr: infiniswap_provider_pool_max_chunks > 0 and (infiniswap_provider_pool_available_chunks / infiniswap_provider_pool_max_chunks) < 0.10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: A Memory Provider pool has less than ten percent admissible capacity.
+          runbook: docs/runbooks/pool-pressure.md
+      - alert: InfiniswapAdmissionRejected
+        expr: increase(infiniswap_provider_admission_rejections_total[5m]) > 0 or increase(infiniswap_consumer_admission_rejections_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Remote Chunk admission was rejected.
+          runbook: docs/runbooks/admission-rejected.md
+      - alert: InfiniswapAuthenticationFailure
+        expr: increase(infiniswap_provider_authentication_failures_total[5m]) > 0 or increase(infiniswap_consumer_authentication_failures_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: Consumer authentication failed.
+          runbook: docs/runbooks/authentication-failure.md
+      - alert: InfiniswapIOErrors
+        expr: increase(infiniswap_consumer_io_errors_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: An Infiniswap Device completed block I/O with errors.
+          runbook: docs/runbooks/io-errors.md
+      - alert: InfiniswapHungRequests
+        expr: infiniswap_consumer_inflight_io > 0 and on(device) (infiniswap_consumer_oldest_inflight_io_milliseconds > 2 * infiniswap_consumer_provider_failure_deadline_milliseconds)
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: In-flight I/O exceeded twice the Provider Failure Deadline.
+          runbook: docs/runbooks/hung-requests.md

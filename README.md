@@ -279,16 +279,27 @@ sudo bin/infiniswapctl enable infiniswap0 --priority 100
 ```
 
 Human-readable status is the default. `--json` emits deterministic schema
-version 5 data covering lifecycle, operational state (including Remote-Lost),
-mode, policy, swap state, Provider connections, local/remote capacity, Hot Range
-scoring, mapped-range count, correctness/failover metrics, and the last kernel
-control error. It never includes key identifiers, PSK paths, PSKs, or
-authentication tags:
+version 6 data covering lifecycle, operational state (including Remote-Lost),
+mode, policy, deadlines, swap state, per-Provider connections/capacity/errors,
+local/remote capacity, Remote Chunks, in-flight I/O, correctness/failover
+metrics, and the last kernel control error. OpenMetrics schema version 1 and
+active alert evaluation use the same status snapshot. None of these interfaces
+includes key identifiers, PSK paths, PSKs, or authentication tags:
 
 ```bash
 bin/infiniswapctl status infiniswap0
 bin/infiniswapctl status infiniswap0 --json
+bin/infiniswapctl metrics infiniswap0
+bin/infiniswapctl alerts infiniswap0 --json
+bin/infiniswapctl provider-status
+bin/infiniswapctl provider-status --json
+bin/infiniswapctl provider-metrics
 ```
+
+The Memory Provider serves loopback-only `/status`, `/metrics`, and `/healthz`
+on port 9401 by default. Set `INFINISWAP_PROVIDER_ID` to its Provider Directory
+identity. Baseline alert rules live in `monitoring/infiniswap-alerts.yml`; mode
+semantics and alert/operation runbooks are indexed in `docs/operations.md`.
 
 Disable, drain, and destroy remain separate commands. Each supports `--dry-run`
 and targets only the named Infiniswap Device; no command disables or

@@ -1,0 +1,47 @@
+# infiniswap_metrics_schema_version 1
+# TYPE infiniswap_provider_healthy gauge
+# TYPE infiniswap_provider_active_connections gauge
+# TYPE infiniswap_provider_pool_max_chunks gauge
+# TYPE infiniswap_provider_pool_allocated_chunks gauge
+# TYPE infiniswap_provider_pool_assigned_chunks gauge
+# TYPE infiniswap_provider_pool_available_chunks gauge
+# TYPE infiniswap_provider_quarantined_chunks gauge
+# TYPE infiniswap_provider_host_reserve_chunks gauge
+# TYPE infiniswap_provider_consumer_connected gauge
+# TYPE infiniswap_provider_consumer_failure_deadline_milliseconds gauge
+# TYPE infiniswap_provider_consumer_inflight_control_requests gauge
+# TYPE infiniswap_provider_consumer_assigned_chunks gauge
+infiniswap_provider_healthy{provider="provider-a"} 1
+infiniswap_provider_active_connections{provider="provider-a"} 1
+infiniswap_provider_pool_max_chunks{provider="provider-a",pool="opportunistic"} 24
+infiniswap_provider_pool_allocated_chunks{provider="provider-a",pool="opportunistic"} 10
+infiniswap_provider_pool_assigned_chunks{provider="provider-a",pool="opportunistic"} 6
+infiniswap_provider_pool_available_chunks{provider="provider-a",pool="opportunistic"} 12
+infiniswap_provider_pool_max_chunks{provider="provider-a",pool="committed"} 8
+infiniswap_provider_pool_allocated_chunks{provider="provider-a",pool="committed"} 0
+infiniswap_provider_pool_assigned_chunks{provider="provider-a",pool="committed"} 0
+infiniswap_provider_pool_available_chunks{provider="provider-a",pool="committed"} 4
+infiniswap_provider_quarantined_chunks{provider="provider-a"} 0
+infiniswap_provider_host_reserve_chunks{provider="provider-a"} 8
+infiniswap_provider_consumer_connected{provider="provider-a",consumer="consumer-a"} 1
+infiniswap_provider_consumer_failure_deadline_milliseconds{provider="provider-a",consumer="consumer-a"} 2000
+infiniswap_provider_consumer_inflight_control_requests{provider="provider-a",consumer="consumer-a"} 1
+infiniswap_provider_consumer_assigned_chunks{provider="provider-a",consumer="consumer-a",pool="opportunistic"} 6
+infiniswap_provider_consumer_assigned_chunks{provider="provider-a",consumer="consumer-a",pool="committed"} 0
+# TYPE infiniswap_provider_admissions_total counter
+infiniswap_provider_admissions_total{provider="provider-a"} 9
+# TYPE infiniswap_provider_admission_rejections_total counter
+infiniswap_provider_admission_rejections_total{provider="provider-a"} 2
+# TYPE infiniswap_provider_pressure_reclaims_total counter
+infiniswap_provider_pressure_reclaims_total{provider="provider-a"} 0
+# TYPE infiniswap_provider_authentication_failures_total counter
+infiniswap_provider_authentication_failures_total{provider="provider-a"} 1
+# TYPE infiniswap_provider_deadline_expiries_total counter
+infiniswap_provider_deadline_expiries_total{provider="provider-a"} 3
+# TYPE infiniswap_provider_connections_total counter
+infiniswap_provider_connections_total{provider="provider-a"} 0
+# TYPE infiniswap_provider_disconnections_total counter
+infiniswap_provider_disconnections_total{provider="provider-a"} 0
+# TYPE infiniswap_provider_control_errors_total counter
+infiniswap_provider_control_errors_total{provider="provider-a"} 0
+# EOF

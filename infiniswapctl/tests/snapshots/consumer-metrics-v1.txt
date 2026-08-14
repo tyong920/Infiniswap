@@ -1,0 +1,65 @@
+# infiniswap_metrics_schema_version 1
+# HELP infiniswap_consumer_info Static Consumer mode and policy information.
+# TYPE infiniswap_consumer_info gauge
+infiniswap_consumer_info{device="infiniswap0",mode="backed",policy="strict"} 1
+# HELP infiniswap_consumer_operational_state Current Consumer operational state.
+# TYPE infiniswap_consumer_operational_state gauge
+infiniswap_consumer_operational_state{device="infiniswap0",state="healthy"} 1
+infiniswap_consumer_operational_state{device="infiniswap0",state="backing-degraded"} 0
+infiniswap_consumer_operational_state{device="infiniswap0",state="remote-lost"} 0
+# HELP infiniswap_consumer_provider_connected Whether a configured Provider is connected.
+# TYPE infiniswap_consumer_provider_connected gauge
+# TYPE infiniswap_consumer_provider_available_chunks gauge
+# TYPE infiniswap_consumer_provider_mapped_chunks gauge
+# TYPE infiniswap_consumer_provider_last_error_errno gauge
+infiniswap_consumer_provider_connected{device="infiniswap0",provider="provider-a"} 1
+infiniswap_consumer_provider_available_chunks{device="infiniswap0",provider="provider-a"} 7
+infiniswap_consumer_provider_mapped_chunks{device="infiniswap0",provider="provider-a"} 1
+infiniswap_consumer_provider_last_error_errno{device="infiniswap0",provider="provider-a"} 0
+# TYPE infiniswap_consumer_active gauge
+infiniswap_consumer_active{device="infiniswap0"} 1
+# TYPE infiniswap_consumer_advertised_bytes gauge
+infiniswap_consumer_advertised_bytes{device="infiniswap0"} 8589934592
+# TYPE infiniswap_consumer_backing_bytes gauge
+infiniswap_consumer_backing_bytes{device="infiniswap0"} 8589934592
+# TYPE infiniswap_consumer_remote_bytes gauge
+infiniswap_consumer_remote_bytes{device="infiniswap0"} 0
+# TYPE infiniswap_consumer_mapped_remote_chunks gauge
+infiniswap_consumer_mapped_remote_chunks{device="infiniswap0"} 1
+# TYPE infiniswap_consumer_inflight_io gauge
+infiniswap_consumer_inflight_io{device="infiniswap0"} 0
+# TYPE infiniswap_consumer_oldest_inflight_io_milliseconds gauge
+infiniswap_consumer_oldest_inflight_io_milliseconds{device="infiniswap0"} 0
+# TYPE infiniswap_consumer_provider_failure_deadline_milliseconds gauge
+infiniswap_consumer_provider_failure_deadline_milliseconds{device="infiniswap0"} 2000
+# TYPE infiniswap_consumer_last_error_errno gauge
+infiniswap_consumer_last_error_errno{device="infiniswap0"} 0
+# TYPE infiniswap_consumer_admission_rejections_total counter
+infiniswap_consumer_admission_rejections_total{device="infiniswap0"} 0
+# TYPE infiniswap_consumer_authentication_failures_total counter
+infiniswap_consumer_authentication_failures_total{device="infiniswap0"} 0
+# TYPE infiniswap_consumer_backing_degraded_transitions_total counter
+infiniswap_consumer_backing_degraded_transitions_total{device="infiniswap0"} 0
+# TYPE infiniswap_consumer_backing_failures_total counter
+infiniswap_consumer_backing_failures_total{device="infiniswap0"} 0
+# TYPE infiniswap_consumer_backing_invalid_sectors counter
+infiniswap_consumer_backing_invalid_sectors{device="infiniswap0"} 0
+# TYPE infiniswap_consumer_backing_retries_total counter
+infiniswap_consumer_backing_retries_total{device="infiniswap0"} 0
+# TYPE infiniswap_consumer_io_completed_total counter
+infiniswap_consumer_io_completed_total{device="infiniswap0"} 12
+# TYPE infiniswap_consumer_io_errors_total counter
+infiniswap_consumer_io_errors_total{device="infiniswap0"} 0
+# TYPE infiniswap_consumer_io_requests_total counter
+infiniswap_consumer_io_requests_total{device="infiniswap0"} 12
+# TYPE infiniswap_consumer_late_rdma_completions_total counter
+infiniswap_consumer_late_rdma_completions_total{device="infiniswap0"} 0
+# TYPE infiniswap_consumer_local_only_writes_total counter
+infiniswap_consumer_local_only_writes_total{device="infiniswap0"} 0
+# TYPE infiniswap_consumer_provider_timeouts_total counter
+infiniswap_consumer_provider_timeouts_total{device="infiniswap0"} 0
+# TYPE infiniswap_consumer_rejected_writes_total counter
+infiniswap_consumer_rejected_writes_total{device="infiniswap0"} 0
+# TYPE infiniswap_consumer_remote_lost_transitions_total counter
+infiniswap_consumer_remote_lost_transitions_total{device="infiniswap0"} 0
+# EOF

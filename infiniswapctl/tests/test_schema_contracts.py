@@ -23,6 +23,12 @@ class SchemaContractTest(unittest.TestCase):
                 snapshot_directory / "status-v3.json",
                 snapshot_directory / "status-v4.json",
                 snapshot_directory / "status-v5.json",
+                snapshot_directory / "status-v6.json",
+                snapshot_directory / "provider-status-v1.json",
+                REPOSITORY
+                / "infiniswap_daemon"
+                / "tests"
+                / "provider-status-v1.json",
             )
         )
         for path in paths:
@@ -59,7 +65,9 @@ class SchemaContractTest(unittest.TestCase):
             ("status-v2.schema.json", "status-v2.json"),
             ("status-v3.schema.json", "status-v3.json"),
             ("status-v4.schema.json", "status-v4.json"),
-            ("status.schema.json", "status-v5.json"),
+            ("status-v5.schema.json", "status-v5.json"),
+            ("status.schema.json", "status-v6.json"),
+            ("provider-status.schema.json", "provider-status-v1.json"),
         )
         for schema_name, snapshot_name in status_contracts:
             with self.subTest(schema=schema_name):
@@ -73,6 +81,22 @@ class SchemaContractTest(unittest.TestCase):
                 )
                 jsonschema.Draft7Validator.check_schema(status_schema)
                 jsonschema.validate(status, status_schema)
+
+        provider_schema = json.loads(
+            (CONFIG / "provider-status.schema.json").read_text(encoding="utf-8")
+        )
+        for provider_snapshot in (
+            Path(__file__).parent / "snapshots" / "provider-status-v1.json",
+            REPOSITORY
+            / "infiniswap_daemon"
+            / "tests"
+            / "provider-status-v1.json",
+        ):
+            with self.subTest(provider_snapshot=provider_snapshot):
+                jsonschema.validate(
+                    json.loads(provider_snapshot.read_text(encoding="utf-8")),
+                    provider_schema,
+                )
 
 
 if __name__ == "__main__":

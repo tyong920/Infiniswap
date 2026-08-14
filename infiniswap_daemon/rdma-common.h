@@ -20,6 +20,7 @@
 
 #include "infiniswap_consumer_liveness.h"
 #include "infiniswap_memory_manager.h"
+#include "infiniswap_observability.h"
 #include "infiniswap_provider_session.h"
 
 #define TEST_NZ(x)                                                            \
@@ -147,6 +148,7 @@ struct connection {
   struct atomic_t cq_qp_state;
   pthread_mutex_t send_lock;
   pthread_mutex_t control_lock;
+  pthread_mutex_t protocol_lock;
   pthread_mutex_t lifetime_lock;
   pthread_cond_t lifetime_idle;
   pthread_t deadline_thread;
@@ -193,6 +195,11 @@ struct rdma_session {
   enum conn_state conns_state[MAX_CLIENT];
   int conn_num;
   struct is_memory_manager *memory_manager;
+  uint64_t authentication_failures_total;
+  uint64_t deadline_expiries_total;
+  uint64_t connections_total;
+  uint64_t disconnections_total;
+  uint64_t control_errors_total;
 };
 
 extern struct rdma_session session;
@@ -217,6 +224,9 @@ void send_free_mem_size(void *context);
 void rdma_session_init(struct rdma_session *provider_session,
                        struct is_memory_manager *memory_manager);
 int provider_connection_count(void);
+int provider_observability_snapshot(
+    const char *provider_id,
+    struct is_provider_observability_snapshot *snapshot);
 void disconnect_provider_connections(void);
 void *free_mem(void *data);
 

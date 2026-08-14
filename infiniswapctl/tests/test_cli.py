@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from infiniswapctl.cli import run
+from infiniswapctl.system import LocalSystem
 
 
 GIB = 1024 * 1024 * 1024
@@ -15,6 +16,8 @@ GIB = 1024 * 1024 * 1024
 class FakeSystem:
     def __init__(self):
         self.mutations = []
+        self.audit_events = []
+        self.endpoint_responses = {}
         self.root = True
         self.groups = set()
         self.attributes = {}
@@ -36,6 +39,12 @@ class FakeSystem:
             "/etc/infiniswap/keys/provider-a.psk": b"p" * 32,
             "/etc/infiniswap/keys/consumer-a.psk": b"c" * 32,
         }
+
+    def fetch_observability(self, endpoint, path):
+        return self.endpoint_responses[(endpoint, path)]
+
+    def record_audit_event(self, event, subject, details):
+        self.audit_events.append((event, subject, details))
 
     def read_secret(self, path):
         return self.secrets[path]
@@ -115,6 +124,41 @@ class FakeSystem:
             self.swap[path] = int(command[2])
         elif command[0] == "swapoff":
             self.swap.pop(path, None)
+
+
+class AuditLogContractTest(unittest.TestCase):
+    def test_audit_log_is_append_only_versioned_jsonl_without_secrets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "audit.jsonl"
+            system = LocalSystem(audit_path=path)
+            system.record_audit_event(
+                "device.created",
+                "infiniswap0",
+                {"mode": "remote-only", "remote_only_eligible": True},
+            )
+            system.record_audit_event(
+                "cutover",
+                "ty-gpu-02",
+                {"change_id": "change-123", "outcome": "completed"},
+            )
+            documents = [
+                json.loads(line)
+                for line in path.read_text(encoding="ascii").splitlines()
+            ]
+            audit_mode = stat.S_IMODE(path.stat().st_mode)
+
+        self.assertEqual(
+            [document["schema_version"] for document in documents], [1, 1]
+        )
+        self.assertEqual(
+            [document["event"] for document in documents],
+            ["device.created", "cutover"],
+        )
+        self.assertRegex(documents[0]["timestamp"], r"^\d{4}-\d{2}-\d{2}T")
+        serialized = json.dumps(documents).lower()
+        self.assertNotIn("psk", serialized)
+        self.assertNotIn("key_id", serialized)
+        self.assertEqual(audit_mode, 0o600)
 
 
 class CliValidationTest(unittest.TestCase):
@@ -540,6 +584,22 @@ class CliValidationTest(unittest.TestCase):
             ],
         )
 
+        self.assertEqual(
+            system.audit_events,
+            [
+                (
+                    "device.created",
+                    "infiniswap0",
+                    {
+                        "acknowledgement_policy": "strict",
+                        "mode": "backed",
+                        "provider_count": 1,
+                        "remote_only_eligible": False,
+                    },
+                )
+            ],
+        )
+
     def test_create_requires_root_and_rolls_back_partial_configuration(self):
         path = self.write_consumer()
 
@@ -674,6 +734,114 @@ class ProviderValidationTest(unittest.TestCase):
                 self.assertEqual(used_system.mutations, [])
 
 
+class ProviderObservabilityCliTest(unittest.TestCase):
+    def setUp(self):
+        self.system = FakeSystem()
+        self.endpoint = "http://127.0.0.1:9401"
+        self.status = {
+            "schema_version": 1,
+            "kind": "infiniswap.provider-status",
+            "provider": {
+                "provider_id": "provider-a",
+                "state": "healthy",
+                "active_connections": 1,
+            },
+            "pools": [
+                {
+                    "name": "opportunistic",
+                    "max_chunks": 24,
+                    "allocated_chunks": 10,
+                    "assigned_chunks": 6,
+                    "available_chunks": 12,
+                },
+                {
+                    "name": "committed",
+                    "max_chunks": 8,
+                    "allocated_chunks": 0,
+                    "assigned_chunks": 0,
+                    "available_chunks": 4,
+                },
+            ],
+            "chunks": {
+                "size_bytes": GIB,
+                "host_reserve_chunks": 8,
+                "allocated_chunks": 10,
+                "assigned_chunks": 6,
+                "quarantined_chunks": 0,
+            },
+            "consumers": [
+                {
+                    "consumer_id": "consumer-a",
+                    "state": "ready",
+                    "mode": "backed",
+                    "pool": "opportunistic",
+                    "failure_deadline_ms": 2000,
+                    "connection_count": 1,
+                    "assigned_opportunistic_chunks": 6,
+                    "assigned_committed_chunks": 0,
+                    "inflight_control_requests": 1,
+                    "last_error_code": 0,
+                }
+            ],
+            "metrics": {
+                "admissions_total": 9,
+                "admission_rejections_total": 2,
+                "pressure_reclaims_total": 1,
+                "authentication_failures_total": 0,
+                "deadline_expiries_total": 0,
+                "connections_total": 1,
+                "disconnections_total": 0,
+                "control_errors_total": 0,
+            },
+            "last_error": None,
+        }
+        self.system.endpoint_responses[(self.endpoint, "/status")] = json.dumps(
+            self.status
+        )
+        self.system.endpoint_responses[(self.endpoint, "/metrics")] = (
+            "# infiniswap_metrics_schema_version 1\n"
+            'infiniswap_provider_healthy{provider="provider-a"} 1\n'
+            "# EOF\n"
+        )
+
+    def invoke(self, *arguments):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        result = run(list(arguments), system=self.system, stdout=stdout, stderr=stderr)
+        return result, stdout.getvalue(), stderr.getvalue()
+
+    def test_provider_status_and_metrics_use_the_loopback_endpoint(self):
+        result, output, error = self.invoke(
+            "provider-status", "--endpoint", self.endpoint, "--json"
+        )
+        self.assertEqual((result, error), (0, ""))
+        self.assertEqual(json.loads(output), self.status)
+        self.assertNotIn("psk", output.lower())
+        self.assertNotIn("key_id", output.lower())
+
+        result, human, error = self.invoke(
+            "provider-status", "--endpoint", self.endpoint
+        )
+        self.assertEqual((result, error), (0, ""))
+        self.assertIn("provider-a: healthy (1 active Consumer connection)", human)
+        self.assertIn(
+            "Opportunistic Pool: 6 assigned, 12 available, 24 maximum Remote Chunks",
+            human,
+        )
+        self.assertIn(
+            "Consumer consumer-a: ready, backed, opportunistic, deadline 2000 ms",
+            human,
+        )
+        self.assertIn("in-flight control requests: 1", human)
+
+        result, metrics, error = self.invoke(
+            "provider-metrics", "--endpoint", self.endpoint
+        )
+        self.assertEqual((result, error), (0, ""))
+        self.assertTrue(metrics.endswith("# EOF\n"))
+        self.assertNotIn("psk", metrics.lower())
+
+
 class LifecycleCommandTest(unittest.TestCase):
     def setUp(self):
         self.system = FakeSystem()
@@ -710,6 +878,14 @@ class LifecycleCommandTest(unittest.TestCase):
             "local_only_writes_total": "0",
             "remote_lost_transitions_total": "0",
             "backing_invalid_sectors": "0",
+            "authentication_failures_total": "0",
+            "admission_rejections_total": "0",
+            "io_requests_total": "12",
+            "io_completed_total": "12",
+            "io_errors_total": "0",
+            "inflight_io": "0",
+            "oldest_inflight_ms": "0",
+            "provider_runtime_status": "0 not-connected 7 1 0",
         }
 
     def invoke(self, *arguments):
@@ -798,7 +974,7 @@ class LifecycleCommandTest(unittest.TestCase):
             stderr=stderr,
         )
 
-        snapshot = (Path(__file__).parent / "snapshots" / "status-v5.json").read_text(
+        snapshot = (Path(__file__).parent / "snapshots" / "status-v6.json").read_text(
             encoding="utf-8"
         )
         self.assertEqual((result, stderr.getvalue()), (0, ""))
@@ -806,6 +982,28 @@ class LifecycleCommandTest(unittest.TestCase):
         self.assertNotIn("psk", stdout.getvalue().lower())
         self.assertNotIn("key-current", stdout.getvalue())
         status = json.loads(stdout.getvalue())
+        self.assertEqual(
+            status["connection"]["providers"],
+            [
+                {
+                    "available_chunks": 7,
+                    "last_error": None,
+                    "mapped_chunks": 1,
+                    "provider_id": "provider-a",
+                    "state": "not-connected",
+                }
+            ],
+        )
+        self.assertEqual(
+            status["io"],
+            {
+                "completed_total": 12,
+                "errors_total": 0,
+                "in_flight": 0,
+                "oldest_in_flight_ms": 0,
+                "requests_total": 12,
+            },
+        )
         self.assertEqual(
             status["mapping"],
             {
@@ -830,7 +1028,92 @@ class LifecycleCommandTest(unittest.TestCase):
         self.assertIn("placements: 0→provider-a", human)
         self.assertIn("swap: enabled at priority 100", human)
         self.assertIn("backing: healthy", human)
+        self.assertIn("Provider Failure Deadline: 2000 ms", human)
+        self.assertIn("I/O: 0 in flight, 12 completed, 0 errors", human)
+        self.assertIn(
+            "Provider provider-a: not-connected, 7 chunks available, 1 mapped",
+            human,
+        )
         self.assertIn("last error: none", human)
+
+    def test_metrics_exposes_versioned_openmetrics_without_secrets(self):
+        self.system.attributes["infiniswap0"]["provider_runtime_status"] = (
+            "0 connected 7 1 0"
+        )
+        result, output, error = self.invoke("metrics", "infiniswap0")
+
+        self.assertEqual((result, error), (0, ""))
+        snapshot = (
+            Path(__file__).parent / "snapshots" / "consumer-metrics-v1.txt"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(output, snapshot)
+        self.assertIn("# infiniswap_metrics_schema_version 1", output)
+        self.assertIn(
+            'infiniswap_consumer_info{device="infiniswap0",mode="backed",policy="strict"} 1',
+            output,
+        )
+        self.assertIn(
+            'infiniswap_consumer_provider_connected{device="infiniswap0",provider="provider-a"} 1',
+            output,
+        )
+        self.assertIn(
+            'infiniswap_consumer_io_requests_total{device="infiniswap0"} 12',
+            output,
+        )
+        self.assertTrue(output.endswith("# EOF\n"))
+        self.assertNotIn("psk", output.lower())
+        self.assertNotIn("key-current", output)
+
+    def test_alerts_identify_actionable_states_and_clear_recovered_conditions(self):
+        self.system.attributes["infiniswap0"].update(
+            {
+                "connection_state": "degraded",
+                "operational_state": "backing-degraded",
+                "backing_state": "backing-degraded",
+                "provider_runtime_status": "provider-a degraded 0 1 110",
+                "provider_timeouts_total": "1",
+                "backing_degraded_transitions_total": "1",
+                "inflight_io": "1",
+                "oldest_inflight_ms": "5000",
+                "last_error": "110",
+            }
+        )
+
+        result, output, error = self.invoke("alerts", "infiniswap0", "--json")
+
+        self.assertEqual((result, error), (0, ""))
+        alert_state = json.loads(output)
+        self.assertEqual(alert_state["schema_version"], 1)
+        names = {alert["name"] for alert in alert_state["alerts"]}
+        self.assertTrue(
+            {
+                "InfiniswapProviderDisconnected",
+                "InfiniswapProviderDeadlineExpired",
+                "InfiniswapBackingDegraded",
+                "InfiniswapHungRequests",
+            }.issubset(names)
+        )
+        self.assertTrue(
+            all(alert["runbook"].startswith("docs/runbooks/") for alert in alert_state["alerts"])
+        )
+
+        self.system.attributes["infiniswap0"].update(
+            {
+                "connection_state": "connected",
+                "provider_runtime_status": "provider-a connected 7 1 0",
+                "inflight_io": "0",
+                "oldest_inflight_ms": "0",
+            }
+        )
+        result, output, error = self.invoke("alerts", "infiniswap0", "--json")
+        recovered_names = {
+            alert["name"] for alert in json.loads(output)["alerts"]
+        }
+        self.assertEqual((result, error), (0, ""))
+        self.assertNotIn("InfiniswapProviderDisconnected", recovered_names)
+        self.assertNotIn("InfiniswapProviderDeadlineExpired", recovered_names)
+        self.assertNotIn("InfiniswapHungRequests", recovered_names)
+        self.assertIn("InfiniswapBackingDegraded", recovered_names)
 
     def test_backing_degraded_is_visible_in_cli_json_and_metrics(self):
         self.system.attributes["infiniswap0"].update(
@@ -856,6 +1139,8 @@ class LifecycleCommandTest(unittest.TestCase):
         self.assertEqual(
             status["metrics"],
             {
+                "admission_rejections_total": 0,
+                "authentication_failures_total": 0,
                 "backing_degraded_transitions_total": 1,
                 "backing_failures_total": 2,
                 "backing_invalid_sectors": 8,
@@ -892,7 +1177,7 @@ class LifecycleCommandTest(unittest.TestCase):
 
         self.assertEqual((result, error), (0, ""))
         status = json.loads(output)
-        self.assertEqual(status["schema_version"], 5)
+        self.assertEqual(status["schema_version"], 6)
         self.assertEqual(status["device"]["operational_state"], "remote-lost")
         self.assertEqual(status["connection"]["state"], "remote-lost")
         self.assertEqual(status["capacity"]["backing_bytes"], 0)
@@ -901,6 +1186,42 @@ class LifecycleCommandTest(unittest.TestCase):
         result, human, error = self.invoke("status", "infiniswap0")
         self.assertEqual((result, error), (0, ""))
         self.assertIn("remote: remote-lost (all I/O rejected)", human)
+
+    def test_production_changes_emit_structured_audit_events(self):
+        self.system.swap_signatures.add("/dev/infiniswap0")
+        result, _, error = self.invoke(
+            "enable", "infiniswap0", "--priority", "100"
+        )
+        self.assertEqual((result, error), (0, ""))
+        self.assertEqual(
+            self.system.audit_events[-1],
+            (
+                "swap.activated",
+                "infiniswap0",
+                {"priority": 100, "scope": "host-wide"},
+            ),
+        )
+
+        result, output, error = self.invoke(
+            "audit",
+            "cutover",
+            "--subject",
+            "ty-gpu-02",
+            "--change-id",
+            "change-123",
+            "--outcome",
+            "completed",
+        )
+        self.assertEqual((result, error), (0, ""))
+        self.assertIn("Recorded cutover audit event", output)
+        self.assertEqual(
+            self.system.audit_events[-1],
+            (
+                "cutover",
+                "ty-gpu-02",
+                {"change_id": "change-123", "outcome": "completed"},
+            ),
+        )
 
     def test_every_host_affecting_command_has_a_non_mutating_dry_run(self):
         cases = [

@@ -1,0 +1,57 @@
+{
+  "chunks": {
+    "allocated_chunks": 10,
+    "assigned_chunks": 6,
+    "host_reserve_chunks": 8,
+    "quarantined_chunks": 0,
+    "size_bytes": 1073741824
+  },
+  "consumers": [
+    {
+      "assigned_committed_chunks": 0,
+      "assigned_opportunistic_chunks": 6,
+      "connection_count": 1,
+      "consumer_id": "consumer-a",
+      "failure_deadline_ms": 2000,
+      "inflight_control_requests": 1,
+      "last_error_code": 0,
+      "mode": "backed",
+      "pool": "opportunistic",
+      "state": "ready"
+    }
+  ],
+  "kind": "infiniswap.provider-status",
+  "last_error": null,
+  "metrics": {
+    "admission_rejections_total": 2,
+    "admissions_total": 9,
+    "authentication_failures_total": 0,
+    "connections_total": 1,
+    "control_errors_total": 0,
+    "deadline_expiries_total": 0,
+    "disconnections_total": 0,
+    "pressure_reclaims_total": 1
+  },
+  "pools": [
+    {
+      "allocated_chunks": 10,
+      "assigned_chunks": 6,
+      "available_chunks": 12,
+      "max_chunks": 24,
+      "name": "opportunistic"
+    },
+    {
+      "allocated_chunks": 0,
+      "assigned_chunks": 0,
+      "available_chunks": 4,
+      "max_chunks": 8,
+      "name": "committed"
+    }
+  ],
+  "provider": {
+    "active_connections": 1,
+    "provider_id": "provider-a",
+    "state": "healthy"
+  },
+  "schema_version": 1
+}

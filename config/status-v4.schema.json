@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/tyong920/Infiniswap/config/status.schema.json",
+  "$id": "https://github.com/tyong920/Infiniswap/config/status-v4.schema.json",
   "title": "Infiniswap Device Status v4",
   "type": "object",
   "additionalProperties": false,

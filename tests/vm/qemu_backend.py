@@ -630,6 +630,7 @@ class QemuBackend:
             "provider-start",
             "19420",
             "/etc/infiniswap-vm.psk",
+            "provider-%d" % index,
         )
 
     def _provider_specs(self, handle, indices=None):
@@ -705,6 +706,53 @@ class QemuBackend:
                 sudo=True,
                 timeout=60,
             )
+        psk_path = "/etc/infiniswap-vm-provider-0.psk"
+        self._helper(
+            handle, handle.consumer, "auth-corrupt-psk", "psk-corrupt", psk_path
+        )
+        try:
+            self._create_device(
+                handle, "backed", provider_indices=(0,), capacity_gib=1
+            )
+            self._helper(
+                handle,
+                handle.consumer,
+                "auth-failure-counter",
+                "wait-counter",
+                "authentication_failures_total",
+                "1",
+                "200",
+            )
+            self._helper(
+                handle,
+                handle.consumer,
+                "alert-auth-failure",
+                "assert-alert",
+                "auth-failure",
+                "InfiniswapAuthenticationFailure",
+                "present",
+            )
+        finally:
+            self._stop_device(handle)
+            self._helper(
+                handle,
+                handle.consumer,
+                "auth-restore-psk",
+                "psk-restore",
+                psk_path,
+                check=False,
+            )
+        self._create_device(handle, "backed", provider_indices=(0,), capacity_gib=1)
+        self._helper(
+            handle,
+            handle.consumer,
+            "alert-auth-cleared",
+            "assert-alert",
+            "auth-cleared",
+            "InfiniswapAuthenticationFailure",
+            "absent",
+        )
+        self._stop_device(handle)
         return ScenarioResult(
             status="passed",
             detail="supported GA kernel booted; Consumer and Providers built and deployed",
@@ -821,6 +869,15 @@ class QemuBackend:
             handle, handle.consumer, "kill-exclusion", "wait-exclusion", "provider-0"
         )
         self._helper(
+            handle,
+            handle.consumer,
+            "alert-kill-disconnected",
+            "assert-alert",
+            "kill-disconnected",
+            "InfiniswapProviderDisconnected",
+            "present",
+        )
+        self._helper(
             handle, handle.consumer, "kill-read-backed", "read-pattern", "heat-0", "0"
         )
         self._helper(
@@ -854,10 +911,45 @@ class QemuBackend:
             handle, handle.consumer, "kill-io-failure", "expect-io-failure"
         )
         self._helper(
+            handle,
+            handle.consumer,
+            "alert-kill-remote-lost",
+            "assert-alert",
+            "kill-remote-lost",
+            "InfiniswapRemoteLost",
+            "present",
+        )
+        self._helper(
+            handle,
+            handle.consumer,
+            "alert-kill-io-errors",
+            "assert-alert",
+            "kill-io-errors",
+            "InfiniswapIOErrors",
+            "present",
+        )
+        self._helper(
             handle, handle.consumer, "status-kill-remote", "snapshot", "kill-remote"
         )
         self._stop_device(handle)
         self._reset_transports(handle)
+        self._create_device(handle, "backed", provider_indices=(0,), capacity_gib=1)
+        for alert_name in (
+            "InfiniswapProviderDisconnected",
+            "InfiniswapProviderDeadlineExpired",
+            "InfiniswapRemoteLost",
+            "InfiniswapIOErrors",
+        ):
+            self._helper(
+                handle,
+                handle.consumer,
+                "alert-kill-cleared-%s" % alert_name,
+                "assert-alert",
+                "kill-cleared-%s" % alert_name,
+                alert_name,
+                "absent",
+            )
+        self._stop_device(handle)
         self._check_kernel(handle)
         return ScenarioResult(
             status="passed",
@@ -887,6 +979,15 @@ class QemuBackend:
                 "network-exclusion",
                 "wait-exclusion",
                 "provider-0",
+            )
+            self._helper(
+                handle,
+                handle.consumer,
+                "alert-network-disconnected",
+                "assert-alert",
+                "network-disconnected",
+                "InfiniswapProviderDisconnected",
+                "present",
             )
         finally:
             self._helper(
@@ -949,6 +1050,24 @@ class QemuBackend:
                 "remote-lost",
                 "100",
             )
+            self._helper(
+                handle,
+                handle.consumer,
+                "alert-network-deadline",
+                "assert-alert",
+                "network-deadline",
+                "InfiniswapProviderDeadlineExpired",
+                "present",
+            )
+            self._helper(
+                handle,
+                handle.consumer,
+                "alert-network-remote-lost",
+                "assert-alert",
+                "network-remote-lost",
+                "InfiniswapRemoteLost",
+                "present",
+            )
         finally:
             self._helper(
                 handle,
@@ -971,6 +1090,22 @@ class QemuBackend:
         )
         self._stop_device(handle)
         self._reset_transports(handle)
+        self._create_device(handle, "backed", provider_indices=(0,), capacity_gib=1)
+        for alert_name in (
+            "InfiniswapProviderDisconnected",
+            "InfiniswapProviderDeadlineExpired",
+            "InfiniswapRemoteLost",
+        ):
+            self._helper(
+                handle,
+                handle.consumer,
+                "alert-network-cleared-%s" % alert_name,
+                "assert-alert",
+                "network-cleared-%s" % alert_name,
+                alert_name,
+                "absent",
+            )
+        self._stop_device(handle)
         self._check_kernel(handle)
         return ScenarioResult(
             status="passed",
@@ -1011,6 +1146,15 @@ class QemuBackend:
             self._helper(
                 handle,
                 handle.consumer,
+                "alert-backing-degraded",
+                "assert-alert",
+                "backing-degraded",
+                "InfiniswapBackingDegraded",
+                "present",
+            )
+            self._helper(
+                handle,
+                handle.consumer,
                 "backing-read",
                 "read-pattern",
                 "backing-fault",
@@ -1042,6 +1186,19 @@ class QemuBackend:
         self._helper(
             handle, handle.consumer, "backing-remove", "backing-remove"
         )
+        self._create_device(
+            handle, "backed", provider_indices=(0,), capacity_gib=1
+        )
+        self._helper(
+            handle,
+            handle.consumer,
+            "alert-backing-cleared",
+            "assert-alert",
+            "backing-cleared",
+            "InfiniswapBackingDegraded",
+            "absent",
+        )
+        self._stop_device(handle)
         self._check_kernel(handle)
         return ScenarioResult(
             status="passed",

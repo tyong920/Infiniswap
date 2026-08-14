@@ -5,6 +5,7 @@
  */
 #include <linux/ctype.h>
 #include <linux/err.h>
+#include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -485,6 +486,12 @@ static ssize_t is_device_provider_exclusions_show(struct config_item *item,
 	return is_rdma_provider_exclusions_show(to_is_device(item), page);
 }
 
+static ssize_t is_device_provider_runtime_status_show(
+	struct config_item *item, char *page)
+{
+	return is_rdma_provider_runtime_status_show(to_is_device(item), page);
+}
+
 static ssize_t is_device_backing_state_show(struct config_item *item,
 					    char *page)
 {
@@ -517,6 +524,30 @@ IS_DEVICE_METRIC_SHOW(local_only_writes_total, local_only_writes_total)
 IS_DEVICE_METRIC_SHOW(remote_lost_transitions_total,
 	remote_lost_transitions_total)
 IS_DEVICE_METRIC_SHOW(backing_invalid_sectors, backing_invalid_sectors)
+IS_DEVICE_METRIC_SHOW(authentication_failures_total,
+	authentication_failures_total)
+IS_DEVICE_METRIC_SHOW(admission_rejections_total, admission_rejections_total)
+IS_DEVICE_METRIC_SHOW(io_requests_total, io_requests_total)
+IS_DEVICE_METRIC_SHOW(io_completed_total, io_completed_total)
+IS_DEVICE_METRIC_SHOW(io_errors_total, io_errors_total)
+
+static ssize_t is_device_inflight_io_show(struct config_item *item, char *page)
+{
+	return sysfs_emit(page, "%d\n",
+		atomic_read(&to_is_device(item)->inflight));
+}
+
+static ssize_t is_device_oldest_inflight_ms_show(struct config_item *item,
+						 char *page)
+{
+	struct is_device *device = to_is_device(item);
+	unsigned long started = READ_ONCE(device->oldest_inflight_started);
+	unsigned long age = 0;
+
+	if (atomic_read(&device->inflight) > 0 && started)
+		age = jiffies_to_msecs(jiffies - started);
+	return sysfs_emit(page, "%lu\n", age);
+}
 
 static ssize_t is_device_last_error_show(struct config_item *item, char *page)
 {
@@ -601,6 +632,7 @@ CONFIGFS_ATTR_RO(is_device_, mapped_remote_chunks);
 CONFIGFS_ATTR_RO(is_device_, mapped_hot_ranges);
 CONFIGFS_ATTR_RO(is_device_, remote_chunk_placements);
 CONFIGFS_ATTR_RO(is_device_, provider_exclusions);
+CONFIGFS_ATTR_RO(is_device_, provider_runtime_status);
 CONFIGFS_ATTR_RO(is_device_, backing_state);
 CONFIGFS_ATTR_RO(is_device_, operational_state);
 CONFIGFS_ATTR_RO(is_device_, backing_failures_total);
@@ -612,6 +644,13 @@ CONFIGFS_ATTR_RO(is_device_, rejected_writes_total);
 CONFIGFS_ATTR_RO(is_device_, local_only_writes_total);
 CONFIGFS_ATTR_RO(is_device_, remote_lost_transitions_total);
 CONFIGFS_ATTR_RO(is_device_, backing_invalid_sectors);
+CONFIGFS_ATTR_RO(is_device_, authentication_failures_total);
+CONFIGFS_ATTR_RO(is_device_, admission_rejections_total);
+CONFIGFS_ATTR_RO(is_device_, io_requests_total);
+CONFIGFS_ATTR_RO(is_device_, io_completed_total);
+CONFIGFS_ATTR_RO(is_device_, io_errors_total);
+CONFIGFS_ATTR_RO(is_device_, inflight_io);
+CONFIGFS_ATTR_RO(is_device_, oldest_inflight_ms);
 CONFIGFS_ATTR_RO(is_device_, last_error);
 CONFIGFS_ATTR(is_device_, state);
 
@@ -645,6 +684,7 @@ static struct configfs_attribute *is_device_attrs[] = {
 	&is_device_attr_mapped_hot_ranges,
 	&is_device_attr_remote_chunk_placements,
 	&is_device_attr_provider_exclusions,
+	&is_device_attr_provider_runtime_status,
 	&is_device_attr_backing_state,
 	&is_device_attr_operational_state,
 	&is_device_attr_backing_failures_total,
@@ -656,6 +696,13 @@ static struct configfs_attribute *is_device_attrs[] = {
 	&is_device_attr_local_only_writes_total,
 	&is_device_attr_remote_lost_transitions_total,
 	&is_device_attr_backing_invalid_sectors,
+	&is_device_attr_authentication_failures_total,
+	&is_device_attr_admission_rejections_total,
+	&is_device_attr_io_requests_total,
+	&is_device_attr_io_completed_total,
+	&is_device_attr_io_errors_total,
+	&is_device_attr_inflight_io,
+	&is_device_attr_oldest_inflight_ms,
 	&is_device_attr_last_error,
 	&is_device_attr_state,
 	NULL,

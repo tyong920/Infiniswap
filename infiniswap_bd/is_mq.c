@@ -60,6 +60,11 @@ void is_device_init(struct is_device *device, const char *name)
 	atomic_set(&device->remote_lost, 0);
 	atomic_set(&device->mapped_remote_chunks, 0);
 	atomic64_set(&device->next_io_generation, 0);
+	atomic64_set(&device->io_requests_total, 0);
+	atomic64_set(&device->io_completed_total, 0);
+	atomic64_set(&device->io_errors_total, 0);
+	atomic64_set(&device->authentication_failures_total, 0);
+	atomic64_set(&device->admission_rejections_total, 0);
 	atomic64_set(&device->backing_failures_total, 0);
 	atomic64_set(&device->backing_retries_total, 0);
 	atomic64_set(&device->backing_degraded_transitions_total, 0);
@@ -1071,8 +1076,18 @@ static void is_close_backing_store(struct is_device *device)
 
 static void is_finish_inflight(struct is_device *device)
 {
-	atomic_dec(&device->inflight);
+	if (atomic_dec_return(&device->inflight) == 0)
+		WRITE_ONCE(device->oldest_inflight_started, 0);
 	wake_up_all(&device->drain_wait);
+}
+
+static void is_complete_request(struct is_device *device,
+				struct request *request, blk_status_t status)
+{
+	atomic64_inc(&device->io_completed_total);
+	if (status != BLK_STS_OK)
+		atomic64_inc(&device->io_errors_total);
+	blk_mq_end_request(request, status);
 }
 
 static void is_end_request(struct is_request_ctx *ctx, blk_status_t status)
@@ -1092,7 +1107,7 @@ static void is_end_request(struct is_request_ctx *ctx, blk_status_t status)
 			blk_rq_bytes(request), EIO);
 	else if (req_op(request) == REQ_OP_WRITE && status == BLK_STS_OK)
 		atomic64_inc(&device->local_only_writes_total);
-	blk_mq_end_request(request, status);
+	is_complete_request(device, request, status);
 	is_finish_inflight(device);
 }
 
@@ -1177,9 +1192,10 @@ static void is_remote_apply_action(struct is_remote_request *remote,
 				false);
 	}
 	if (action & IS_IO_COMPLETE_SUCCESS)
-		blk_mq_end_request(remote->request, BLK_STS_OK);
+		is_complete_request(remote->device, remote->request, BLK_STS_OK);
 	else if (action & IS_IO_COMPLETE_ERROR)
-		blk_mq_end_request(remote->request, completion_status);
+		is_complete_request(remote->device, remote->request,
+			completion_status);
 }
 
 static void is_remote_path_complete(struct is_remote_request *remote,
@@ -1563,7 +1579,7 @@ static void is_complete_accepted_request(struct is_device *device,
 					 struct request *request,
 					 blk_status_t status)
 {
-	blk_mq_end_request(request, status);
+	is_complete_request(device, request, status);
 	is_finish_inflight(device);
 }
 
@@ -1613,8 +1629,10 @@ static bool is_accept_request(struct is_device *device,
 		accepted = false;
 		rejected_degraded = true;
 	}
-	if (accepted)
-		atomic_inc(&device->inflight);
+	if (accepted) {
+		if (atomic_inc_return(&device->inflight) == 1)
+			WRITE_ONCE(device->oldest_inflight_started, jiffies);
+	}
 	spin_unlock_irqrestore(&device->io_lock, flags);
 	if (rejected_degraded)
 		atomic64_inc(&device->rejected_writes_total);
@@ -1632,7 +1650,7 @@ static void is_issue_flush(struct is_device *device, struct request *request)
 		spin_lock_irqsave(&device->io_lock, flags);
 		if (atomic_read(&device->remote_lost))
 			status = BLK_STS_IOERR;
-		blk_mq_end_request(request, status);
+		is_complete_request(device, request, status);
 		is_finish_inflight(device);
 		spin_unlock_irqrestore(&device->io_lock, flags);
 		return;
@@ -1688,15 +1706,16 @@ static blk_status_t is_queue_rq(struct blk_mq_hw_ctx *hctx,
 	struct request *request = bd->rq;
 	struct is_request_ctx *ctx = blk_mq_rq_to_pdu(request);
 
+	atomic64_inc(&device->io_requests_total);
 	blk_mq_start_request(request);
 	if (req_op(request) != REQ_OP_READ &&
 	    req_op(request) != REQ_OP_WRITE &&
 	    req_op(request) != REQ_OP_FLUSH) {
-		blk_mq_end_request(request, BLK_STS_NOTSUPP);
+		is_complete_request(device, request, BLK_STS_NOTSUPP);
 		return BLK_STS_OK;
 	}
 	if (!is_accept_request(device, request)) {
-		blk_mq_end_request(request, BLK_STS_IOERR);
+		is_complete_request(device, request, BLK_STS_IOERR);
 		return BLK_STS_OK;
 	}
 

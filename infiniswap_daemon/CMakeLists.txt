@@ -38,6 +38,21 @@ target_include_directories(
 target_link_libraries(infiniswap-memory PUBLIC Threads::Threads)
 
 add_library(
+  infiniswap-observability STATIC
+  infiniswap_observability.c
+  infiniswap_observability_server.c)
+target_compile_features(infiniswap-observability PUBLIC c_std_11)
+target_compile_definitions(
+  infiniswap-observability PUBLIC _POSIX_C_SOURCE=200809L)
+target_compile_options(
+  infiniswap-observability PRIVATE -Wall -Wextra -Wpedantic -Werror)
+target_include_directories(
+  infiniswap-observability PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(
+  infiniswap-observability
+  PUBLIC infiniswap-memory infiniswap-protocol Threads::Threads)
+
+add_library(
   infiniswap-control STATIC
   infiniswap_auth.c
   infiniswap_provider_session.c)
@@ -76,7 +91,8 @@ target_link_libraries(
     Threads::Threads
     infiniswap-consumer-liveness
     infiniswap-control
-    infiniswap-memory)
+    infiniswap-memory
+    infiniswap-observability)
 
 add_executable(infiniswap-daemon infiniswap-daemon.c)
 target_compile_options(infiniswap-daemon PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -105,6 +121,8 @@ install(
     ${CMAKE_CURRENT_SOURCE_DIR}/../config/status-v2.schema.json
     ${CMAKE_CURRENT_SOURCE_DIR}/../config/status-v3.schema.json
     ${CMAKE_CURRENT_SOURCE_DIR}/../config/status-v4.schema.json
+    ${CMAKE_CURRENT_SOURCE_DIR}/../config/status-v5.schema.json
+    ${CMAKE_CURRENT_SOURCE_DIR}/../config/provider-status.schema.json
     ${CMAKE_CURRENT_SOURCE_DIR}/../config/provider-memory.example.conf
   DESTINATION share/infiniswap)
 
@@ -150,6 +168,18 @@ if(BUILD_TESTING)
   target_link_libraries(
     consumer-liveness-test PRIVATE infiniswap-consumer-liveness)
   add_test(NAME consumer-liveness COMMAND consumer-liveness-test)
+
+  add_executable(provider-observability-test tests/provider_observability_test.c)
+  target_compile_options(
+    provider-observability-test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  target_link_libraries(
+    provider-observability-test PRIVATE infiniswap-observability)
+  add_test(
+    NAME provider-observability
+    COMMAND
+      provider-observability-test
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/provider-status-v1.json
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/provider-metrics-v1.txt)
 
   add_executable(rdma-common-test tests/rdma_common_test.c)
   target_compile_options(rdma-common-test PRIVATE -Wall -Wextra -Wpedantic -Werror)

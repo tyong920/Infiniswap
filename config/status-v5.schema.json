@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/tyong920/Infiniswap/config/status.schema.json",
-  "title": "Infiniswap Device Status v6",
+  "$id": "https://github.com/tyong920/Infiniswap/config/status-v5.schema.json",
+  "title": "Infiniswap Device Status v5",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -11,13 +11,12 @@
     "connection",
     "capacity",
     "mapping",
-    "io",
     "metrics",
     "last_error"
   ],
   "properties": {
     "schema_version": {
-      "const": 6
+      "const": 5
     },
     "kind": {
       "const": "infiniswap.device-status"
@@ -147,10 +146,7 @@
             "additionalProperties": false,
             "required": [
               "provider_id",
-              "state",
-              "available_chunks",
-              "mapped_chunks",
-              "last_error"
+              "state"
             ],
             "properties": {
               "provider_id": {
@@ -165,41 +161,6 @@
                   "connected",
                   "degraded",
                   "remote-lost"
-                ]
-              },
-              "available_chunks": {
-                "type": "integer",
-                "minimum": 0,
-                "maximum": 128
-              },
-              "mapped_chunks": {
-                "type": "integer",
-                "minimum": 0,
-                "maximum": 128
-              },
-              "last_error": {
-                "oneOf": [
-                  {
-                    "type": "null"
-                  },
-                  {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": [
-                      "code",
-                      "errno"
-                    ],
-                    "properties": {
-                      "code": {
-                        "type": "string",
-                        "pattern": "^E[A-Z0-9_]+$"
-                      },
-                      "errno": {
-                        "type": "integer",
-                        "minimum": 1
-                      }
-                    }
-                  }
                 ]
               }
             }
@@ -329,8 +290,6 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "admission_rejections_total",
-        "authentication_failures_total",
         "backing_degraded_transitions_total",
         "backing_failures_total",
         "backing_invalid_sectors",
@@ -377,14 +336,6 @@
         "remote_lost_transitions_total": {
           "type": "integer",
           "minimum": 0
-        },
-        "admission_rejections_total": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "authentication_failures_total": {
-          "type": "integer",
-          "minimum": 0
         }
       }
     },
@@ -412,40 +363,6 @@
           }
         }
       ]
-    },
-    "io": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "in_flight",
-        "oldest_in_flight_ms",
-        "requests_total",
-        "completed_total",
-        "errors_total"
-      ],
-      "properties": {
-        "in_flight": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 128
-        },
-        "oldest_in_flight_ms": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "requests_total": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "completed_total": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "errors_total": {
-          "type": "integer",
-          "minimum": 0
-        }
-      }
     }
   }
 }

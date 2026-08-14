@@ -67,6 +67,7 @@ static int build_error(struct is_provider_session *session,
     return -1;
   outcome->response_ready = 1;
   outcome->close_after_response = 1;
+  session->last_error_code = (uint16_t)code;
   session->state = IS_PROVIDER_SESSION_CLOSED;
   return 0;
 }
