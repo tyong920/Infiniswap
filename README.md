@@ -511,6 +511,25 @@ Run `tests/vm/run --preflight-only --json` to validate a host without creating
 or downloading anything. A release-gate report is certifiable only with the
 full selected profile and at least 24 soak hours.
 
+#### Persistent developer installation
+
+`ty-gpu-02` has a persistent user installation for development and regression
+work. `tests/vm/run` remains the canonical implementation; the installed
+`infiniswap-vm` command is only a thin adapter that supplies managed cache and
+result paths. Check it without starting a VM or changing host state:
+
+```bash
+ssh ty-gpu-02 'infiniswap-vm --preflight-only --json'
+ssh ty-gpu-02 'git -C ~/.local/share/infiniswap-vm/source status -sb'
+```
+
+The installation lives under `~/.local/share/infiniswap-vm`: keep `cache/`
+(Jammy and Noble base images), `archive/` (checksummed evidence), and `state/`
+(installation and safety records). Completed entries under `results/` are
+disposable after any important report has been archived. Installation details
+and the reversible uninstall entry point are recorded in that directory's
+`README.md` and `state/installation.json`.
+
 `setup/install.sh bd` only builds and installs the module. It does not load the
 module, create an Infiniswap Device, format swap, or alter active swap.
 `setup/install.sh ctl` installs the Python CLI and versioned schemas below
