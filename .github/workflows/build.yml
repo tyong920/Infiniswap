@@ -39,6 +39,10 @@ jobs:
             python3-jsonschema \
             linux-headers-generic
 
+      - name: Install Noble DKMS debhelper addon
+        if: matrix.ubuntu == '24.04'
+        run: sudo apt-get install -y dh-dkms
+
       - name: Configure Memory Provider
         run: >-
           cmake -S infiniswap_daemon

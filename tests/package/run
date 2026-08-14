@@ -44,10 +44,15 @@ cp /proc/swaps "$swap_before"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends \
-  build-essential cmake debhelper devscripts dkms kmod pkg-config \
-  libibverbs-dev librdmacm-dev libssl-dev rdma-core \
+build_dependencies=(
+  build-essential cmake debhelper devscripts dkms kmod pkg-config
+  libibverbs-dev librdmacm-dev libssl-dev rdma-core
   "linux-headers-$(uname -r)"
+)
+if [[ $VERSION_ID == 24.04 ]]; then
+  build_dependencies+=(dh-dkms)
+fi
+apt-get install -y --no-install-recommends "${build_dependencies[@]}"
 
 copy_current_source() {
   local destination=$1

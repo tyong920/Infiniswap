@@ -11,6 +11,10 @@ Build binary packages on Ubuntu 22.04 or 24.04:
 ```bash
 sudo apt-get install -y build-essential devscripts debhelper dkms \
   cmake pkg-config libibverbs-dev librdmacm-dev libssl-dev
+# Ubuntu 24.04 splits the debhelper addon out of the dkms package.
+if [[ $(. /etc/os-release; echo "$VERSION_ID") == 24.04 ]]; then
+  sudo apt-get install -y dh-dkms
+fi
 
 dpkg-buildpackage --build=binary --no-sign
 ```

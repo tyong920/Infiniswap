@@ -46,13 +46,19 @@ class DebianPackageContractTest(unittest.TestCase):
             self.read("debian/module-signing.conf"), r"BEGIN .*PRIVATE KEY"
         )
 
-    def test_ubuntu_2204_uses_dkms_package_for_debhelper_addon(self):
-        for path in (
-            ".github/workflows/build.yml",
-            "tests/package/run",
-            "docs/packaging.md",
-        ):
-            self.assertNotIn("dh-dkms", self.read(path), path)
+    def test_dkms_debhelper_addon_tracks_ubuntu_package_split(self):
+        workflow = self.read(".github/workflows/build.yml")
+        common_install = workflow.split(
+            "- name: Install Noble DKMS debhelper addon", 1
+        )[0]
+        self.assertNotIn("dh-dkms", common_install)
+        self.assertIn("- name: Install Noble DKMS debhelper addon", workflow)
+        self.assertIn("if: matrix.ubuntu == '24.04'", workflow)
+        self.assertIn("sudo apt-get install -y dh-dkms", workflow)
+
+        lifecycle = self.read("tests/package/run")
+        self.assertIn("if [[ $VERSION_ID == 24.04 ]]", lifecycle)
+        self.assertIn("build_dependencies+=(dh-dkms)", lifecycle)
 
     def test_package_sources_contain_no_implicit_swap_mutation(self):
         forbidden = re.compile(r"\b(?:swapon|mkswap)\b|swapoff\s+-a")
