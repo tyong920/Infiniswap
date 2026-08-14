@@ -1,0 +1,11 @@
+# Provider identity used in status, metrics, and audit output. The empty default
+# makes an incomplete configuration fail closed.
+INFINISWAP_PROVIDER_ID=
+
+# The daemon currently binds an IPv6 RDMA CM listener. Use :: for dual-stack
+# environments or an explicit IPv6 address assigned to the configured Rail.
+INFINISWAP_LISTEN_ADDRESS=::
+INFINISWAP_LISTEN_PORT=9400
+INFINISWAP_MEMORY_CONFIG=/etc/infiniswap/provider-memory.conf
+INFINISWAP_CONSUMER_ALLOWLIST=/etc/infiniswap/consumers.conf
+INFINISWAP_OBSERVABILITY_PORT=9401

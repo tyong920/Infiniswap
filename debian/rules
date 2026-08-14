@@ -1,0 +1,44 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all optimize=-lto
+export DEB_CFLAGS_MAINT_APPEND = -Wformat -Werror=format-security
+
+PACKAGE_VERSION := $(shell dpkg-parsechangelog -SVersion)
+DKMS_ROOT := debian/tmp/usr/src/infiniswap-$(PACKAGE_VERSION)
+
+%:
+	dh $@ --buildsystem=cmake \
+		--sourcedirectory=infiniswap_daemon \
+		--builddirectory=debian/build
+
+override_dh_auto_configure:
+	dh_auto_configure -- -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=ON
+
+override_dh_auto_install:
+	dh_auto_install --destdir=debian/tmp
+	install -d debian/tmp/usr/lib/infiniswap/infiniswapctl
+	install -m 0755 bin/infiniswapctl debian/tmp/usr/sbin/infiniswapctl
+	install -m 0644 infiniswapctl/*.py debian/tmp/usr/lib/infiniswap/infiniswapctl/
+	install -d debian/tmp/usr/share/infiniswap/monitoring
+	install -m 0644 monitoring/infiniswap-alerts.yml \
+		debian/tmp/usr/share/infiniswap/monitoring/
+	install -d debian/tmp/etc/infiniswap
+	install -m 0600 debian/module-signing.conf \
+		debian/tmp/etc/infiniswap/module-signing.conf
+	install -d $(DKMS_ROOT)/common $(DKMS_ROOT)/infiniswap_bd
+	install -m 0644 common/*.c common/*.h $(DKMS_ROOT)/common/
+	install -m 0644 infiniswap_bd/Makefile infiniswap_bd/*.c \
+		infiniswap_bd/*.h $(DKMS_ROOT)/infiniswap_bd/
+	cp -a infiniswap_bd/scripts $(DKMS_ROOT)/infiniswap_bd/
+
+# Substitute the Debian version into dkms.conf and merge it with staged source.
+override_dh_dkms:
+	dh_dkms -V $(PACKAGE_VERSION)
+
+# A package install must never start a Provider without reviewed configuration.
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start
+
+override_dh_auto_clean:
+	dh_auto_clean
+	rm -rf debian/tmp

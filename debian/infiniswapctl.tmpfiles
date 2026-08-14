@@ -1,0 +1,2 @@
+d /var/lib/infiniswap 0700 root root -
+d /var/log/infiniswap 0750 root root -

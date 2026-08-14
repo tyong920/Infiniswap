@@ -4,6 +4,7 @@ import argparse
 import errno
 import json
 import sys
+from pathlib import Path
 from typing import IO, Any, Dict, List, Optional, Tuple
 
 from .config import (
@@ -11,11 +12,18 @@ from .config import (
     ConsumerConfig,
     GIB,
     load_consumer,
+    load_json,
     load_provider,
     load_provider_directory,
     validate_device_name,
 )
 from .observability import evaluate_consumer_alerts, render_consumer_metrics
+from .release import (
+    ReleaseError,
+    assess_drain_capacity,
+    migrate_config_document,
+    verify_kernel_abi_evidence,
+)
 from .system import LocalSystem
 
 
@@ -80,6 +88,51 @@ def _parser() -> argparse.ArgumentParser:
         "kind", choices=("consumer", "provider", "provider-directory")
     )
     validate.add_argument("--config", required=True)
+
+    migrate = commands.add_parser("migrate")
+    migrate.add_argument(
+        "kind", choices=("consumer", "provider", "provider-directory")
+    )
+    migrate.add_argument("--config", required=True)
+    migrate.add_argument("--output")
+
+    release_gate = commands.add_parser("release-gate")
+    release_gate.add_argument("--evidence", required=True)
+    release_gate.add_argument("--commit", required=True)
+
+    upgrade = commands.add_parser("upgrade")
+    upgrade_commands = upgrade.add_subparsers(dest="upgrade_action", required=True)
+    for action in ("preflight", "prepare"):
+        command = upgrade_commands.add_parser(action)
+        command.add_argument("device")
+        command.add_argument("--config", required=True)
+        command.add_argument("--reserve-mib", type=int, default=1024)
+        if action == "prepare":
+            command.add_argument("--state-file", required=True)
+            command.add_argument("--yes", action="store_true")
+            command.add_argument("--dry-run", action="store_true")
+    for action in ("restore", "rollback"):
+        restore = upgrade_commands.add_parser(action)
+        restore.add_argument("device")
+        restore.add_argument("--config", required=True)
+        restore.add_argument("--state-file", required=True)
+        restore.add_argument("--dry-run", action="store_true")
+        if action == "rollback":
+            restore.add_argument("--package", action="append", required=True)
+            restore.add_argument("--yes", action="store_true")
+    provider_upgrade = upgrade_commands.add_parser("provider")
+    provider_upgrade.add_argument(
+        "--consumer-mode", required=True, choices=("backed", "remote-only")
+    )
+    provider_upgrade.add_argument("--target-package", action="append", required=True)
+    provider_upgrade.add_argument(
+        "--rollback-package", action="append", required=True
+    )
+    provider_upgrade.add_argument(
+        "--endpoint", default="http://127.0.0.1:9401"
+    )
+    provider_upgrade.add_argument("--yes", action="store_true")
+    provider_upgrade.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -306,6 +359,243 @@ def _run_lifecycle_command(
         system.write_attribute(args.device, "state", "stop")
         system.remove_group(args.device)
     print("Completed %s for %s" % (args.command, args.device), file=stdout)
+
+
+def _upgrade_preflight(
+    args: argparse.Namespace, config: ConsumerConfig, system: Any, stdout: IO[str]
+) -> Tuple[str, Any]:
+    path, state = _inspect_device(args.device, system)
+    if config.name != args.device:
+        raise ConfigError(
+            "upgrade configuration names %s, not %s" % (config.name, args.device)
+        )
+    if state != "active":
+        raise ConfigError("upgrade requires an active Infiniswap Device")
+    mode = system.read_attribute(args.device, "mode")
+    if mode != config.mode:
+        raise ConfigError(
+            "upgrade configuration mode does not match the active device"
+        )
+    if args.reserve_mib < 0:
+        raise ConfigError("upgrade reserve must be a non-negative MiB value")
+    used, memory, alternate = system.drain_capacity(path)
+    assessment = assess_drain_capacity(
+        target_swap_used_bytes=used,
+        memory_available_bytes=memory,
+        alternate_swap_free_bytes=alternate,
+        reserve_bytes=args.reserve_mib * 1024 * 1024,
+    )
+    print("Preflight upgrade " + args.device, file=stdout)
+    print("  mode: " + mode, file=stdout)
+    print(
+        "  target swap used: %d bytes" % assessment.target_swap_used_bytes,
+        file=stdout,
+    )
+    print("  available RAM: %d bytes" % assessment.memory_available_bytes, file=stdout)
+    print(
+        "  alternate swap free: %d bytes" % assessment.alternate_swap_free_bytes,
+        file=stdout,
+    )
+    print("  reserved RAM: %d bytes" % assessment.reserve_bytes, file=stdout)
+    if not assessment.sufficient:
+        raise ConfigError(
+            "insufficient RAM and alternate swap for Consumer upgrade; "
+            "shortfall: %d bytes" % assessment.shortfall_bytes
+        )
+    print("  drain capacity: sufficient", file=stdout)
+    if mode == "remote-only":
+        print(
+            "  Remote-Only Mode: stop and recreate; in-place upgrade is forbidden",
+            file=stdout,
+        )
+    return path, assessment
+
+
+def _prepare_upgrade(
+    args: argparse.Namespace,
+    config: ConsumerConfig,
+    path: str,
+    system: Any,
+    stdout: IO[str],
+) -> None:
+    if not args.dry_run and not args.yes:
+        raise ConfigError("upgrade prepare requires --yes after reviewing preflight")
+    if args.dry_run:
+        print("Dry run: no changes made", file=stdout)
+        return
+    swap_enabled = system.is_swap_enabled(path)
+    state = {
+        "schema_version": 1,
+        "kind": "infiniswap.consumer-upgrade",
+        "device": config.name,
+        "mode": config.mode,
+        "config_sha256": system.file_sha256(args.config),
+        "swap": {
+            "was_enabled": swap_enabled,
+            "priority": system.swap_priority(path) if swap_enabled else None,
+        },
+        "packages": system.installed_package_versions(
+            ("infiniswap-dkms", "infiniswap-provider", "infiniswapctl")
+        ),
+    }
+    system.write_release_state(args.state_file, state)
+    if swap_enabled:
+        system.run_host_command(["swapoff", path])
+    system.write_attribute(config.name, "state", "drain")
+    system.verify_device_drained(config.name)
+    system.write_attribute(config.name, "state", "stop")
+    system.remove_group(config.name)
+    system.unload_module("infiniswap")
+    print(
+        "Prepared %s for package installation; release state: %s"
+        % (config.name, args.state_file),
+        file=stdout,
+    )
+
+
+def _validate_upgrade_state(
+    args: argparse.Namespace, config: ConsumerConfig, system: Any
+) -> Dict[str, Any]:
+    state = system.read_release_state(args.state_file)
+    if (
+        not isinstance(state, dict)
+        or state.get("schema_version") != 1
+        or state.get("kind") != "infiniswap.consumer-upgrade"
+        or state.get("device") != args.device
+        or state.get("mode") != config.mode
+        or config.name != args.device
+    ):
+        raise ConfigError(
+            "upgrade state does not match the requested device configuration"
+        )
+    return state
+
+
+def _restore_upgrade(
+    args: argparse.Namespace, config: ConsumerConfig, system: Any, stdout: IO[str]
+) -> None:
+    _validate_upgrade_state(args, config, system)
+    if system.group_exists(config.name):
+        raise ConfigError("Infiniswap Device already exists: " + config.name)
+    print("Preflight restore " + config.name, file=stdout)
+    print("  mode: " + config.mode, file=stdout)
+    print("  swap activation: disabled", file=stdout)
+    if args.dry_run:
+        print("Dry run: no changes made", file=stdout)
+        return
+    _create(config, system, stdout)
+    print(
+        "Restored device configuration; swap remains disabled until explicit "
+        "format/enable",
+        file=stdout,
+    )
+
+
+def _rollback_upgrade(
+    args: argparse.Namespace, config: ConsumerConfig, system: Any, stdout: IO[str]
+) -> None:
+    state = _validate_upgrade_state(args, config, system)
+    if state.get("config_sha256") != system.file_sha256(args.config):
+        raise ConfigError(
+            "rollback requires the configuration captured by upgrade prepare"
+        )
+    missing = [path for path in args.package if not system.is_package_file(path)]
+    if missing:
+        raise ConfigError("rollback package is not a regular .deb file: " + missing[0])
+    captured_packages = state.get("packages")
+    if not isinstance(captured_packages, dict):
+        raise ConfigError("upgrade state does not contain captured package versions")
+    expected_packages = {
+        name: version
+        for name, version in captured_packages.items()
+        if isinstance(version, str) and version
+    }
+    artifact_packages = {}
+    for path in args.package:
+        name, version = system.package_artifact_info(path)
+        if name in artifact_packages:
+            raise ConfigError("rollback package set contains duplicate " + name)
+        artifact_packages[name] = version
+    if artifact_packages != expected_packages:
+        raise ConfigError(
+            "rollback artifacts do not match the captured previous package set"
+        )
+    print("Preflight rollback " + config.name, file=stdout)
+    for path in args.package:
+        print("  previous package: " + path, file=stdout)
+    print("  swap activation: disabled", file=stdout)
+    if not args.dry_run and not args.yes:
+        raise ConfigError("upgrade rollback requires --yes after reviewing preflight")
+    if args.dry_run:
+        print("Dry run: no changes made", file=stdout)
+        return
+    system.install_packages(args.package, allow_downgrades=True)
+    _restore_upgrade(args, config, system, stdout)
+    print("Rollback complete; use explicit enable after verification", file=stdout)
+
+
+def _provider_upgrade(args: argparse.Namespace, system: Any, stdout: IO[str]) -> None:
+    if args.consumer_mode == "remote-only":
+        raise ConfigError(
+            "Remote-Only Mode Providers require the Consumer to stop and recreate; "
+            "rolling upgrade is forbidden"
+        )
+    if len(args.target_package) != 1 or len(args.rollback_package) != 1:
+        raise ConfigError(
+            "Provider upgrade requires one target and one rollback package"
+        )
+    for path in args.target_package + args.rollback_package:
+        if not system.is_package_file(path):
+            raise ConfigError(
+                "Provider upgrade package is not a regular .deb file: " + path
+            )
+    target_name, target_version = system.package_artifact_info(
+        args.target_package[0]
+    )
+    rollback_name, rollback_version = system.package_artifact_info(
+        args.rollback_package[0]
+    )
+    installed_version = system.installed_package_versions(
+        ("infiniswap-provider",)
+    ).get("infiniswap-provider")
+    if (
+        target_name != "infiniswap-provider"
+        or rollback_name != "infiniswap-provider"
+        or not installed_version
+        or rollback_version != installed_version
+        or not system.package_version_is_newer(target_version, installed_version)
+    ):
+        raise ConfigError(
+            "Provider artifacts must contain one newer target and the installed "
+            "version for rollback"
+        )
+    print("Preflight rolling upgrade for one Memory Provider", file=stdout)
+    print("  Consumer mode: backed", file=stdout)
+    print("  swap activation: unchanged", file=stdout)
+    if not args.dry_run and not args.yes:
+        raise ConfigError("Provider upgrade requires --yes after reviewing preflight")
+    if args.dry_run:
+        print("Dry run: no changes made", file=stdout)
+        return
+    system.install_packages(args.target_package, allow_downgrades=False)
+    system.restart_provider()
+    if not system.provider_is_healthy(args.endpoint):
+        system.install_packages(args.rollback_package, allow_downgrades=True)
+        system.restart_provider()
+        if not system.provider_is_healthy(args.endpoint):
+            raise OSError(
+                "upgraded Memory Provider failed health check; previous package "
+                "was restored but is unhealthy"
+            )
+        raise OSError(
+            "upgraded Memory Provider failed health check; previous package restored"
+        )
+    print("Upgraded one healthy Memory Provider", file=stdout)
+    print(
+        "Drain and recreate the Backed Mode Consumer before upgrading the next "
+        "Provider",
+        file=stdout,
+    )
 
 
 def _parse_chunk_placements(raw: str) -> List[Dict[str, Any]]:
@@ -805,6 +1095,59 @@ def run(
     args = _parser().parse_args(argv)
     system = system or LocalSystem()
     try:
+        if args.command == "migrate":
+            document = migrate_config_document(args.kind, load_json(args.config))
+            payload = json.dumps(document, indent=2, sort_keys=True) + "\n"
+            if args.output:
+                system.write_config_document(args.output, payload)
+                print(
+                    "Migrated %s configuration to %s" % (args.kind, args.output),
+                    file=stdout,
+                )
+            else:
+                stdout.write(payload)
+            return 0
+
+        if args.command == "release-gate":
+            evidence = verify_kernel_abi_evidence(
+                load_json(args.evidence),
+                expected_commit=args.commit,
+                evidence_root=Path(args.evidence).resolve().parent,
+            )
+            print(
+                "Kernel ABI gate passed: Ubuntu %s, %s, %s"
+                % (
+                    evidence.ubuntu_release,
+                    evidence.kernel_release,
+                    evidence.rdma_stack,
+                ),
+                file=stdout,
+            )
+            return 0
+
+        if args.command == "upgrade":
+            if args.upgrade_action == "provider":
+                if not args.dry_run and not system.is_root():
+                    raise ConfigError("Provider upgrades must run as root")
+                _provider_upgrade(args, system, stdout)
+                return 0
+            config = load_consumer(args.config, system)
+            if args.upgrade_action in ("preflight", "prepare"):
+                path, _ = _upgrade_preflight(args, config, system, stdout)
+                if args.upgrade_action == "preflight":
+                    return 0
+                if not args.dry_run and not system.is_root():
+                    raise ConfigError("Consumer upgrades must run as root")
+                _prepare_upgrade(args, config, path, system, stdout)
+                return 0
+            if not args.dry_run and not system.is_root():
+                raise ConfigError("Consumer upgrades must run as root")
+            if args.upgrade_action == "rollback":
+                _rollback_upgrade(args, config, system, stdout)
+            else:
+                _restore_upgrade(args, config, system, stdout)
+            return 0
+
         if args.command == "create":
             config = load_consumer(args.config, system)
             if not args.dry_run and not system.is_root():
@@ -954,7 +1297,7 @@ def run(
                     file=stdout,
                 )
             return 0
-    except ConfigError as exc:
+    except (ConfigError, ReleaseError) as exc:
         print("infiniswapctl: " + str(exc), file=stderr)
         return 2
     except OSError as exc:

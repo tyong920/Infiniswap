@@ -46,6 +46,21 @@ Module.markers
 .tmp_versions/
 *.order
 
+# Debian packaging output
+debian/.debhelper/
+debian/build/
+debian/debhelper-build-stamp
+debian/files
+debian/*.substvars
+debian/infiniswap-dkms/
+debian/infiniswap-provider/
+debian/infiniswap-provider-dbgsym/
+debian/infiniswapctl/
+*.buildinfo
+*.changes
+*.deb
+*.ddeb
+
 # Local deploy / experiment noise
 *.log
 *.out

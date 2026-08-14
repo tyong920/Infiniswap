@@ -1,0 +1,61 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/tyong920/Infiniswap/config/kernel-abi-evidence.schema.json",
+  "title": "Infiniswap kernel ABI release evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "commit",
+    "ubuntu_release",
+    "kernel_release",
+    "rdma_stack",
+    "dkms",
+    "vm",
+    "canary"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "ubuntu_release": {"enum": ["22.04", "24.04"]},
+    "kernel_release": {"type": "string", "minLength": 1},
+    "rdma_stack": {"enum": ["inbox", "mlnx-ofed-5.8"]},
+    "dkms": {"$ref": "#/definitions/report"},
+    "vm": {
+      "allOf": [
+        {"$ref": "#/definitions/report"},
+        {
+          "type": "object",
+          "required": ["certifiable"],
+          "properties": {"certifiable": {"const": true}}
+        }
+      ]
+    },
+    "canary": {
+      "allOf": [
+        {"$ref": "#/definitions/report"},
+        {
+          "type": "object",
+          "required": ["duration_seconds"],
+          "properties": {
+            "duration_seconds": {"type": "integer", "minimum": 1}
+          }
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "passed"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "passed": {"const": true},
+        "certifiable": {"type": "boolean"},
+        "duration_seconds": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

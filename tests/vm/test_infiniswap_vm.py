@@ -37,6 +37,8 @@ class ScenarioRecordingBackend(qemu_backend.QemuBackend):
     def _ssh_shell(self, handle, guest, label, command, **kwargs):
         if label == "force-reboot":
             raise subprocess.TimeoutExpired("ssh", 15)
+        if label.startswith("kernel-release-"):
+            return SimpleNamespace(returncode=0, stdout="6.8.0-137-generic\n")
         return SimpleNamespace(returncode=0, stdout="old-boot-id\n")
 
     def _wait_for_reboot(self, handle, guest, previous_boot_id=None):
@@ -64,6 +66,8 @@ class QemuScenarioTest(unittest.TestCase):
 
         calls = {label: args for label, args, _kwargs in backend.helper_calls}
         self.assertEqual(result.status, "passed")
+        self.assertEqual(result.metrics["kernel_release"], "6.8.0-137-generic")
+        self.assertEqual(result.metrics["rdma_stack"], "inbox")
         self.assertEqual(
             calls["alert-auth-failure"],
             (
@@ -193,8 +197,17 @@ class FailingValidationBackend:
             return infiniswap_vm.ScenarioResult(
                 status="failed", detail="injected network mismatch", artifacts=()
             )
+        metrics = {}
+        if scenario_id == "build-deploy":
+            metrics = {
+                "kernel_release": handle["entry"]["kernel"] + ".0-fixture",
+                "rdma_stack": "inbox",
+            }
         return infiniswap_vm.ScenarioResult(
-            status="passed", detail="fixture passed", artifacts=()
+            status="passed",
+            detail="fixture passed",
+            artifacts=(),
+            metrics=metrics,
         )
 
     def collect(self, handle, artifacts):
@@ -213,6 +226,8 @@ class FailingValidationBackend:
 
 class ShutdownFailingBackend(FailingValidationBackend):
     def run_scenario(self, handle, scenario_id, artifacts):
+        if scenario_id == "build-deploy":
+            return super().run_scenario(handle, scenario_id, artifacts)
         return infiniswap_vm.ScenarioResult(
             status="passed", detail="fixture passed", artifacts=()
         )
@@ -369,6 +384,7 @@ class VmValidationCliTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(report, persisted)
         self.assertEqual(report["status"], "preflight-passed")
+        self.assertRegex(report["source_commit"], r"^[0-9a-f]{40}$")
         self.assertTrue(report["profile"]["certifiable"])
         self.assertEqual(
             {
@@ -451,6 +467,8 @@ class VmValidationCliTest(unittest.TestCase):
         }
         self.assertEqual(result, 1)
         self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["matrix"][0]["kernel_release"], "5.15.0-fixture")
+        self.assertEqual(report["matrix"][0]["rdma_stack"], "inbox")
         self.assertEqual(scenarios["network-interruption"]["status"], "failed")
         self.assertEqual(scenarios["backing-store-error"]["status"], "skipped")
         self.assertEqual(scenarios["resource-leak-check"]["status"], "passed")

@@ -1,0 +1,3 @@
+usr/sbin/infiniswapctl
+usr/lib/infiniswap/infiniswapctl
+usr/share/infiniswap/*.json

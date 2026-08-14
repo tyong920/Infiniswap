@@ -1,0 +1,44 @@
+name: kernel-abi-gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Exact 40-character release commit
+        required: true
+        type: string
+      evidence_path:
+        description: Evidence manifest below /var/lib/infiniswap-release-evidence
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - infiniswap-release-gate
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
+      - name: Verify immutable release evidence
+        run: |
+          test "$(git rev-parse HEAD)" = "${{ inputs.commit }}"
+          evidence=$(realpath -- "${{ inputs.evidence_path }}")
+          case "$evidence" in
+            /var/lib/infiniswap-release-evidence/*) ;;
+            *) echo "evidence must be below the managed evidence root" >&2; exit 1 ;;
+          esac
+          bin/infiniswapctl release-gate \
+            --evidence "$evidence" \
+            --commit "${{ inputs.commit }}" | tee kernel-abi-gate.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-abi-gate-${{ inputs.commit }}
+          path: kernel-abi-gate.log
+          if-no-files-found: error

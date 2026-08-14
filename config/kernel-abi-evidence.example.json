@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "commit": "0123456789abcdef0123456789abcdef01234567",
+  "ubuntu_release": "24.04",
+  "kernel_release": "6.8.0-51-generic",
+  "rdma_stack": "inbox",
+  "dkms": {
+    "path": "evidence/dkms.json",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "passed": true
+  },
+  "vm": {
+    "path": "evidence/vm/report.json",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "passed": true,
+    "certifiable": true
+  },
+  "canary": {
+    "path": "evidence/canary.json",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "passed": true,
+    "duration_seconds": 3600
+  }
+}

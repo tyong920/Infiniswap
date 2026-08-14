@@ -1,6 +1,7 @@
 """Operating-system adapter used by the administration application."""
 
 import fcntl
+import hashlib
 import json
 import os
 import socket
@@ -149,9 +150,9 @@ class LocalSystem:
             "subject": subject,
             "details": details,
         }
-        payload = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode(
-            "ascii"
-        )
+        payload = (
+            json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("ascii")
         self.audit_path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
         if hasattr(os, "O_NOFOLLOW"):
@@ -181,6 +182,183 @@ class LocalSystem:
                 except ValueError:
                     continue
         return swaps
+
+    def drain_capacity(self, path: str) -> Any:
+        memory_available = None
+        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            fields = line.split()
+            if (
+                len(fields) == 3
+                and fields[0] == "MemAvailable:"
+                and fields[2] == "kB"
+            ):
+                memory_available = int(fields[1]) * 1024
+                break
+        if memory_available is None:
+            raise OSError("/proc/meminfo does not report MemAvailable")
+
+        target = os.path.realpath(path)
+        target_used = 0
+        alternate_free = 0
+        lines = Path("/proc/swaps").read_text(encoding="utf-8").splitlines()
+        for line in lines[1:]:
+            fields = line.split()
+            if len(fields) < 5:
+                continue
+            try:
+                size = int(fields[2]) * 1024
+                used = int(fields[3]) * 1024
+            except ValueError:
+                continue
+            if os.path.realpath(fields[0]) == target:
+                target_used = used
+            else:
+                alternate_free += max(0, size - used)
+        return target_used, memory_available, alternate_free
+
+    def file_sha256(self, path: str) -> str:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    def installed_package_versions(self, packages: Any) -> dict:
+        versions = {}
+        for package in packages:
+            result = subprocess.run(
+                ["dpkg-query", "--show", "--showformat=${Version}", package],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            versions[package] = (
+                result.stdout.strip() if result.returncode == 0 else None
+            )
+        return versions
+
+    def write_release_state(self, path: str, document: dict) -> None:
+        destination = Path(path)
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        parent = os.stat(destination.parent, follow_symlinks=False)
+        if not stat.S_ISDIR(parent.st_mode):
+            raise OSError("release state parent must be a non-symlink directory")
+        if parent.st_uid != os.geteuid() or stat.S_IMODE(parent.st_mode) & 0o077:
+            raise OSError(
+                "release state parent must be owner-only and owned by the caller"
+            )
+        payload = (
+            json.dumps(document, indent=2, sort_keys=True) + "\n"
+        ).encode("ascii")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(destination, flags, 0o600)
+        try:
+            if os.write(descriptor, payload) != len(payload):
+                raise OSError("short write to release state")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def read_release_state(self, path: str) -> dict:
+        details = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISREG(details.st_mode):
+            raise OSError("release state must be a regular file")
+        if details.st_uid != os.geteuid() or stat.S_IMODE(details.st_mode) & 0o077:
+            raise OSError("release state must be owner-only and owned by the caller")
+        try:
+            document = json.loads(Path(path).read_text(encoding="ascii"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise OSError("release state is not valid ASCII JSON") from exc
+        if not isinstance(document, dict):
+            raise OSError("release state must be a JSON object")
+        return document
+
+    def write_config_document(self, path: str, payload: str) -> None:
+        destination = Path(path)
+        destination.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(destination, flags, 0o600)
+        try:
+            encoded = payload.encode("utf-8")
+            if os.write(descriptor, encoded) != len(encoded):
+                raise OSError("short write to migrated configuration")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def unload_module(self, name: str) -> None:
+        self._run(["modprobe", "--remove", name])
+
+    def verify_device_drained(self, name: str) -> None:
+        state = self.read_attribute(name, "state")
+        try:
+            inflight = int(self.read_attribute(name, "inflight_io"))
+        except ValueError as exc:
+            raise OSError("Consumer reported invalid in-flight I/O") from exc
+        if state != "drained" or inflight != 0:
+            raise OSError(
+                "Consumer drain did not reach drained with zero in-flight I/O"
+            )
+
+    def is_package_file(self, path: str) -> bool:
+        try:
+            details = os.stat(path, follow_symlinks=False)
+        except OSError:
+            return False
+        return stat.S_ISREG(details.st_mode) and path.endswith(".deb")
+
+    def package_artifact_info(self, path: str) -> Any:
+        fields = []
+        for field in ("Package", "Version"):
+            result = subprocess.run(
+                ["dpkg-deb", "--field", path, field],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            value = result.stdout.strip()
+            if result.returncode != 0 or not value:
+                detail = result.stderr.strip() or "missing " + field
+                raise OSError("could not inspect package artifact: " + detail)
+            fields.append(value)
+        return fields[0], fields[1]
+
+    def package_version_is_newer(self, candidate: str, installed: str) -> bool:
+        result = subprocess.run(
+            ["dpkg", "--compare-versions", candidate, "gt", installed],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode not in (0, 1):
+            raise OSError("could not compare Debian package versions")
+        return result.returncode == 0
+
+    def install_packages(self, paths: Any, allow_downgrades: bool) -> None:
+        command = [
+            "apt-get",
+            "-o",
+            "Dpkg::Options::=--force-confold",
+            "install",
+            "--yes",
+            "--no-install-recommends",
+        ]
+        if allow_downgrades:
+            command.append("--allow-downgrades")
+        command.extend(str(Path(path).resolve()) for path in paths)
+        self._run(command)
+
+    def restart_provider(self) -> None:
+        self._run(["systemctl", "restart", "infiniswap-provider.service"])
+
+    def provider_is_healthy(self, endpoint: str) -> bool:
+        try:
+            return self.fetch_observability(endpoint, "/healthz") == "healthy\n"
+        except OSError:
+            return False
 
     def is_swap_enabled(self, path: str) -> bool:
         return os.path.realpath(path) in self._swaps()

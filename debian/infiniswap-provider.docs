@@ -1,0 +1,6 @@
+README.md
+docs/operations.md
+docs/runbooks/provider-rolling-upgrade.md
+docs/runbooks/psk-rotation-revocation.md
+docs/runbooks/rollback.md
+docs/packaging.md

@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import shutil
+import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -345,6 +346,18 @@ def _persist_report(path: Path, report) -> None:
     temporary.replace(path / "report.json")
 
 
+def _source_commit() -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=Path(__file__).resolve().parents[2],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -412,11 +425,22 @@ def _run_matrix(args, report, environment, initial_facts, backend) -> int:
                         detail="%s: %s" % (type(error).__name__, error),
                     )
                 scenario.update(asdict(outcome))
+                if scenario["id"] == "build-deploy" and scenario["status"] == "passed":
+                    kernel_release = scenario["metrics"].get("kernel_release")
+                    rdma_stack = scenario["metrics"].get("rdma_stack")
+                    if not kernel_release or rdma_stack != "inbox":
+                        scenario["status"] = "failed"
+                        scenario["detail"] = (
+                            "build evidence omitted the exact kernel ABI or RDMA stack"
+                        )
+                    else:
+                        entry["kernel_release"] = kernel_release
+                        entry["rdma_stack"] = rdma_stack
                 scenario["finished_at"] = _utc_now()
                 scenario["duration_seconds"] = round(
                     time.monotonic() - scenario_started, 3
                 )
-                if outcome.status != "passed":
+                if scenario["status"] != "passed":
                     entry_failed = True
                     any_failure = True
                 _persist_report(args.artifacts, report)
@@ -542,6 +566,7 @@ def main(
     )
     report = {
         "schema_version": 1,
+        "source_commit": _source_commit(),
         "run_id": args.artifacts.name,
         "artifacts": str(args.artifacts.resolve()),
         "status": "preflight-failed"

@@ -706,6 +706,25 @@ class QemuBackend:
                 sudo=True,
                 timeout=60,
             )
+        kernel_releases = []
+        for index, guest in enumerate(handle.guests):
+            result = self._ssh_shell(
+                handle,
+                guest,
+                "kernel-release-%d" % index,
+                "uname -r",
+                timeout=30,
+            )
+            kernel_releases.append(result.stdout.strip())
+        if (
+            not kernel_releases[0]
+            or any(value != kernel_releases[0] for value in kernel_releases)
+            or (
+                hasattr(handle, "entry")
+                and not kernel_releases[0].startswith(handle.entry["kernel"] + ".")
+            )
+        ):
+            raise BoundaryError("guest kernel ABI does not match the matrix entry")
         psk_path = "/etc/infiniswap-vm-provider-0.psk"
         self._helper(
             handle, handle.consumer, "auth-corrupt-psk", "psk-corrupt", psk_path
@@ -759,6 +778,8 @@ class QemuBackend:
             metrics={
                 "cloud_image_sha256": handle.image_sha256,
                 "guest_count": len(handle.guests),
+                "kernel_release": kernel_releases[0],
+                "rdma_stack": "inbox",
             },
         )
 

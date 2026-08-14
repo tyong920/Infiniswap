@@ -18,4 +18,13 @@ Only the named Infiniswap swap is disabled; its in-flight I/O drains; the Local 
 
 ## Recovery and rollback
 
-Dry-run and then disable/drain the Infiniswap Device. Enable the validated Local Swap Baseline explicitly, verify `/proc/swaps`, workload health, and memory pressure, then stop/destroy Infiniswap when safe. Record `infiniswapctl audit cutover --subject <host> --change-id <id> --outcome rolled-back`. Re-enter Infiniswap only through the full normal-start preflight and release gates.
+Dry-run `infiniswapctl upgrade prepare`, then capture an owner-only release
+state while the command disables/drains only the named Infiniswap Device. Keep
+the complete previous `.deb` set. Use `infiniswapctl upgrade rollback` with
+that state, the unchanged Consumer config, and explicit previous artifacts to
+restore the module, CLI/schema, and device configuration; rollback leaves swap
+disabled. Enable the validated Local Swap Baseline explicitly, verify
+`/proc/swaps`, workload health, and memory pressure, then stop Providers when
+safe. Record `infiniswapctl audit cutover --subject <host> --change-id <id>
+--outcome rolled-back`. Re-enter Infiniswap only through the full normal-start
+preflight and release gates.

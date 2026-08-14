@@ -18,4 +18,10 @@ In Backed Mode, one Provider disconnects and affected reads fall back. Before to
 
 ## Recovery and rollback
 
-Remove one Provider from admission, stop it, install/restart, and verify `/status` and `/metrics`. Drain and recreate the Backed Mode Consumer device so the upgraded Provider rejoins, then run verified I/O and require all Providers connected before continuing. If a gate fails, reinstall the previous daemon/config, recreate against that version, and verify recovery. If the Consumer remains unhealthy, restore the Local Swap Baseline.
+Remove one Provider from admission, then run `infiniswapctl upgrade provider`
+with the reviewed target and rollback `.deb` artifacts. The command restarts one
+Provider, requires `/healthz`, and reinstalls the previous artifact if health
+fails. Drain and recreate the Backed Mode Consumer so the upgraded Provider
+rejoins, then run verified I/O and require all Providers connected before
+continuing. The command refuses Remote-Only Mode; stop/recreate that device
+first. If the Consumer remains unhealthy, restore the Local Swap Baseline.

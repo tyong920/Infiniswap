@@ -2,8 +2,8 @@
 
 ## Preflight
 
-- Estimate available RAM and alternate swap needed to absorb current Infiniswap usage.
 - Stop new workload admission and run `infiniswapctl status <device>`.
+- Run `infiniswapctl upgrade preflight <device> --config <consumer.json> --reserve-mib <reserve>`; it rejects the drain unless available RAM above the reserve plus free alternate swap can absorb current Infiniswap swap usage.
 - Confirm the named device path and that unrelated swap remains online.
 
 ## Expected output
@@ -18,4 +18,10 @@
 
 ## Recovery and rollback
 
-Run disable, then drain, inspect zero in-flight I/O, and destroy only when an upgrade/recreation requires it. To abort before destroy, correct capacity and re-enable at the configured priority. After destroy, recreate from validated configuration. If recreation fails, leave Infiniswap disabled and retain the Local Swap Baseline.
+Run `infiniswapctl upgrade prepare` with an owner-only state file to disable,
+drain, destroy, and unload only the named Consumer. After package installation,
+`infiniswapctl upgrade restore` recreates the validated device configuration but
+leaves swap disabled. To abort before destroy, correct capacity and re-enable at
+the configured priority. If the new release fails, use `infiniswapctl upgrade
+rollback` with the captured state and explicit previous `.deb` artifacts. If
+recreation fails, leave Infiniswap disabled and retain the Local Swap Baseline.

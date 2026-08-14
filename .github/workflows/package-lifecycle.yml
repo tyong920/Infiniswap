@@ -1,0 +1,50 @@
+name: package-lifecycle
+
+on:
+  workflow_dispatch:
+    inputs:
+      previous_ref:
+        description: Previous packaged release tag/commit (leave empty for bootstrap)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    name: Ubuntu ${{ matrix.ubuntu }} package lifecycle
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ubuntu: "22.04"
+            runner: infiniswap-package-ubuntu-22.04
+          - ubuntu: "24.04"
+            runner: infiniswap-package-ubuntu-24.04
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify disposable runner identity
+        run: |
+          . /etc/os-release
+          test "$VERSION_ID" = "${{ matrix.ubuntu }}"
+          test -e /var/lib/infiniswap-package-test-disposable
+      - name: Exercise fresh install, upgrade, downgrade, purge, and reinstall
+        run: |
+          sudo env \
+            INFINISWAP_PACKAGE_TEST_DESTRUCTIVE=yes \
+            INFINISWAP_PACKAGE_TEST_PREVIOUS_REF="${{ inputs.previous_ref }}" \
+            INFINISWAP_PACKAGE_TEST_REPORT="$GITHUB_WORKSPACE/dkms-report.json" \
+            tests/package/run | tee package-lifecycle.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-lifecycle-ubuntu-${{ matrix.ubuntu }}
+          path: |
+            package-lifecycle.log
+            dkms-report.json
+          if-no-files-found: error

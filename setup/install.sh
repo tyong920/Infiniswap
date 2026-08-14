@@ -42,6 +42,8 @@ else
     "$repo_root/infiniswapctl/__main__.py" \
     "$repo_root/infiniswapctl/cli.py" \
     "$repo_root/infiniswapctl/config.py" \
+    "$repo_root/infiniswapctl/observability.py" \
+    "$repo_root/infiniswapctl/release.py" \
     "$repo_root/infiniswapctl/system.py" \
     "$package_root/"
   sudo install -m 0644 \

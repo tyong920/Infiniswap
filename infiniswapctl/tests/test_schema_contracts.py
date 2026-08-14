@@ -46,6 +46,10 @@ class SchemaContractTest(unittest.TestCase):
             ("provider-v1.schema.json", "provider-v1.example.json"),
             ("provider.schema.json", "provider.example.json"),
             (
+                "kernel-abi-evidence.schema.json",
+                "kernel-abi-evidence.example.json",
+            ),
+            (
                 "provider-directory-v1.schema.json",
                 "provider-directory-v1.example.json",
             ),

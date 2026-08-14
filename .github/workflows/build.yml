@@ -29,6 +29,9 @@ jobs:
           sudo apt-get install -y \
             build-essential \
             cmake \
+            debhelper \
+            dh-dkms \
+            dkms \
             ninja-build \
             pkg-config \
             libibverbs-dev \
@@ -77,6 +80,7 @@ jobs:
               ("consumer.schema.json", "consumer-remote-only.example.json"),
               ("provider-v1.schema.json", "provider-v1.example.json"),
               ("provider.schema.json", "provider.example.json"),
+              ("kernel-abi-evidence.schema.json", "kernel-abi-evidence.example.json"),
               ("provider-directory-v1.schema.json", "provider-directory-v1.example.json"),
               ("provider-directory.schema.json", "provider-directory.example.json"),
           )
@@ -109,6 +113,39 @@ jobs:
           python3 -m unittest discover -s infiniswapctl/tests -v
           bin/infiniswapctl --help >/dev/null
 
+      - name: Test Debian package contracts
+        run: |
+          python3 -m unittest discover -s tests/package -p 'test_*.py' -v
+          bash -n \
+            tests/package/run \
+            infiniswap_bd/scripts/dkms-preflight.sh \
+            infiniswap_bd/scripts/dkms-sign-module.sh
+
+      - name: Build Debian package set
+        run: |
+          dpkg-buildpackage --build=binary --no-sign
+          control_dir=$(mktemp -d)
+          for package in infiniswap-dkms infiniswap-provider infiniswapctl; do
+            artifact=$(find .. -maxdepth 1 -type f -name "${package}_*.deb" -print -quit)
+            test -n "$artifact"
+            dpkg-deb --info "$artifact" >/dev/null
+            package_control="$control_dir/$package"
+            mkdir -p "$package_control"
+            dpkg-deb --control "$artifact" "$package_control"
+            if grep -ERn '\b(swapon|mkswap)\b|swapoff[[:space:]]+-a' "$package_control"; then
+              echo "package maintainer script mutates swap" >&2
+              exit 1
+            fi
+          done
+          dkms_artifact=$(find .. -maxdepth 1 -type f -name 'infiniswap-dkms_*.deb' -print -quit)
+          dkms_root=$(mktemp -d)
+          dpkg-deb --extract "$dkms_artifact" "$dkms_root"
+          source_root=$(find "$dkms_root/usr/src" -mindepth 1 -maxdepth 1 \
+            -type d -name 'infiniswap-*' ! -name '*#MODULE_VERSION#*' -print -quit)
+          test -f "$source_root/dkms.conf"
+          test -f "$source_root/infiniswap_bd/Makefile"
+          ! find "$dkms_root/usr/src" -name '*#MODULE_VERSION#*' -print -quit | grep -q .
+
       - name: Test VM harness contracts
         run: |
           python3 -m unittest discover -s tests/vm -p 'test_*.py' -v
@@ -131,6 +168,9 @@ jobs:
           bash -n infiniswap_bd/tests/local-backing-test.sh
           bash -n infiniswap_bd/tests/remote-backed-test.sh
           bash -n infiniswap_bd/tests/remote-only-test.sh
+          bash -n tests/package/run
+          bash -n infiniswap_bd/scripts/dkms-preflight.sh
+          bash -n infiniswap_bd/scripts/dkms-sign-module.sh
           bash -n setup/infiniswap_bd_setup.sh
           bash -n setup/infiniswap_bd_teardown.sh
           bash -n setup/install.sh

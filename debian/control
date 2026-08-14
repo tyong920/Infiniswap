@@ -1,0 +1,42 @@
+Source: infiniswap
+Section: admin
+Priority: optional
+Maintainer: tyong920 <tyong920@gmail.com>
+Build-Depends:
+ cmake,
+ debhelper-compat (= 13),
+ dh-sequence-dkms,
+ libibverbs-dev,
+ librdmacm-dev,
+ libssl-dev,
+ pkg-config
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/tyong920/Infiniswap
+
+Package: infiniswap-dkms
+Architecture: all
+Depends: dkms (>= 2.8.7), kmod, ${misc:Depends}
+Recommends: linux-headers-generic
+Description: Infiniswap Memory Consumer kernel module source
+ Versioned DKMS source for the Infiniswap Memory Consumer. The package builds
+ only for the supported Ubuntu Linux 5.15 and 6.8 GA kernel lines and supports
+ optional operator-provided module-signing keys.
+
+Package: infiniswap-provider
+Architecture: any
+Depends: rdma-core, ${misc:Depends}, ${shlibs:Depends}
+Recommends: infiniswapctl (= ${source:Version})
+Description: Infiniswap Memory Provider daemon
+ RDMA Memory Provider daemon, hardened systemd unit, default settings, metrics
+ and alert integration, and operator documentation. Installation does not start
+ the daemon until explicit Provider configuration is present.
+
+Package: infiniswapctl
+Architecture: all
+Depends: kmod, python3 (>= 3.8), util-linux, ${misc:Depends}
+Recommends: infiniswap-dkms (= ${source:Version})
+Description: Infiniswap administration and release tooling
+ Administration commands, versioned JSON schemas, configuration migration,
+ capacity-aware Consumer upgrade preparation, Provider rolling upgrades, and
+ explicit rollback support. Package actions never create or enable swap.

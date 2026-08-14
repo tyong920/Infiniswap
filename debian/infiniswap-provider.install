@@ -1,0 +1,4 @@
+usr/sbin/infiniswap-daemon
+usr/share/infiniswap/monitoring/infiniswap-alerts.yml
+usr/share/infiniswap/provider-memory.example.conf
+usr/share/infiniswap/consumers.example.conf

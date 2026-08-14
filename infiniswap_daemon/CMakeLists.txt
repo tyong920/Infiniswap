@@ -123,7 +123,10 @@ install(
     ${CMAKE_CURRENT_SOURCE_DIR}/../config/status-v4.schema.json
     ${CMAKE_CURRENT_SOURCE_DIR}/../config/status-v5.schema.json
     ${CMAKE_CURRENT_SOURCE_DIR}/../config/provider-status.schema.json
+    ${CMAKE_CURRENT_SOURCE_DIR}/../config/kernel-abi-evidence.schema.json
+    ${CMAKE_CURRENT_SOURCE_DIR}/../config/kernel-abi-evidence.example.json
     ${CMAKE_CURRENT_SOURCE_DIR}/../config/provider-memory.example.conf
+    ${CMAKE_CURRENT_SOURCE_DIR}/../config/consumers.example.conf
   DESTINATION share/infiniswap)
 
 if(BUILD_TESTING)

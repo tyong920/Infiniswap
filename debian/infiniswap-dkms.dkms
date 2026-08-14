@@ -1,0 +1,12 @@
+PACKAGE_NAME="infiniswap"
+PACKAGE_VERSION="#MODULE_VERSION#"
+AUTOINSTALL="yes"
+
+BUILT_MODULE_NAME[0]="infiniswap"
+BUILT_MODULE_LOCATION[0]="infiniswap_bd"
+DEST_MODULE_LOCATION[0]="/updates/dkms"
+
+PRE_BUILD="infiniswap_bd/scripts/dkms-preflight.sh"
+MAKE[0]="make -C infiniswap_bd KDIR=${kernel_source_dir} modules"
+CLEAN="make -C infiniswap_bd KDIR=${kernel_source_dir} clean"
+POST_BUILD="infiniswap_bd/scripts/dkms-sign-module.sh"

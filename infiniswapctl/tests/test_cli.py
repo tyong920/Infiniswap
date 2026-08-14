@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import stat
@@ -35,6 +36,18 @@ class FakeSystem:
             ),
         }
         self.rdma_rails = {("mlx5_ib2", 1): 0}
+        self.memory_available_bytes = 4 * GIB
+        self.swap_usage_bytes = {}
+        self.alternate_swap_free_bytes = 4 * GIB
+        self.release_states = {}
+        self.package_versions = {
+            "infiniswap-dkms": "0.1.0",
+            "infiniswap-provider": "0.1.0",
+            "infiniswapctl": "0.1.0",
+        }
+        self.package_files = set()
+        self.package_infos = {}
+        self.provider_health_results = []
         self.secrets = {
             "/etc/infiniswap/keys/provider-a.psk": b"p" * 32,
             "/etc/infiniswap/keys/consumer-a.psk": b"c" * 32,
@@ -124,6 +137,64 @@ class FakeSystem:
             self.swap[path] = int(command[2])
         elif command[0] == "swapoff":
             self.swap.pop(path, None)
+
+    def drain_capacity(self, path):
+        return (
+            self.swap_usage_bytes.get(path, 0),
+            self.memory_available_bytes,
+            self.alternate_swap_free_bytes,
+        )
+
+    def file_sha256(self, path):
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    def installed_package_versions(self, packages):
+        return {name: self.package_versions.get(name) for name in packages}
+
+    def write_release_state(self, path, document):
+        if path in self.release_states:
+            raise OSError("release state already exists")
+        self.mutations.append(("write_release_state", path))
+        self.release_states[path] = json.loads(json.dumps(document))
+
+    def read_release_state(self, path):
+        return json.loads(json.dumps(self.release_states[path]))
+
+    def unload_module(self, name):
+        self.mutations.append(("unload_module", name))
+
+    def is_package_file(self, path):
+        return path in self.package_files
+
+    def package_artifact_info(self, path):
+        return self.package_infos[path]
+
+    def package_version_is_newer(self, candidate, installed):
+        def parts(value):
+            return tuple(int(part) for part in value.split(".") if part.isdigit())
+
+        return parts(candidate) > parts(installed)
+
+    def install_packages(self, paths, allow_downgrades):
+        self.mutations.append(
+            ("install_packages", tuple(paths), bool(allow_downgrades))
+        )
+
+    def restart_provider(self):
+        self.mutations.append(("restart_provider",))
+
+    def provider_is_healthy(self, endpoint):
+        if self.provider_health_results:
+            return self.provider_health_results.pop(0)
+        return self.endpoint_responses.get((endpoint, "/healthz")) == "healthy\n"
+
+    def verify_device_drained(self, name):
+        if (
+            self.attributes[name].get("state") != "drain"
+            or self.attributes[name].get("inflight_io", "0") != "0"
+        ):
+            raise OSError("in-flight I/O remains after drain")
+        self.attributes[name]["state"] = "drained"
 
 
 class AuditLogContractTest(unittest.TestCase):
@@ -263,6 +334,359 @@ class CliValidationTest(unittest.TestCase):
             stderr=stderr,
         )
         return result, stdout.getvalue(), stderr.getvalue(), system
+
+    def test_migrate_consumer_emits_current_schema_without_mutation(self):
+        path = self.write_consumer()
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["schema_version"] = 1
+        del document["device"]["hot_range"]
+        path.write_text(json.dumps(document), encoding="utf-8")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        system = FakeSystem()
+
+        result = run(
+            ["migrate", "consumer", "--config", str(path)],
+            system=system,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+        migrated = json.loads(stdout.getvalue())
+        self.assertEqual((result, stderr.getvalue()), (0, ""))
+        self.assertEqual(migrated["schema_version"], 3)
+        self.assertFalse(migrated["identity"]["remote_only_eligible"])
+        self.assertEqual(migrated["device"]["hot_range"]["mapping_threshold"], 8)
+        self.assertEqual(system.mutations, [])
+
+    def test_upgrade_prepare_refuses_insufficient_drain_capacity(self):
+        path = self.write_consumer()
+        system = FakeSystem()
+        system.groups.add("infiniswap0")
+        system.attributes["infiniswap0"] = {"state": "active", "mode": "backed"}
+        system.swap["/dev/infiniswap0"] = 100
+        system.swap_usage_bytes["/dev/infiniswap0"] = 3 * GIB
+        system.memory_available_bytes = 2 * GIB
+        system.alternate_swap_free_bytes = GIB
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        result = run(
+            [
+                "upgrade",
+                "prepare",
+                "infiniswap0",
+                "--config",
+                str(path),
+                "--state-file",
+                str(self.directory / "upgrade.json"),
+                "--reserve-mib",
+                "1024",
+                "--yes",
+            ],
+            system=system,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+        self.assertEqual(result, 2)
+        self.assertIn("insufficient RAM and alternate swap", stderr.getvalue())
+        self.assertIn("shortfall: 1073741824 bytes", stderr.getvalue())
+        self.assertEqual(system.mutations, [])
+        self.assertIn("/dev/infiniswap0", system.swap)
+
+    def test_upgrade_prepare_drains_only_the_named_device_and_unloads_module(self):
+        path = self.write_consumer()
+        state_path = str(self.directory / "upgrade.json")
+        system = FakeSystem()
+        system.groups.add("infiniswap0")
+        system.attributes["infiniswap0"] = {"state": "active", "mode": "backed"}
+        system.swap["/dev/infiniswap0"] = 100
+        system.swap_usage_bytes["/dev/infiniswap0"] = 2 * GIB
+        system.memory_available_bytes = 3 * GIB
+        system.alternate_swap_free_bytes = 0
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        result = run(
+            [
+                "upgrade",
+                "prepare",
+                "infiniswap0",
+                "--config",
+                str(path),
+                "--state-file",
+                state_path,
+                "--reserve-mib",
+                "1024",
+                "--yes",
+            ],
+            system=system,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+        self.assertEqual((result, stderr.getvalue()), (0, ""))
+        self.assertNotIn("infiniswap0", system.groups)
+        self.assertEqual(system.swap, {"/dev/nvme0n1p2": -2})
+        self.assertEqual(
+            system.mutations,
+            [
+                ("write_release_state", state_path),
+                ("run_host_command", ("swapoff", "/dev/infiniswap0")),
+                ("write_attribute", "infiniswap0", "state", "drain"),
+                ("write_attribute", "infiniswap0", "state", "stop"),
+                ("remove_group", "infiniswap0"),
+                ("unload_module", "infiniswap"),
+            ],
+        )
+        self.assertTrue(system.release_states[state_path]["swap"]["was_enabled"])
+
+    def test_upgrade_prepare_never_unloads_before_zero_inflight_drain(self):
+        path = self.write_consumer()
+        state_path = str(self.directory / "upgrade.json")
+        system = FakeSystem()
+        system.groups.add("infiniswap0")
+        system.attributes["infiniswap0"] = {
+            "state": "active",
+            "mode": "backed",
+            "inflight_io": "1",
+        }
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        result = run(
+            [
+                "upgrade",
+                "prepare",
+                "infiniswap0",
+                "--config",
+                str(path),
+                "--state-file",
+                state_path,
+                "--yes",
+            ],
+            system=system,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+        self.assertEqual(result, 1)
+        self.assertIn("in-flight I/O remains", stderr.getvalue())
+        self.assertIn("infiniswap0", system.groups)
+        self.assertEqual(
+            system.mutations,
+            [
+                ("write_release_state", state_path),
+                ("write_attribute", "infiniswap0", "state", "drain"),
+            ],
+        )
+
+    def test_upgrade_restore_recreates_device_but_never_enables_swap(self):
+        path = self.write_consumer()
+        state_path = str(self.directory / "upgrade.json")
+        system = FakeSystem()
+        system.release_states[state_path] = {
+            "schema_version": 1,
+            "kind": "infiniswap.consumer-upgrade",
+            "device": "infiniswap0",
+            "mode": "backed",
+            "config_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "swap": {"was_enabled": True, "priority": 100},
+            "packages": system.package_versions,
+        }
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        result = run(
+            [
+                "upgrade",
+                "restore",
+                "infiniswap0",
+                "--config",
+                str(path),
+                "--state-file",
+                state_path,
+            ],
+            system=system,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+        self.assertEqual((result, stderr.getvalue()), (0, ""))
+        self.assertIn("remains disabled", stdout.getvalue())
+        host_commands = [
+            item for item in system.mutations if item[0] == "run_host_command"
+        ]
+        self.assertEqual(host_commands, [])
+        self.assertEqual(system.swap, {"/dev/nvme0n1p2": -2})
+        self.assertIn("infiniswap0", system.groups)
+
+    def test_upgrade_rollback_installs_explicit_previous_artifacts_and_restores(self):
+        path = self.write_consumer()
+        state_path = str(self.directory / "upgrade.json")
+        old_dkms = str(self.directory / "infiniswap-dkms_0.1.0_all.deb")
+        old_ctl = str(self.directory / "infiniswapctl_0.1.0_all.deb")
+        system = FakeSystem()
+        system.package_files.update((old_dkms, old_ctl))
+        system.package_infos.update(
+            {
+                old_dkms: ("infiniswap-dkms", "0.1.0"),
+                old_ctl: ("infiniswapctl", "0.1.0"),
+            }
+        )
+        previous_packages = dict(system.package_versions)
+        previous_packages["infiniswap-provider"] = None
+        system.release_states[state_path] = {
+            "schema_version": 1,
+            "kind": "infiniswap.consumer-upgrade",
+            "device": "infiniswap0",
+            "mode": "backed",
+            "config_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "swap": {"was_enabled": True, "priority": 100},
+            "packages": previous_packages,
+        }
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        result = run(
+            [
+                "upgrade",
+                "rollback",
+                "infiniswap0",
+                "--config",
+                str(path),
+                "--state-file",
+                state_path,
+                "--package",
+                old_dkms,
+                "--package",
+                old_ctl,
+                "--yes",
+            ],
+            system=system,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+        self.assertEqual((result, stderr.getvalue()), (0, ""))
+        self.assertEqual(
+            system.mutations[0],
+            ("install_packages", (old_dkms, old_ctl), True),
+        )
+        self.assertIn("infiniswap0", system.groups)
+        self.assertEqual(system.swap, {"/dev/nvme0n1p2": -2})
+        self.assertIn("explicit enable", stdout.getvalue())
+
+    def test_upgrade_rollback_rejects_incomplete_or_wrong_previous_artifacts(self):
+        path = self.write_consumer()
+        state_path = str(self.directory / "upgrade.json")
+        old_ctl = str(self.directory / "infiniswapctl_0.0.9_all.deb")
+        system = FakeSystem()
+        system.package_files.add(old_ctl)
+        system.package_infos[old_ctl] = ("infiniswapctl", "0.0.9")
+        system.release_states[state_path] = {
+            "schema_version": 1,
+            "kind": "infiniswap.consumer-upgrade",
+            "device": "infiniswap0",
+            "mode": "backed",
+            "config_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "swap": {"was_enabled": True, "priority": 100},
+            "packages": {
+                "infiniswap-dkms": "0.1.0",
+                "infiniswap-provider": None,
+                "infiniswapctl": "0.1.0",
+            },
+        }
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        result = run(
+            [
+                "upgrade",
+                "rollback",
+                "infiniswap0",
+                "--config",
+                str(path),
+                "--state-file",
+                state_path,
+                "--package",
+                old_ctl,
+                "--yes",
+            ],
+            system=system,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+        self.assertEqual(result, 2)
+        self.assertIn("captured previous package set", stderr.getvalue())
+        self.assertEqual(system.mutations, [])
+
+    def test_provider_upgrade_rejects_remote_only_and_rolls_back_failed_health(self):
+        target = str(self.directory / "infiniswap-provider_0.2.0_amd64.deb")
+        rollback = str(self.directory / "infiniswap-provider_0.1.0_amd64.deb")
+        system = FakeSystem()
+        system.package_files.update((target, rollback))
+        system.package_infos.update(
+            {
+                target: ("infiniswap-provider", "0.2.0"),
+                rollback: ("infiniswap-provider", "0.1.0"),
+            }
+        )
+        system.provider_health_results.extend((False, True))
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        result = run(
+            [
+                "upgrade",
+                "provider",
+                "--consumer-mode",
+                "remote-only",
+                "--target-package",
+                target,
+                "--rollback-package",
+                rollback,
+                "--yes",
+            ],
+            system=system,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        self.assertEqual(result, 2)
+        self.assertIn("stop and recreate", stderr.getvalue())
+        self.assertEqual(system.mutations, [])
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        result = run(
+            [
+                "upgrade",
+                "provider",
+                "--consumer-mode",
+                "backed",
+                "--target-package",
+                target,
+                "--rollback-package",
+                rollback,
+                "--yes",
+            ],
+            system=system,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        self.assertEqual(result, 1)
+        self.assertIn("failed health check", stderr.getvalue())
+        self.assertEqual(
+            system.mutations,
+            [
+                ("install_packages", (target,), False),
+                ("restart_provider",),
+                ("install_packages", (rollback,), True),
+                ("restart_provider",),
+            ],
+        )
 
     def test_version_one_consumer_config_keeps_legacy_hot_range_defaults(self):
         path = self.write_consumer()

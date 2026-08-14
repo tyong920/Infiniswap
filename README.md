@@ -37,6 +37,22 @@ sudo apt-get install -y \
   linux-headers-generic
 ```
 
+## Debian Packages and Safe Upgrades
+
+Builds produce separate `infiniswap-dkms`, `infiniswap-provider`, and
+`infiniswapctl` Debian packages. The Provider unit is installed disabled and
+stopped; no package action creates an Infiniswap Device, formats storage,
+activates swap, or modifies unrelated swap. DKMS supports the validated Linux
+5.15 and 6.8 GA lines and offers an optional operator-key signing hook.
+
+Consumer upgrades use capacity-aware `infiniswapctl upgrade preflight` before
+the named swap is disabled and drained. Provider rolling upgrades are
+Provider-first for Backed Mode and are rejected for Remote-Only Mode until the
+device is stopped and recreated. Configuration migration and rollback are
+explicit, artifact-backed operations. See `docs/packaging.md` for package build,
+fresh install, upgrade, downgrade, purge/reinstall, signing, and kernel-ABI gate
+procedures.
+
 ## Build the Memory Provider
 
 CMake obtains `libibverbs`, `librdmacm`, and `libcrypto` through `pkg-config`.

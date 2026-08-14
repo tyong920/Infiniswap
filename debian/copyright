@@ -1,0 +1,26 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Infiniswap
+Source: https://github.com/tyong920/Infiniswap
+
+Files: *
+Copyright: 2017 University of Michigan, Ann Arbor
+           2026 Infiniswap contributors
+License: GPL-2
+ This program is free software; you can redistribute it and/or modify it under
+ the terms of version 2 of the GNU General Public License as published by the
+ Free Software Foundation.
+ .
+ On Debian systems, the complete text of the GNU General Public License version
+ 2 is available in /usr/share/common-licenses/GPL-2.
+
+Files: common/infiniswap_protocol.* common/infiniswap_placement.*
+       infiniswap_bd/is_io_policy.h infiniswap_daemon/infiniswap_auth.*
+       infiniswap_daemon/infiniswap_consumer_liveness.*
+       infiniswap_daemon/infiniswap_memory_manager.*
+       infiniswap_daemon/infiniswap_observability.*
+       infiniswap_daemon/infiniswap_observability_server.*
+       infiniswap_daemon/infiniswap_provider_session.*
+Copyright: 2026 Infiniswap contributors
+License: GPL-2 or BSD-3-Clause
+ These files may be redistributed under either version 2 of the GNU General
+ Public License or the 3-clause BSD license, as identified by their SPDX tags.

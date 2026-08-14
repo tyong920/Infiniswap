@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail() {
+  echo "package lifecycle test: $*" >&2
+  exit 1
+}
+
+[[ ${INFINISWAP_PACKAGE_TEST_DESTRUCTIVE:-} == yes ]] ||
+  fail "set INFINISWAP_PACKAGE_TEST_DESTRUCTIVE=yes on a disposable Ubuntu host"
+[[ $(id -u) -eq 0 ]] || fail "run as root"
+[[ -r /etc/os-release ]] || fail "cannot identify the test host"
+# shellcheck disable=SC1091
+source /etc/os-release
+case ${VERSION_ID:-}:$(uname -r) in
+  22.04:5.15.*|24.04:6.8.*) ;;
+  *) fail "requires Ubuntu 22.04/Linux 5.15 or Ubuntu 24.04/Linux 6.8" ;;
+esac
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd -- "$script_dir/../.." && pwd)
+work=$(mktemp -d)
+old_source=$work/old/source
+new_source=$work/new/source
+old_artifacts=$work/old
+new_artifacts=$work/new
+swap_before=$work/swaps.before
+installed=0
+
+cleanup() {
+  if (( installed )); then
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y \
+      infiniswap-dkms infiniswap-provider infiniswapctl >/dev/null 2>&1 || true
+  fi
+  rm -rf "$work"
+}
+trap cleanup EXIT
+
+for package in infiniswap-dkms infiniswap-provider infiniswapctl; do
+  dpkg-query -W "$package" >/dev/null 2>&1 &&
+    fail "$package is already installed; use a disposable host"
+done
+cp /proc/swaps "$swap_before"
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends \
+  build-essential cmake debhelper devscripts dh-dkms dkms kmod pkg-config \
+  libibverbs-dev librdmacm-dev libssl-dev rdma-core \
+  "linux-headers-$(uname -r)"
+
+copy_current_source() {
+  local destination=$1
+  mkdir -p "$destination"
+  git -c safe.directory="$repo_root" -C "$repo_root" \
+    ls-files --cached --others --exclude-standard -z |
+    tar -C "$repo_root" --null -T - -cf - |
+    tar -C "$destination" -xf -
+}
+
+copy_previous_source() {
+  local destination=$1
+  local previous_ref=$2
+  mkdir -p "$destination"
+  git -c safe.directory="$repo_root" -C "$repo_root" \
+    archive --format=tar "$previous_ref" |
+    tar -C "$destination" -xf -
+  [[ -f $destination/debian/control ]] ||
+    fail "previous ref $previous_ref does not contain Debian packaging"
+}
+
+build_packages() {
+  local source=$1
+  (cd "$source" && dpkg-buildpackage --build=binary --no-sign)
+}
+
+package_path() {
+  local directory=$1
+  local package=$2
+  find "$directory" -maxdepth 1 -type f -name "${package}_*.deb" -print -quit
+}
+
+assert_swap_unchanged() {
+  cmp -s "$swap_before" /proc/swaps ||
+    fail "a package action modified host swap"
+}
+
+previous_ref=${INFINISWAP_PACKAGE_TEST_PREVIOUS_REF:-}
+if [[ -n $previous_ref ]]; then
+  copy_previous_source "$old_source" "$previous_ref"
+  previous_release=$previous_ref
+else
+  copy_current_source "$old_source"
+  sed -i '1s/([^)]*)/(0.0.9)/' "$old_source/debian/changelog"
+  previous_release=synthetic-bootstrap
+fi
+build_packages "$old_source"
+copy_current_source "$new_source"
+build_packages "$new_source"
+
+old_dkms=$(package_path "$old_artifacts" infiniswap-dkms)
+old_provider=$(package_path "$old_artifacts" infiniswap-provider)
+old_ctl=$(package_path "$old_artifacts" infiniswapctl)
+new_dkms=$(package_path "$new_artifacts" infiniswap-dkms)
+new_provider=$(package_path "$new_artifacts" infiniswap-provider)
+new_ctl=$(package_path "$new_artifacts" infiniswapctl)
+for artifact in "$old_dkms" "$old_provider" "$old_ctl" \
+  "$new_dkms" "$new_provider" "$new_ctl"; do
+  [[ -n $artifact && -f $artifact ]] || fail "missing package artifact"
+done
+old_version=$(dpkg-deb --field "$old_ctl" Version)
+new_version=$(dpkg-deb --field "$new_ctl" Version)
+dpkg --compare-versions "$old_version" lt "$new_version" ||
+  fail "previous package version $old_version is not older than $new_version"
+
+# Fresh install includes a real DKMS build for the running supported ABI.
+installed=1
+apt-get -o Dpkg::Options::=--force-confold install -y \
+  "$old_dkms" "$old_provider" "$old_ctl"
+dkms status infiniswap | grep -F "$(uname -r)" | grep -Eq 'installed|built' ||
+  fail "DKMS did not build for $(uname -r)"
+systemctl is-enabled --quiet infiniswap-provider.service &&
+  fail "Provider service was enabled implicitly"
+systemctl is-active --quiet infiniswap-provider.service &&
+  fail "Provider service was started implicitly"
+assert_swap_unchanged
+
+printf '\n# lifecycle-preservation-marker\n' >>/etc/default/infiniswap-provider
+apt-get -o Dpkg::Options::=--force-confold install -y \
+  "$new_dkms" "$new_provider" "$new_ctl"
+grep -q lifecycle-preservation-marker /etc/default/infiniswap-provider ||
+  fail "upgrade replaced Provider configuration"
+assert_swap_unchanged
+
+apt-get -o Dpkg::Options::=--force-confold install -y --allow-downgrades \
+  "$old_dkms" "$old_provider" "$old_ctl"
+grep -q lifecycle-preservation-marker /etc/default/infiniswap-provider ||
+  fail "downgrade replaced Provider configuration"
+assert_swap_unchanged
+
+apt-get purge -y infiniswap-dkms infiniswap-provider infiniswapctl
+installed=0
+assert_swap_unchanged
+
+installed=1
+apt-get -o Dpkg::Options::=--force-confold install -y \
+  "$new_dkms" "$new_provider" "$new_ctl"
+dkms status infiniswap | grep -F "$(uname -r)" | grep -Eq 'installed|built' ||
+  fail "DKMS did not build after reinstall"
+systemctl is-active --quiet infiniswap-provider.service &&
+  fail "Provider service was started on reinstall"
+assert_swap_unchanged
+
+rdma_stack=${INFINISWAP_PACKAGE_TEST_RDMA_STACK:-inbox}
+case $rdma_stack in
+  inbox|mlnx-ofed-5.8) ;;
+  *) fail "INFINISWAP_PACKAGE_TEST_RDMA_STACK must be inbox or mlnx-ofed-5.8" ;;
+esac
+report_path=${INFINISWAP_PACKAGE_TEST_REPORT:-$repo_root/results/package/dkms-report.json}
+mkdir -p "$(dirname -- "$report_path")"
+python3 - "$report_path" \
+  "$(git -c safe.directory="$repo_root" -C "$repo_root" rev-parse HEAD)" \
+  "$VERSION_ID" "$(uname -r)" "$rdma_stack" "$previous_release" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path, commit, ubuntu, kernel, rdma_stack, previous_release = sys.argv[1:]
+report = {
+    "schema_version": 1,
+    "kind": "infiniswap.dkms-report",
+    "status": "passed",
+    "source_commit": commit,
+    "ubuntu_release": ubuntu,
+    "kernel_release": kernel,
+    "rdma_stack": rdma_stack,
+    "previous_release": previous_release,
+}
+Path(path).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+PY
+
+echo "package lifecycle test passed for Ubuntu $VERSION_ID / $(uname -r)"
+echo "DKMS evidence: $report_path"

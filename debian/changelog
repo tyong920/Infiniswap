@@ -1,0 +1,5 @@
+infiniswap (0.1.0) unstable; urgency=medium
+
+  * Add versioned DKMS, Provider, and administration packages.
+
+ -- tyong920 <tyong920@gmail.com>  Fri, 14 Aug 2026 16:58:56 +0800
