@@ -171,7 +171,8 @@ if(BUILD_TESTING)
 
   add_executable(provider-observability-test tests/provider_observability_test.c)
   target_compile_options(
-    provider-observability-test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    provider-observability-test
+    PRIVATE -Wall -Wextra -Wpedantic -Werror -UNDEBUG)
   target_link_libraries(
     provider-observability-test PRIVATE infiniswap-observability)
   add_test(
