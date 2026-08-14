@@ -46,6 +46,14 @@ class DebianPackageContractTest(unittest.TestCase):
             self.read("debian/module-signing.conf"), r"BEGIN .*PRIVATE KEY"
         )
 
+    def test_ubuntu_2204_uses_dkms_package_for_debhelper_addon(self):
+        for path in (
+            ".github/workflows/build.yml",
+            "tests/package/run",
+            "docs/packaging.md",
+        ):
+            self.assertNotIn("dh-dkms", self.read(path), path)
+
     def test_package_sources_contain_no_implicit_swap_mutation(self):
         forbidden = re.compile(r"\b(?:swapon|mkswap)\b|swapoff\s+-a")
         for path in (ROOT / "debian").rglob("*"):

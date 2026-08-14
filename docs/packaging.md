@@ -9,7 +9,7 @@ The source builds three version-locked Debian packages:
 Build binary packages on Ubuntu 22.04 or 24.04:
 
 ```bash
-sudo apt-get install -y build-essential devscripts debhelper dh-dkms dkms \
+sudo apt-get install -y build-essential devscripts debhelper dkms \
   cmake pkg-config libibverbs-dev librdmacm-dev libssl-dev
 
 dpkg-buildpackage --build=binary --no-sign

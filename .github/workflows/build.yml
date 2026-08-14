@@ -30,7 +30,6 @@ jobs:
             build-essential \
             cmake \
             debhelper \
-            dh-dkms \
             dkms \
             ninja-build \
             pkg-config \
