@@ -29,6 +29,22 @@ PROFILES = {
     "large": Resources(vcpus=16, memory_gib=128, disk_gib=160),
 }
 
+DEFAULT_SCENARIOS = (
+    "build-deploy",
+    "fio-verification",
+    "swap-pressure",
+    "normal-shutdown",
+    "provider-process-kill",
+    "network-interruption",
+    "backing-store-error",
+    "guest-reboot",
+    "safe-module-reload",
+    "resource-leak-check",
+    "soak",
+)
+SCENARIO_PREREQUISITES = {"fio-verification": ("build-deploy",)}
+CLEANUP_SCENARIO = "resource-leak-check"
+
 REQUIRED_HOST_COMMANDS = (
     "cloud-localds",
     "git",
@@ -132,6 +148,12 @@ def _parser() -> argparse.ArgumentParser:
         "--kernel", choices=("all", "5.15", "6.8"), default="all"
     )
     parser.add_argument("--topology", choices=("all", "2", "3"), default="all")
+    parser.add_argument(
+        "--scenario",
+        choices=("all", "fio-verification"),
+        default="all",
+        help="run the default certifiable plan or focused fio evidence",
+    )
     parser.add_argument("--soak-hours", type=float, default=24.0)
     parser.add_argument("--artifacts", type=Path, default=_default_artifacts())
     parser.add_argument(
@@ -289,6 +311,22 @@ def _guest_plan(topology: int, requested: Resources):
     return guests
 
 
+def _selected_scenarios(selection: str):
+    if selection == "all":
+        return DEFAULT_SCENARIOS
+    scenarios = []
+
+    def include(scenario_id: str) -> None:
+        for prerequisite in SCENARIO_PREREQUISITES.get(scenario_id, ()):
+            include(prerequisite)
+        if scenario_id not in scenarios:
+            scenarios.append(scenario_id)
+
+    include(selection)
+    include(CLEANUP_SCENARIO)
+    return tuple(scenarios)
+
+
 def _planned_matrix(args, requested: Resources):
     kernels = {
         "5.15": "22.04",
@@ -296,19 +334,7 @@ def _planned_matrix(args, requested: Resources):
     }
     selected_kernels = kernels if args.kernel == "all" else {args.kernel: kernels[args.kernel]}
     topologies = (2, 3) if args.topology == "all" else (int(args.topology),)
-    scenario_ids = (
-        "build-deploy",
-        "fio-verification",
-        "swap-pressure",
-        "normal-shutdown",
-        "provider-process-kill",
-        "network-interruption",
-        "backing-store-error",
-        "guest-reboot",
-        "safe-module-reload",
-        "resource-leak-check",
-        "soak",
-    )
+    scenario_ids = _selected_scenarios(args.scenario)
     matrix = []
     for kernel, ubuntu in selected_kernels.items():
         for topology in topologies:
@@ -576,7 +602,11 @@ def main(
             "name": profile_name,
             "limits": asdict(limit),
             "requested": asdict(requested),
-            "certifiable": requested == limit and args.soak_hours >= 24.0,
+            "certifiable": (
+                requested == limit
+                and args.soak_hours >= 24.0
+                and args.scenario == "all"
+            ),
         },
         "selection": {
             "kernel": args.kernel,
@@ -586,11 +616,19 @@ def main(
         "preflight": {"status": preflight_status, "checks": checks},
         "matrix": _planned_matrix(args, requested),
     }
+    if args.scenario != "all":
+        report["selection"]["scenario"] = args.scenario
+        report["certification"] = {
+            "status": "non-certifiable",
+            "reason": "focused Soft-RoCE performance evidence",
+        }
     _persist_report(args.artifacts, report)
     if preflight_status == "passed" and not args.preflight_only:
         if backend is None:
             from qemu_backend import QemuBackend
 
+            args.source_commit = report["source_commit"]
+            args.host_identity = platform.node()
             backend = QemuBackend(args, Path(__file__).resolve().parents[2])
         result = _run_matrix(args, report, environment, initial_facts, backend)
     else:
@@ -602,9 +640,20 @@ def main(
         failed = [check["detail"] for check in checks if check["status"] == "failed"]
         stderr.write("preflight failed: %s\n" % "; ".join(failed))
     elif args.preflight_only:
-        stdout.write("preflight passed\n")
+        if args.scenario == "all":
+            stdout.write("preflight passed\n")
+        else:
+            stdout.write("preflight passed; NON-CERTIFIABLE focused evidence\n")
     else:
-        stdout.write("validation %s; report: %s\n" % (report["status"], args.artifacts / "report.json"))
+        prefix = (
+            "NON-CERTIFIABLE focused validation"
+            if args.scenario != "all"
+            else "validation"
+        )
+        stdout.write(
+            "%s %s; report: %s\n"
+            % (prefix, report["status"], args.artifacts / "report.json")
+        )
     return result
 
 

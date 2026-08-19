@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import secrets
 import shlex
@@ -653,8 +654,11 @@ class QemuBackend:
         capacity_gib: Optional[int] = None,
         policy: str = "strict",
         backing: str = "/dev/vdb",
+        wait_for_connection: bool = True,
     ) -> None:
         specs = self._provider_specs(handle, provider_indices)
+        if not wait_for_connection:
+            specs.insert(0, "--allow-not-connected")
         if capacity_gib is None:
             capacity_gib = len(specs) if mode == "remote-only" else 2
         self._helper(
@@ -731,7 +735,11 @@ class QemuBackend:
         )
         try:
             self._create_device(
-                handle, "backed", provider_indices=(0,), capacity_gib=1
+                handle,
+                "backed",
+                provider_indices=(0,),
+                capacity_gib=1,
+                wait_for_connection=False,
             )
             self._helper(
                 handle,
@@ -784,6 +792,9 @@ class QemuBackend:
         )
 
     def _scenario_fio(self, handle):
+        if getattr(getattr(self, "args", None), "scenario", "all") == "fio-verification":
+            return self._scenario_focused_fio(handle)
+
         provider_count = len(handle.providers)
         self._create_device(handle, "backed")
         self._helper(
@@ -835,6 +846,148 @@ class QemuBackend:
                 "guest:consumer:fio-remote-only.json",
             ),
             metrics={"providers": provider_count},
+        )
+
+    def _scenario_focused_fio(self, handle):
+        performance_dir = handle.case_dir / "performance"
+        performance_dir.mkdir(parents=True, exist_ok=True)
+        artifact_paths = []
+        evidence = {}
+        provider_count = len(handle.providers)
+
+        for mode in ("backed", "remote-only"):
+            capacity_gib = provider_count if mode == "remote-only" else None
+            self._create_device(handle, mode, capacity_gib=capacity_gib)
+            try:
+                self._helper(
+                    handle,
+                    handle.consumer,
+                    "performance-heat-%s" % mode,
+                    "heat-ranges",
+                    str(provider_count),
+                    timeout=180,
+                )
+                if mode == "remote-only":
+                    self._helper(
+                        handle,
+                        handle.consumer,
+                        "performance-heartbeat-remote-only",
+                        "verify-remote-only-heartbeats",
+                        "5",
+                        timeout=30,
+                    )
+                warmup_io_errors = None
+                for phase, count in (("warmup", 1), ("measured", 5)):
+                    for sample_index in range(count):
+                        label = "performance-%s-%s-%d" % (
+                            mode,
+                            phase,
+                            sample_index + 1,
+                        )
+                        result = self._helper(
+                            handle,
+                            handle.consumer,
+                            label,
+                            "fio-performance",
+                            mode,
+                            phase,
+                            str(sample_index + 1),
+                            "60",
+                            timeout=420,
+                        )
+                        payload = json.loads(result.stdout)
+                        raw_fio = payload["fio"]
+                        verification = payload.get("verification")
+                        fio_documents = [raw_fio]
+                        if verification is not None:
+                            fio_documents.append(verification)
+                        if any(
+                            job.get("error", 0)
+                            for document in fio_documents
+                            for job in document.get("jobs", ())
+                        ):
+                            raise BoundaryError("fio reported an I/O verification error")
+                        envelope = {
+                            "schema_version": 1,
+                            "kind": "infiniswap.soft-roce-fio-sample",
+                            "metadata": {
+                                "source_commit": self.args.source_commit,
+                                "cloud_image_sha256": handle.image_sha256,
+                                "host_identity": self.args.host_identity,
+                                "ubuntu_release": handle.entry["ubuntu"],
+                                "kernel_release": handle.entry["kernel_release"],
+                                "rdma_stack": handle.entry["rdma_stack"],
+                                "topology": handle.entry["topology"],
+                                "vm_resources": handle.entry["resources"],
+                                "guests": handle.entry["guests"],
+                                "mode": mode,
+                                "phase": phase,
+                                "sample_index": sample_index + 1,
+                                "duration_seconds": 60,
+                                "fio_arguments": payload["arguments"],
+                                "fio_verification_arguments": payload.get(
+                                    "verification_arguments", []
+                                ),
+                            },
+                            "fio": raw_fio,
+                            "verification": verification,
+                        }
+                        path = performance_dir / (label + ".json")
+                        path.write_text(
+                            json.dumps(envelope, indent=2, sort_keys=True) + "\n",
+                            encoding="utf-8",
+                        )
+                        artifact_paths.append(
+                            str(path.relative_to(handle.case_dir.parent))
+                        )
+                    if phase == "warmup":
+                        warmup_result = self._helper(
+                            handle,
+                            handle.consumer,
+                            "performance-warmup-evidence-%s" % mode,
+                            "performance-evidence",
+                            mode,
+                        )
+                        warmup_evidence = json.loads(warmup_result.stdout)
+                        if warmup_evidence.get("status") != "passed":
+                            raise BoundaryError(
+                                "%s warmup safety evidence failed" % mode
+                            )
+                        warmup_io_errors = warmup_evidence["io_errors_total"]
+                evidence_result = self._helper(
+                    handle,
+                    handle.consumer,
+                    "performance-evidence-%s" % mode,
+                    "performance-evidence",
+                    mode,
+                )
+                evidence[mode] = json.loads(evidence_result.stdout)
+                evidence[mode]["io_errors_before_measured"] = warmup_io_errors
+                if evidence[mode].get("status") != "passed":
+                    raise BoundaryError("%s performance safety evidence failed" % mode)
+                if evidence[mode]["io_errors_total"] != warmup_io_errors:
+                    raise BoundaryError(
+                        "%s measured samples increased the I/O error counter" % mode
+                    )
+            finally:
+                self._stop_device(handle)
+
+        self._check_kernel(handle)
+        return ScenarioResult(
+            status="passed",
+            detail=(
+                "NON-CERTIFIABLE focused fio completed one warmup and five "
+                "measured 60-second samples per mode"
+            ),
+            artifacts=tuple(artifact_paths),
+            metrics={
+                "providers": provider_count,
+                "non_certifiable": True,
+                "sample_duration_seconds": 60,
+                "warmup_samples_per_mode": 1,
+                "measured_samples_per_mode": 5,
+                "evidence": evidence,
+            },
         )
 
     def _scenario_swap_pressure(self, handle):

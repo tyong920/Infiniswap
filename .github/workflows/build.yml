@@ -152,9 +152,13 @@ jobs:
       - name: Test VM harness contracts
         run: |
           python3 -m unittest discover -s tests/vm -p 'test_*.py' -v
-          python3 -m py_compile tests/vm/infiniswap_vm.py tests/vm/qemu_backend.py
-          bash -n tests/vm/run tests/vm/guest.sh
+          python3 -m py_compile \
+            tests/vm/infiniswap_vm.py \
+            tests/vm/qemu_backend.py \
+            tests/vm/compare_performance.py
+          bash -n tests/vm/run tests/vm/compare tests/vm/guest.sh
           tests/vm/run --help >/dev/null
+          tests/vm/compare --help >/dev/null
 
       - name: Test Memory Consumer completion policy
         run: |

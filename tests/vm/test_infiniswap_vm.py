@@ -19,6 +19,7 @@ import qemu_backend  # noqa: E402
 class ScenarioRecordingBackend(qemu_backend.QemuBackend):
     def __init__(self):
         self.helper_calls = []
+        self.device_calls = []
         self.waited_for_reboot = False
         self.previous_boot_id = None
 
@@ -26,7 +27,7 @@ class ScenarioRecordingBackend(qemu_backend.QemuBackend):
         self.helper_calls.append((label, args, kwargs))
 
     def _create_device(self, *args, **kwargs):
-        pass
+        self.device_calls.append((args, kwargs))
 
     def _stop_device(self, handle):
         pass
@@ -49,6 +50,80 @@ class ScenarioRecordingBackend(qemu_backend.QemuBackend):
         pass
 
 
+class PerformanceRecordingBackend(ScenarioRecordingBackend):
+    def __init__(self):
+        super().__init__()
+        self.args = SimpleNamespace(
+            scenario="fio-verification",
+            source_commit="a" * 40,
+            host_identity="perf-host",
+        )
+
+    def _helper(self, handle, guest, label, *args, **kwargs):
+        self.helper_calls.append((label, args, kwargs))
+        if args[0] == "fio-performance":
+            raw_fio = {
+                "jobs": [
+                    {
+                        "error": 0,
+                        "read": {
+                            "iops": 600.0,
+                            "bw_bytes": 2457600,
+                            "clat_ns": {"percentile": {"99.000000": 1000}},
+                        },
+                        "write": {
+                            "iops": 400.0,
+                            "bw_bytes": 1638400,
+                            "clat_ns": {"percentile": {"99.000000": 1200}},
+                        },
+                        "sys_cpu": 20.0,
+                    }
+                ]
+            }
+            arguments = [
+                "--runtime=60",
+                "--verify=crc32c",
+                "--verify_fatal=1",
+            ]
+            verification_arguments = []
+            verification = None
+            if args[1] == "remote-only":
+                arguments.append("--do_verify=0")
+                verification_arguments = [
+                    "--rw=read",
+                    "--verify=crc32c",
+                    "--verify_only=1",
+                    "--verify_fatal=1",
+                ]
+                verification = raw_fio
+            else:
+                arguments.append("--do_verify=1")
+            return SimpleNamespace(
+                stdout=json.dumps(
+                    {
+                        "arguments": arguments,
+                        "fio": raw_fio,
+                        "verification_arguments": verification_arguments,
+                        "verification": verification,
+                    }
+                )
+            )
+        if args[0] == "performance-evidence":
+            return SimpleNamespace(
+                stdout=json.dumps(
+                    {
+                        "status": "passed",
+                        "provider_timeouts_total": 0,
+                        "late_rdma_completions_total": 0,
+                        "io_errors_total": 0,
+                        "inflight_io": 0,
+                        "oldest_inflight_ms": 0,
+                    }
+                )
+            )
+        return SimpleNamespace(stdout="")
+
+
 class QemuScenarioTest(unittest.TestCase):
     def test_build_deploy_exercises_and_clears_authentication_alert(self):
         backend = ScenarioRecordingBackend()
@@ -68,6 +143,7 @@ class QemuScenarioTest(unittest.TestCase):
         self.assertEqual(result.status, "passed")
         self.assertEqual(result.metrics["kernel_release"], "6.8.0-137-generic")
         self.assertEqual(result.metrics["rdma_stack"], "inbox")
+        self.assertFalse(backend.device_calls[0][1]["wait_for_connection"])
         self.assertEqual(
             calls["alert-auth-failure"],
             (
@@ -146,6 +222,99 @@ class QemuScenarioTest(unittest.TestCase):
             if call[0] == "fio-remote-only"
         )
         self.assertLess(heartbeat_index, fio_index)
+
+    def test_focused_fio_retains_warmups_samples_and_environment_identity(self):
+        backend = PerformanceRecordingBackend()
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = Path(directory)
+            handle = SimpleNamespace(
+                consumer=object(),
+                providers=[object()],
+                image_sha256="image-sha256",
+                case_dir=case_dir,
+                entry={
+                    "kernel": "6.8",
+                    "ubuntu": "24.04",
+                    "topology": 2,
+                    "resources": {"vcpus": 6, "memory_gib": 48, "disk_gib": 100},
+                    "guests": [
+                        {
+                            "name": "consumer",
+                            "role": "consumer",
+                            "vcpus": 3,
+                            "memory_gib": 24,
+                            "root_disk_gib": 48,
+                            "backing_disk_gib": 4,
+                        },
+                        {
+                            "name": "provider-0",
+                            "role": "provider",
+                            "vcpus": 3,
+                            "memory_gib": 24,
+                            "root_disk_gib": 48,
+                            "backing_disk_gib": 0,
+                        },
+                    ],
+                    "kernel_release": "6.8.0-137-generic",
+                    "rdma_stack": "inbox",
+                },
+            )
+
+            result = backend._scenario_fio(handle)
+            envelopes = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in sorted((case_dir / "performance").glob("*.json"))
+            ]
+
+        self.assertEqual(result.status, "passed")
+        self.assertEqual(len(envelopes), 12)
+        for mode in ("backed", "remote-only"):
+            selected = [
+                envelope
+                for envelope in envelopes
+                if envelope["metadata"]["mode"] == mode
+            ]
+            self.assertEqual(
+                [envelope["metadata"]["phase"] for envelope in selected].count(
+                    "warmup"
+                ),
+                1,
+            )
+            self.assertEqual(
+                [envelope["metadata"]["phase"] for envelope in selected].count(
+                    "measured"
+                ),
+                5,
+            )
+        for envelope in envelopes:
+            metadata = envelope["metadata"]
+            self.assertEqual(metadata["duration_seconds"], 60)
+            self.assertEqual(metadata["source_commit"], "a" * 40)
+            self.assertEqual(metadata["cloud_image_sha256"], "image-sha256")
+            self.assertEqual(metadata["kernel_release"], "6.8.0-137-generic")
+            self.assertEqual(metadata["topology"], 2)
+            self.assertEqual(metadata["host_identity"], "perf-host")
+            self.assertIn("--runtime=60", metadata["fio_arguments"])
+            self.assertIn("--verify=crc32c", metadata["fio_arguments"])
+            self.assertIn("--verify_fatal=1", metadata["fio_arguments"])
+            if metadata["mode"] == "remote-only":
+                self.assertIn("--do_verify=0", metadata["fio_arguments"])
+                self.assertIn(
+                    "--verify_only=1", metadata["fio_verification_arguments"]
+                )
+            else:
+                self.assertIn("--do_verify=1", metadata["fio_arguments"])
+                self.assertEqual(metadata["fio_verification_arguments"], [])
+            self.assertIn("vm_resources", metadata)
+            self.assertIn("fio", envelope)
+        self.assertEqual(
+            set(result.metrics["evidence"]), {"backed", "remote-only"}
+        )
+        calls = {label: args for label, args, _kwargs in backend.helper_calls}
+        self.assertEqual(
+            calls["performance-heartbeat-remote-only"],
+            ("verify-remote-only-heartbeats", "5"),
+        )
 
     def test_reboot_command_timeout_still_waits_for_guest_restart(self):
         backend = ScenarioRecordingBackend()
@@ -386,6 +555,11 @@ class VmValidationCliTest(unittest.TestCase):
         self.assertEqual(report["status"], "preflight-passed")
         self.assertRegex(report["source_commit"], r"^[0-9a-f]{40}$")
         self.assertTrue(report["profile"]["certifiable"])
+        self.assertNotIn("certification", report)
+        self.assertEqual(
+            report["selection"],
+            {"kernel": "all", "topology": "all", "soak_hours": 24.0},
+        )
         self.assertEqual(
             {
                 (entry["kernel"], entry["ubuntu"], entry["topology"])
@@ -433,6 +607,43 @@ class VmValidationCliTest(unittest.TestCase):
                 ),
                 100,
             )
+
+    def test_focused_fio_plan_expands_prerequisites_and_is_non_certifiable(self):
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            result = infiniswap_vm.main(
+                [
+                    "--preflight-only",
+                    "--json",
+                    "--scenario",
+                    "fio-verification",
+                    "--kernel",
+                    "6.8",
+                    "--topology",
+                    "2",
+                    "--artifacts",
+                    directory,
+                ],
+                stdout=stdout,
+                stderr=io.StringIO(),
+                environment=self.supported_host(),
+            )
+            report = json.loads(stdout.getvalue())
+
+        self.assertEqual(result, 0)
+        self.assertFalse(report["profile"]["certifiable"])
+        self.assertEqual(
+            report["certification"],
+            {
+                "status": "non-certifiable",
+                "reason": "focused Soft-RoCE performance evidence",
+            },
+        )
+        self.assertEqual(report["selection"]["scenario"], "fio-verification")
+        self.assertEqual(
+            [scenario["id"] for scenario in report["matrix"][0]["scenarios"]],
+            ["build-deploy", "fio-verification", "resource-leak-check"],
+        )
 
     def test_failure_still_cleans_resources_and_records_skipped_scenarios(self):
         stdout = io.StringIO()

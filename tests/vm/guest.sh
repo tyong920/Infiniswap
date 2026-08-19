@@ -172,6 +172,11 @@ setup_rxe() {
 create_device() {
   local mode=$1 policy=$2 group_backing=$3 capacity=$4
   shift 4
+  local wait_for_connection=yes
+  if [[ ${1:-} == --allow-not-connected ]]; then
+    wait_for_connection=no
+    shift
+  fi
   local -a specs=("$@") providers=()
   local spec provider_id address port rail psk_file psk numa provider_list=
 
@@ -219,7 +224,9 @@ create_device() {
   done
   printf 'activate\n' >"$group/state"
   wait_for_path "$device" present
-  wait_for_field connection_state connected
+  if [[ $wait_for_connection == yes ]]; then
+    wait_for_field connection_state connected
+  fi
 }
 
 write_pattern() {
@@ -301,6 +308,108 @@ run_fio() {
     args+=(--time_based=1 --runtime="$duration")
   fi
   timeout "$((duration + 300))" fio "${args[@]}"
+}
+
+run_fio_performance() {
+  local mode=$1 phase=$2 sample=$3 duration=$4 rw=randrw do_verify=1
+  local label="performance-$mode-$phase-$sample"
+  local output="$artifacts/fio-$label.json"
+  local verification_output=
+  local -a args verification_args=()
+  if [[ $mode == remote-only ]]; then
+    rw=write
+    do_verify=0
+    verification_output="$artifacts/fio-$label-verify.json"
+  fi
+  args=(--name="$label" --filename="$device" --direct=1 --ioengine=libaio
+    --rw="$rw" --bs=4k --iodepth=32 --size=64m
+    --verify=crc32c --do_verify="$do_verify" --verify_fatal=1 --group_reporting
+    --time_based=1 --runtime="$duration" --output-format=json --output="$output")
+  if [[ $rw == randrw ]]; then
+    args+=(--rwmixread=60)
+  fi
+  timeout "$((duration + 300))" fio "${args[@]}"
+  if [[ $mode == remote-only ]]; then
+    verification_args=(--name="$label-verify" --filename="$device" --direct=1
+      --ioengine=libaio --rw=read --bs=4k --iodepth=32 --size=64m
+      --verify=crc32c --verify_only=1 --verify_fatal=1 --group_reporting
+      --output-format=json --output="$verification_output")
+    timeout 300 fio "${verification_args[@]}"
+  fi
+  python3 - "$output" "$verification_output" "${args[@]}" \
+    --verification-arguments "${verification_args[@]}" <<'PY'
+import json
+import sys
+
+
+def load_fio(path):
+    if not path:
+        return None
+    with open(path, encoding="utf-8") as source:
+        output = source.read()
+    start = output.find("{")
+    if start < 0:
+        raise SystemExit("fio output does not contain JSON")
+    return json.loads(output[start:])
+
+
+marker = sys.argv.index("--verification-arguments")
+json.dump(
+    {
+        "arguments": sys.argv[3:marker],
+        "fio": load_fio(sys.argv[1]),
+        "verification": load_fio(sys.argv[2]),
+        "verification_arguments": sys.argv[marker + 1 :],
+    },
+    sys.stdout,
+    sort_keys=True,
+)
+sys.stdout.write("\n")
+PY
+}
+
+performance_evidence() {
+  local mode=$1 timeouts late errors inflight oldest
+  check_kernel
+  timeouts=$(<"$group/provider_timeouts_total")
+  late=$(<"$group/late_rdma_completions_total")
+  errors=$(<"$group/io_errors_total")
+  inflight=$(<"$group/inflight_io")
+  oldest=$(<"$group/oldest_inflight_ms")
+  python3 - "$mode" "$timeouts" "$late" "$errors" "$inflight" "$oldest" <<'PY'
+import json
+import sys
+
+mode, timeouts, late, errors, inflight, oldest = sys.argv[1:]
+values = {
+    "provider_timeouts_total": int(timeouts),
+    "late_rdma_completions_total": int(late),
+    "io_errors_total": int(errors),
+    "inflight_io": int(inflight),
+    "oldest_inflight_ms": int(oldest),
+}
+failed = any(
+    values[field]
+    for field in (
+        "provider_timeouts_total",
+        "late_rdma_completions_total",
+        "inflight_io",
+        "oldest_inflight_ms",
+    )
+)
+json.dump(
+    {
+        "status": "failed" if failed else "passed",
+        "mode": mode,
+        **values,
+    },
+    sys.stdout,
+    sort_keys=True,
+)
+sys.stdout.write("\n")
+if failed:
+    raise SystemExit("performance run observed timeout, late completion, or hung I/O")
+PY
 }
 
 assert_alert() {
@@ -554,6 +663,8 @@ case $command in
   read-pattern) read_pattern "$@" ;;
   heat-ranges) heat_ranges "$@" ;;
   fio) run_fio "$@" ;;
+  fio-performance) run_fio_performance "$@" ;;
+  performance-evidence) performance_evidence "$@" ;;
   verify-remote-only-heartbeats) verify_remote_only_heartbeats "$@" ;;
   snapshot) snapshot "$@" ;;
   assert-alert) assert_alert "$@" ;;

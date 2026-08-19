@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "kind": "infiniswap.soft-roce-baseline-reference",
+  "issue": 18,
+  "certifiable": false,
+  "source_commit": "0bc2e361569b5b6806b57700eed7cb6f23113899",
+  "finished_at": "2026-08-19T18:16:01+00:00",
+  "archive": {
+    "host": "ty-gpu-02",
+    "path": "/home/tianyong/.local/share/infiniswap-vm/archive/soft-roce-performance-baseline-0bc2e36-180107.tar.gz",
+    "sha256": "33ad4ed668339e1a0732ddc911392fd0d81eea0a91debe31a9995318c56e3fbe",
+    "report_sha256": "a8da4c49858ab9355bc7d5366ccf72ce6648d7a846dc654c89b1962fd2073631",
+    "comparison_sha256": "f2b7a043888d7b062ac8a966340acdf7862a6ac02901186cb05eb6fcebcb3c90"
+  },
+  "environment": {
+    "cloud_image_sha256": "6e40c07ae715f744f84af0bec76415cc1987dd115b4b8de437818561f01a3733",
+    "host_identity": "ty-gpu-02",
+    "ubuntu_release": "24.04",
+    "kernel_release": "6.8.0-137-generic",
+    "rdma_stack": "inbox",
+    "topology": 2,
+    "vm_resources": {
+      "vcpus": 6,
+      "memory_gib": 48,
+      "disk_gib": 100
+    },
+    "guests": [
+      {
+        "name": "consumer",
+        "role": "consumer",
+        "vcpus": 3,
+        "memory_gib": 24,
+        "root_disk_gib": 48,
+        "backing_disk_gib": 4
+      },
+      {
+        "name": "provider-0",
+        "role": "provider",
+        "vcpus": 3,
+        "memory_gib": 24,
+        "root_disk_gib": 48,
+        "backing_disk_gib": 0
+      }
+    ]
+  },
+  "baseline_stability": {
+    "backed": {
+      "iops_cv_percent": 2.726544829131964,
+      "throughput_bytes_per_second_cv_percent": 2.7265447791081594,
+      "p99_latency_ns_cv_percent": 2.620581049329091
+    },
+    "remote-only": {
+      "iops_cv_percent": 0.4851730969350333,
+      "throughput_bytes_per_second_cv_percent": 0.48517299719274015,
+      "p99_latency_ns_cv_percent": 5.421103581800581
+    }
+  },
+  "correctness_evidence": {
+    "backed": {
+      "provider_timeouts_total": 0,
+      "late_rdma_completions_total": 0,
+      "io_errors_before_measured": 0,
+      "io_errors_total": 0,
+      "inflight_io": 0,
+      "oldest_inflight_ms": 0
+    },
+    "remote-only": {
+      "provider_timeouts_total": 0,
+      "late_rdma_completions_total": 0,
+      "io_errors_before_measured": 16,
+      "io_errors_total": 16,
+      "inflight_io": 0,
+      "oldest_inflight_ms": 0
+    }
+  }
+}

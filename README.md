@@ -534,6 +534,46 @@ tests/vm/run --kernel 6.8 --topology 2 --soak-hours 0 \
   --memory-gib 8 --disk-gib 24 --keep-on-failure
 ```
 
+For repeatable completion-path performance evidence, select only
+`fio-verification`. The harness expands that selection to build/deploy first and
+the resource leak check last; it does not run the fault, reboot, reload, pressure,
+or soak scenarios. The selection is always reported as non-certifiable, even
+when it uses the full resource profile:
+
+```bash
+tests/vm/run --scenario fio-verification \
+  --kernel 6.8 --topology 2 --soak-hours 0 \
+  --artifacts results/vm/performance-baseline --json
+```
+
+Backed and Remote-Only each run one warmup and five measured 60-second verified
+`fio` samples. Every raw sample is retained in an envelope with the source
+commit, Ubuntu image checksum, exact kernel release, RDMA stack, topology, VM
+resources, host identity, and effective `fio` arguments. Timeout or late RDMA
+evidence, `fio` verification failure, outstanding I/O, kernel diagnostics, failed
+cleanup, or a leak fails the run.
+
+Compare a merge-base baseline and candidate with the machine-readable
+comparison command:
+
+```bash
+tests/vm/compare \
+  results/vm/performance-baseline/report.json \
+  results/vm/performance-candidate/report.json \
+  --output results/vm/performance-comparison.json
+```
+
+The comparison exits 2 when environments differ or baseline IOPS/throughput
+coefficient of variation exceeds 5% or p99 latency coefficient of variation
+exceeds 10%. It exits 1 for correctness evidence, an IOPS/throughput median
+regression greater than 5%, a median p99 latency increase greater than 10%, or a
+system-CPU increase greater than 10% reproduced in at least three samples.
+Exact threshold values pass. Archive the complete baseline result directory,
+not only `report.json`, because the report references the retained raw samples.
+The first merge-base baseline is indexed at
+`tests/vm/baselines/issue-18-soft-roce.json`. The default `tests/vm/run` plan
+and certifiable report contract are unchanged.
+
 Run `tests/vm/run --preflight-only --json` to validate a host without creating
 or downloading anything. A release-gate report is certifiable only with the
 full selected profile and at least 24 soak hours.
