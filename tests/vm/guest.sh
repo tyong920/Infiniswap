@@ -353,7 +353,7 @@ rdma_delay() {
     add)
       [[ $delay_ms =~ ^[1-9][0-9]*$ ]] || fail "invalid RDMA delay"
       while iptables -w -t mangle -D OUTPUT -o "$netdev" -p udp \
-        --dport 4791 -m length --length 512:65535 -m comment \
+        --dport 4791 -m length --length 128:65535 -m comment \
         --comment "$comment" -j MARK --set-mark "$mark" 2>/dev/null; do :; done
       tc qdisc del dev "$netdev" root 2>/dev/null || true
       tc qdisc add dev "$netdev" root handle 1: prio bands 2 \
@@ -363,12 +363,12 @@ rdma_delay() {
       tc filter add dev "$netdev" protocol ip parent 1: prio 1 \
         handle "$mark" fw flowid 1:2
       iptables -w -t mangle -I OUTPUT -o "$netdev" -p udp --dport 4791 \
-        -m length --length 512:65535 -m comment --comment "$comment" \
+        -m length --length 128:65535 -m comment --comment "$comment" \
         -j MARK --set-mark "$mark"
       ;;
     clear)
       while iptables -w -t mangle -D OUTPUT -o "$netdev" -p udp \
-        --dport 4791 -m length --length 512:65535 -m comment \
+        --dport 4791 -m length --length 128:65535 -m comment \
         --comment "$comment" -j MARK --set-mark "$mark" 2>/dev/null; do :; done
       tc qdisc del dev "$netdev" root 2>/dev/null || true
       ;;
