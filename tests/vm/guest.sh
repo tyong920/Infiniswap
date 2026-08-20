@@ -386,7 +386,7 @@ eviction_io() {
       systemd-run --quiet --unit="$unit" --service-type=exec -- \
         fio --name=atomic-eviction --filename="$device" --direct=1 \
           --ioengine=libaio --rw=randwrite --bs=4k --iodepth=32 --size=64m \
-          --time_based=1 --runtime=15 --verify=crc32c --do_verify=1 \
+          --time_based=1 --runtime=45 --verify=crc32c --do_verify=1 \
           --verify_fatal=1 --group_reporting --output-format=json \
           --output="$output"
       ;;
