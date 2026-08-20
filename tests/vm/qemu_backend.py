@@ -656,6 +656,7 @@ class QemuBackend:
         policy: str = "strict",
         backing: str = "/dev/vdb",
         wait_for_connection: bool = True,
+        failure_deadline_ms: int = 2000,
     ) -> None:
         specs = self._provider_specs(handle, provider_indices)
         if not wait_for_connection:
@@ -671,6 +672,7 @@ class QemuBackend:
             policy,
             backing,
             str(capacity_gib * GIB),
+            str(failure_deadline_ms),
             *specs,
             timeout=180,
         )
@@ -1054,7 +1056,11 @@ class QemuBackend:
             "2",
         )
         self._create_device(
-            handle, "backed", provider_indices=(0,), capacity_gib=1
+            handle,
+            "backed",
+            provider_indices=(0,),
+            capacity_gib=1,
+            failure_deadline_ms=5000,
         )
         self._helper(handle, handle.consumer, "eviction-heat", "heat-ranges", "1")
         self._helper(
@@ -1064,7 +1070,7 @@ class QemuBackend:
             "rdma-delay",
             "add",
             consumer_rail,
-            "1000",
+            "3000",
         )
         try:
             self._helper(

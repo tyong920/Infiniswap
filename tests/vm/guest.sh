@@ -185,8 +185,8 @@ setup_rxe() {
 }
 
 create_device() {
-  local mode=$1 policy=$2 group_backing=$3 capacity=$4
-  shift 4
+  local mode=$1 policy=$2 group_backing=$3 capacity=$4 failure_deadline_ms=$5
+  shift 5
   local wait_for_connection=yes
   if [[ ${1:-} == --allow-not-connected ]]; then
     wait_for_connection=no
@@ -208,8 +208,10 @@ create_device() {
   else
     printf '1\n' >"$group/remote_only_eligible"
   fi
+  [[ $failure_deadline_ms =~ ^[0-9]+$ ]] ||
+    fail "invalid Provider Failure Deadline"
   printf '%s\n' "$capacity" >"$group/capacity_bytes"
-  printf '2000\n' >"$group/provider_failure_deadline_ms"
+  printf '%s\n' "$failure_deadline_ms" >"$group/provider_failure_deadline_ms"
   printf 'consumer-vm\n' >"$group/consumer_id"
   printf '100\n' >"$group/swap_priority"
 

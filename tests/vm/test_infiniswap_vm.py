@@ -225,6 +225,9 @@ class QemuScenarioTest(unittest.TestCase):
             ["backed", "remote-only"],
         )
         self.assertEqual(
+            backend.device_calls[0][1]["failure_deadline_ms"], 5000
+        )
+        self.assertEqual(
             calls["remote-chunk-contracts"], ("remote-chunk-contracts",)
         )
         self.assertEqual(
@@ -245,7 +248,7 @@ class QemuScenarioTest(unittest.TestCase):
         )
         self.assertEqual(
             calls["eviction-delay"],
-            ("rdma-delay", "add", "rxe0", "1000"),
+            ("rdma-delay", "add", "rxe0", "3000"),
         )
         self.assertEqual(
             calls["eviction-observer-start"],
