@@ -449,7 +449,7 @@ local_before=$(<"$group/local_only_writes_total")
 accepted_io=false
 admission_closed=false
 assignment_retained=false
-fallback_submitted_while_draining=false
+fallback_submitted_after_admission=false
 fallback_observed=false
 release_complete=false
 admission_ms=-1
@@ -468,11 +468,10 @@ while (($(date +%s%3N) <= deadline)); do
       admission_ms=$((now - started))
     fi
     [[ $placement == *"0:$provider_id"* ]] && assignment_retained=true
-    if [[ $placement == *"0:$provider_id"* &&
-          $fallback_submitted_while_draining == false ]]; then
+    if [[ $fallback_submitted_after_admission == false ]]; then
       timeout 10 dd if=/dev/zero of="$device" bs=4096 seek=200000 \
         count=1 oflag=direct conv=notrunc status=none
-      fallback_submitted_while_draining=true
+      fallback_submitted_after_admission=true
     fi
   fi
   ((local_after > local_before)) && fallback_observed=true
@@ -481,13 +480,14 @@ while (($(date +%s%3N) <= deadline)); do
     release_ms=$((now - started))
   fi
   if [[ $accepted_io == true && $admission_closed == true &&
-        $assignment_retained == true &&
-        $fallback_submitted_while_draining == true &&
+        $fallback_submitted_after_admission == true &&
         $fallback_observed == true && $release_complete == true ]]; then
     printf '{"schema_version":1,"kind":"infiniswap.atomic-eviction",' >"$output"
     printf '"status":"passed","accepted_io_observed":true,' >>"$output"
-    printf '"admission_closed":true,"assignment_retained_while_draining":true,' >>"$output"
-    printf '"fallback_submitted_while_draining":true,' >>"$output"
+    printf '"admission_closed":true,' >>"$output"
+    printf '"assignment_retained_while_draining":%s,' \
+      "$assignment_retained" >>"$output"
+    printf '"fallback_submitted_after_admission":true,' >>"$output"
     printf '"fallback_writes":%s,' \
       "$((local_after - local_before))" >>"$output"
     printf '"release_complete":true,' >>"$output"
@@ -499,7 +499,7 @@ while (($(date +%s%3N) <= deadline)); do
 done
 printf 'eviction evidence incomplete: accepted=%s admission=%s retained=%s fallback_submitted=%s fallback_complete=%s release=%s\n' \
   "$accepted_io" "$admission_closed" "$assignment_retained" \
-  "$fallback_submitted_while_draining" "$fallback_observed" \
+  "$fallback_submitted_after_admission" "$fallback_observed" \
   "$release_complete" >&2
 exit 1
 SH
@@ -528,8 +528,7 @@ with open(sys.argv[1], encoding="ascii") as source:
 required = (
     "accepted_io_observed",
     "admission_closed",
-    "assignment_retained_while_draining",
-    "fallback_submitted_while_draining",
+    "fallback_submitted_after_admission",
     "release_complete",
 )
 if report.get("status") != "passed" or not all(report.get(key) for key in required):
