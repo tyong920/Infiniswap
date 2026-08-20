@@ -24,8 +24,10 @@ enum is_remote_io_transaction_event {
 };
 
 /*
- * Each claim names a producer that may still deliver a lifecycle event.
- * active_events keeps Adapter re-entry alive while effects run unlocked.
+ * Each claim names the only producer allowed to deliver its lifecycle event.
+ * An event consumes that claim before Adapter effects become observable; the
+ * producer must not access the transaction after the event returns. Active
+ * events keep Adapter re-entry alive while effects run unlocked.
  */
 struct is_remote_io_transaction {
 	is_remote_io_transaction_lock_t lock;

@@ -47,7 +47,8 @@ struct test_transaction {
 };
 
 enum threaded_event_kind {
-	THREADED_EVENT_LOCAL = 1,
+	THREADED_EVENT_DISPATCHER = 1,
+	THREADED_EVENT_LOCAL,
 	THREADED_EVENT_REMOTE,
 	THREADED_EVENT_TRANSPORT,
 };
@@ -99,7 +100,7 @@ static void test_barrier_destroy(struct test_barrier *barrier)
 	(void)pthread_mutex_destroy(&barrier->lock);
 }
 
-static struct test_transaction *test_transaction_from_owner(
+static struct test_transaction *test_transaction_from_embedded_transaction(
 	struct is_remote_io_transaction *transaction)
 {
 	return (struct test_transaction *)((char *)transaction -
@@ -110,7 +111,7 @@ void is_remote_io_transaction_adapter_complete(
 	struct is_remote_io_transaction *transaction, int status)
 {
 	struct effect_recorder *recorder =
-		test_transaction_from_owner(transaction)->recorder;
+		test_transaction_from_embedded_transaction(transaction)->recorder;
 
 	pthread_mutex_lock(&recorder->lock);
 	recorder->completion_status = status;
@@ -129,7 +130,7 @@ void is_remote_io_transaction_adapter_backing_degraded(
 	struct is_remote_io_transaction *transaction)
 {
 	struct effect_recorder *recorder =
-		test_transaction_from_owner(transaction)->recorder;
+		test_transaction_from_embedded_transaction(transaction)->recorder;
 
 	pthread_mutex_lock(&recorder->lock);
 	recorder->degraded++;
@@ -141,7 +142,7 @@ void is_remote_io_transaction_adapter_mark_local_only(
 	struct is_remote_io_transaction *transaction)
 {
 	struct effect_recorder *recorder =
-		test_transaction_from_owner(transaction)->recorder;
+		test_transaction_from_embedded_transaction(transaction)->recorder;
 
 	pthread_mutex_lock(&recorder->lock);
 	recorder->local_only++;
@@ -153,7 +154,7 @@ void is_remote_io_transaction_adapter_submit_local(
 	struct is_remote_io_transaction *transaction)
 {
 	struct effect_recorder *recorder =
-		test_transaction_from_owner(transaction)->recorder;
+		test_transaction_from_embedded_transaction(transaction)->recorder;
 	bool complete_local;
 	int status;
 
@@ -171,7 +172,7 @@ void is_remote_io_transaction_adapter_settle(
 	struct is_remote_io_transaction *transaction)
 {
 	struct effect_recorder *recorder =
-		test_transaction_from_owner(transaction)->recorder;
+		test_transaction_from_embedded_transaction(transaction)->recorder;
 
 	pthread_mutex_lock(&recorder->lock);
 	recorder->settlements++;
@@ -184,7 +185,7 @@ void is_remote_io_transaction_adapter_invariant(
 	enum is_remote_io_transaction_event event)
 {
 	struct effect_recorder *recorder =
-		test_transaction_from_owner(transaction)->recorder;
+		test_transaction_from_embedded_transaction(transaction)->recorder;
 
 	(void)event;
 	pthread_mutex_lock(&recorder->lock);
@@ -199,6 +200,9 @@ static void *run_transaction_event(void *context)
 
 	test_barrier_wait(event->start);
 	switch (event->kind) {
+	case THREADED_EVENT_DISPATCHER:
+		is_remote_io_transaction_dispatcher_released(event->transaction);
+		break;
 	case THREADED_EVENT_LOCAL:
 		is_remote_io_transaction_local_completed(event->transaction,
 			event->status);
@@ -728,6 +732,69 @@ static int test_concurrent_late_branches_settle_after_early_ack(void)
 	return failed;
 }
 
+static int test_all_claims_can_release_concurrently(void)
+{
+	struct test_barrier barrier;
+	struct effect_recorder recorder = {
+		.lock = PTHREAD_MUTEX_INITIALIZER,
+	};
+	struct test_transaction transaction = {
+		.recorder = &recorder,
+	};
+	struct threaded_event events[] = {
+		{
+			.transaction = &transaction.transaction,
+			.start = &barrier,
+			.kind = THREADED_EVENT_DISPATCHER,
+			.generation = 211,
+			.status = 0,
+		},
+		{
+			.transaction = &transaction.transaction,
+			.start = &barrier,
+			.kind = THREADED_EVENT_LOCAL,
+			.generation = 211,
+			.status = 0,
+		},
+		{
+			.transaction = &transaction.transaction,
+			.start = &barrier,
+			.kind = THREADED_EVENT_REMOTE,
+			.generation = 211,
+			.status = 0,
+		},
+		{
+			.transaction = &transaction.transaction,
+			.start = &barrier,
+			.kind = THREADED_EVENT_TRANSPORT,
+			.generation = 211,
+			.status = 0,
+		},
+	};
+	pthread_t threads[sizeof(events) / sizeof(events[0])];
+	unsigned int index;
+	int failed;
+
+	if (test_barrier_init(&barrier,
+		    sizeof(events) / sizeof(events[0])) != 0 ||
+	    is_remote_io_transaction_init(&transaction.transaction,
+		IS_IO_POLICY_STRICT_WRITE, 211) != 0)
+		return 1;
+	for (index = 0; index < sizeof(events) / sizeof(events[0]); index++) {
+		if (pthread_create(&threads[index], NULL, run_transaction_event,
+			   &events[index]) != 0) {
+			fprintf(stderr, "all-claim thread creation failed\n");
+			return 1;
+		}
+	}
+	for (index = 0; index < sizeof(events) / sizeof(events[0]); index++)
+		(void)pthread_join(threads[index], NULL);
+	failed = (recorder.completions != 1) | (recorder.successes != 1) |
+		(recorder.settlements != 1) | (recorder.invariants != 0);
+	test_barrier_destroy(&barrier);
+	return failed;
+}
+
 int main(void)
 {
 	return test_write_outcome_and_completion_order_matrix() |
@@ -740,5 +807,6 @@ int main(void)
 		test_duplicate_remote_result_completes_once() |
 		test_synchronous_branch_failures_settle_once() |
 		test_concurrent_local_and_remote_release_settles_once() |
-		test_concurrent_late_branches_settle_after_early_ack();
+		test_concurrent_late_branches_settle_after_early_ack() |
+		test_all_claims_can_release_concurrently();
 }
