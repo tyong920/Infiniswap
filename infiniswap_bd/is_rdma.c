@@ -592,7 +592,8 @@ static void is_rdma_fail(struct is_rdma_session *session, int error)
 	if (error >= 0)
 		error = -EIO;
 	mutex_lock(&session->control_lock);
-	if (READ_ONCE(session->stopping)) {
+	if (READ_ONCE(session->stopping) ||
+	    READ_ONCE(session->fabric->stopping)) {
 		mutex_unlock(&session->control_lock);
 		return;
 	}
