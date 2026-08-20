@@ -2,7 +2,7 @@ ifneq ($(KERNELRELEASE),)
 
 obj-m := infiniswap.o
 infiniswap-y := is_configfs.o is_mq.o is_main.o is_protocol.o is_placement.o
-infiniswap-y += is_rdma_operation_owner.o is_rdma.o
+infiniswap-y += is_remote_io_transaction.o is_rdma_operation_owner.o is_rdma.o
 ccflags-y += -I$(src)/../common
 
 kernel_include_dirs := $(srctree)/include $(objtree)/include

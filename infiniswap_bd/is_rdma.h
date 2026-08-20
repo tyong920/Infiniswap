@@ -26,7 +26,7 @@ struct is_rdma_io {
 	void *context;
 	void (*complete)(void *context, u64 generation, int status,
 			 bool cancelled);
-	void (*release)(void *context);
+	void (*release)(void *context, u64 generation);
 };
 
 int is_rdma_start(struct is_device *device);

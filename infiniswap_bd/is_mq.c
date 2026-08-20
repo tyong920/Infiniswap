@@ -10,14 +10,13 @@
 #include <linux/highmem.h>
 #include <linux/major.h>
 #include <linux/namei.h>
-#include <linux/refcount.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/vmalloc.h>
 
 #include "infiniswap.h"
-#include "is_io_policy.h"
 #include "is_rdma.h"
+#include "is_remote_io_transaction.h"
 
 #ifdef INFINISWAP_HAVE_BDEV_HANDLE
 #define IS_BACKING_MODE (BLK_OPEN_READ | BLK_OPEN_WRITE | BLK_OPEN_EXCL)
@@ -1143,93 +1142,89 @@ struct is_remote_request {
 	sector_t sector;
 	unsigned int bytes;
 	unsigned int command_flags;
-	spinlock_t policy_lock;
-	refcount_t references;
-	struct is_io_policy policy;
+	struct is_remote_io_transaction transaction;
 	atomic_t pending_bios;
 	atomic_t local_status;
 	unsigned int backing_retries;
+	bool remote_first_write;
 	struct work_struct local_work;
 	struct is_rdma_io rdma_io;
 	struct page *owned_pages[IS_RDMA_MAX_SEGMENTS];
 	unsigned int owned_page_count;
 };
 
-static void is_remote_request_put(struct is_remote_request *remote)
+static struct is_remote_request *is_remote_request_from_transaction(
+	struct is_remote_io_transaction *transaction)
 {
+	return container_of(transaction, struct is_remote_request, transaction);
+}
+
+static void is_remote_local_complete(struct is_remote_request *remote,
+				     blk_status_t status);
+
+void is_remote_io_transaction_adapter_complete(
+	struct is_remote_io_transaction *transaction, int status)
+{
+	struct is_remote_request *remote =
+		is_remote_request_from_transaction(transaction);
+
+	is_complete_request(remote->device, remote->request,
+		(__force blk_status_t)status);
+}
+
+void is_remote_io_transaction_adapter_backing_degraded(
+	struct is_remote_io_transaction *transaction)
+{
+	struct is_remote_request *remote =
+		is_remote_request_from_transaction(transaction);
+
+	is_degrade_backing(remote->device, remote->sector, remote->bytes, EIO);
+}
+
+void is_remote_io_transaction_adapter_mark_local_only(
+	struct is_remote_io_transaction *transaction)
+{
+	struct is_remote_request *remote =
+		is_remote_request_from_transaction(transaction);
+
+	atomic64_inc(&remote->device->local_only_writes_total);
+}
+
+void is_remote_io_transaction_adapter_submit_local(
+	struct is_remote_io_transaction *transaction)
+{
+	struct is_remote_request *remote =
+		is_remote_request_from_transaction(transaction);
+
+	if (!queue_work(remote->device->ordered_backing_wq, &remote->local_work))
+		is_remote_io_transaction_local_completed(transaction,
+			(__force int)BLK_STS_IOERR);
+}
+
+void is_remote_io_transaction_adapter_settle(
+	struct is_remote_io_transaction *transaction)
+{
+	struct is_remote_request *remote =
+		is_remote_request_from_transaction(transaction);
 	unsigned int index;
 
-	if (!refcount_dec_and_test(&remote->references))
-		return;
-	WARN_ON_ONCE(!remote->policy.request_complete);
-	WARN_ON_ONCE(!is_io_policy_releasable(&remote->policy));
 	for (index = 0; index < remote->owned_page_count; index++)
 		__free_page(remote->owned_pages[index]);
 	is_finish_inflight(remote->device);
 	kfree(remote);
 }
 
-static void is_remote_local_complete(struct is_remote_request *remote,
-				     blk_status_t status);
-static void is_remote_path_complete(struct is_remote_request *remote,
-				    bool remote_path,
-				    blk_status_t status, bool cancelled);
-
-static void is_remote_apply_action(struct is_remote_request *remote,
-				   enum is_io_action action,
-				   blk_status_t completion_status)
+void is_remote_io_transaction_adapter_invariant(
+	struct is_remote_io_transaction *transaction,
+	enum is_remote_io_transaction_event event)
 {
-	if (action & IS_IO_BACKING_DEGRADED)
-		is_degrade_backing(remote->device, remote->sector,
-			remote->bytes, EIO);
-	if (action & IS_IO_MARK_LOCAL_ONLY)
-		atomic64_inc(&remote->device->local_only_writes_total);
-	if (action & IS_IO_SUBMIT_LOCAL) {
-		refcount_inc(&remote->references);
-		if (!queue_work(remote->device->ordered_backing_wq,
-				&remote->local_work))
-			is_remote_path_complete(remote, false, BLK_STS_IOERR,
-				false);
-	}
-	if (action & IS_IO_COMPLETE_SUCCESS)
-		is_complete_request(remote->device, remote->request, BLK_STS_OK);
-	else if (action & IS_IO_COMPLETE_ERROR)
-		is_complete_request(remote->device, remote->request,
-			completion_status);
-}
+	struct is_remote_request *remote =
+		is_remote_request_from_transaction(transaction);
 
-static void is_remote_path_complete(struct is_remote_request *remote,
-				    bool remote_path,
-				    blk_status_t status, bool cancelled)
-{
-	enum is_io_action action;
-	blk_status_t completion_status = status;
-	unsigned long flags;
-
-	spin_lock_irqsave(&remote->policy_lock, flags);
-	if (remote_path) {
-		if (cancelled)
-			action = is_io_policy_cancel_remote(&remote->policy,
-				remote->rdma_io.generation, (__force int)status);
-		else
-			action = is_io_policy_remote_complete(&remote->policy,
-				remote->rdma_io.generation, (__force int)status);
-	} else {
-		action = is_io_policy_local_complete(&remote->policy,
-			(__force int)status);
-	}
-	if (action & IS_IO_COMPLETE_ERROR) {
-		if (remote->policy.local_done)
-			completion_status = (__force blk_status_t)
-				remote->policy.local_status;
-		else
-			completion_status = (__force blk_status_t)
-				remote->policy.remote_status;
-	}
-	spin_unlock_irqrestore(&remote->policy_lock, flags);
-
-	is_remote_apply_action(remote, action, completion_status);
-	is_remote_request_put(remote);
+	pr_warn(IS_DRIVER_NAME
+		": illegal Remote I/O Transaction event %u for generation %llu\n",
+		(unsigned int)event,
+		(unsigned long long)remote->rdma_io.generation);
 }
 
 static int is_copy_owned_pages_to_request(struct is_remote_request *remote)
@@ -1262,18 +1257,24 @@ static void is_remote_rdma_complete(void *context, u64 generation, int status,
 	struct is_remote_request *remote = context;
 
 	if (generation != remote->rdma_io.generation) {
-		is_remote_request_put(remote);
+		is_remote_io_transaction_remote_completed(&remote->transaction,
+			generation, status ? errno_to_blk_status(status) : BLK_STS_OK,
+			cancelled);
 		return;
 	}
 	if (!status && !cancelled && !remote->rdma_io.write)
 		status = is_copy_owned_pages_to_request(remote);
-	is_remote_path_complete(remote, true,
-		status ? errno_to_blk_status(status) : BLK_STS_OK, cancelled);
+	is_remote_io_transaction_remote_completed(&remote->transaction,
+		generation, status ? errno_to_blk_status(status) : BLK_STS_OK,
+		cancelled);
 }
 
-static void is_remote_transport_release(void *context)
+static void is_remote_transport_release(void *context, u64 generation)
 {
-	is_remote_request_put(context);
+	struct is_remote_request *remote = context;
+
+	is_remote_io_transaction_transport_released(&remote->transaction,
+		generation);
 }
 
 static void is_remote_local_complete(struct is_remote_request *remote,
@@ -1285,7 +1286,8 @@ static void is_remote_local_complete(struct is_remote_request *remote,
 	if (!atomic_dec_and_test(&remote->pending_bios))
 		return;
 	status = (__force blk_status_t)atomic_read(&remote->local_status);
-	is_remote_path_complete(remote, false, status, false);
+	is_remote_io_transaction_local_completed(&remote->transaction,
+		(__force int)status);
 }
 
 static void is_remote_backing_end_io(struct bio *bio)
@@ -1295,7 +1297,7 @@ static void is_remote_backing_end_io(struct bio *bio)
 
 	bio_put(bio);
 	if (status != BLK_STS_OK && remote->rdma_io.write &&
-	    remote->policy.kind == IS_IO_POLICY_REMOTE_FIRST_WRITE &&
+	    remote->remote_first_write &&
 	    remote->backing_retries < IS_BACKING_RETRY_LIMIT) {
 		remote->backing_retries++;
 		atomic64_inc(&remote->device->backing_retries_total);
@@ -1416,7 +1418,6 @@ static struct is_remote_request *is_alloc_remote_request(
 	remote->sector = blk_rq_pos(request);
 	remote->bytes = blk_rq_bytes(request);
 	remote->command_flags = request->cmd_flags;
-	spin_lock_init(&remote->policy_lock);
 	remote->rdma_io.sector = remote->sector;
 	remote->rdma_io.bytes = remote->bytes;
 	remote->rdma_io.generation = atomic64_inc_return(
@@ -1481,16 +1482,19 @@ static bool is_dispatch_remote_read(struct is_device *device,
 	remote->rdma_io.write = false;
 	generation = remote->rdma_io.generation;
 	if (device->mode == IS_DEVICE_MODE_REMOTE_ONLY)
-		is_io_policy_init_remote_only_read(&remote->policy, generation);
+		ret = is_remote_io_transaction_init(&remote->transaction,
+			IS_IO_POLICY_REMOTE_ONLY_READ, generation);
 	else
-		is_io_policy_init_remote_read(&remote->policy, generation);
-	refcount_set(&remote->references, 3);
+		ret = is_remote_io_transaction_init(&remote->transaction,
+			IS_IO_POLICY_REMOTE_READ, generation);
+	if (ret)
+		goto free_remote;
 	ret = is_rdma_submit(device, &remote->rdma_io);
 	if (ret) {
-		is_remote_transport_release(remote);
+		is_remote_transport_release(remote, generation);
 		is_remote_rdma_complete(remote, generation, ret, false);
 	}
-	is_remote_request_put(remote);
+	is_remote_io_transaction_dispatcher_released(&remote->transaction);
 	return true;
 
 free_remote:
@@ -1525,15 +1529,22 @@ static bool is_dispatch_remote_write(struct is_device *device,
 		kind = device->acknowledgement_policy ==
 			IS_ACKNOWLEDGEMENT_POLICY_REMOTE_FIRST ?
 			IS_IO_POLICY_REMOTE_FIRST_WRITE : IS_IO_POLICY_STRICT_WRITE;
-		is_io_policy_init_write(&remote->policy, kind,
+		remote->remote_first_write =
+			kind == IS_IO_POLICY_REMOTE_FIRST_WRITE;
+		ret = is_remote_io_transaction_init(&remote->transaction, kind,
 			remote->rdma_io.generation);
-		refcount_set(&remote->references, 4);
+		if (ret) {
+			bio_put(bio);
+			goto free_remote;
+		}
 		atomic_set(&remote->local_status, BLK_STS_OK);
 		atomic_set(&remote->pending_bios, 1);
 	} else {
-		is_io_policy_init_remote_only_write(&remote->policy,
+		ret = is_remote_io_transaction_init(&remote->transaction,
+			IS_IO_POLICY_REMOTE_ONLY_WRITE,
 			remote->rdma_io.generation);
-		refcount_set(&remote->references, 3);
+		if (ret)
+			goto free_remote;
 	}
 	remote->rdma_io.write = true;
 	generation = remote->rdma_io.generation;
@@ -1543,10 +1554,10 @@ static bool is_dispatch_remote_write(struct is_device *device,
 		submit_bio_noacct(bio);
 	ret = is_rdma_submit(device, &remote->rdma_io);
 	if (ret) {
-		is_remote_transport_release(remote);
+		is_remote_transport_release(remote, generation);
 		is_remote_rdma_complete(remote, generation, ret, false);
 	}
-	is_remote_request_put(remote);
+	is_remote_io_transaction_dispatcher_released(&remote->transaction);
 	return true;
 
 free_remote:

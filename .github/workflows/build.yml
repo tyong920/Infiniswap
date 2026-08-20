@@ -167,6 +167,20 @@ jobs:
             -o "${{ runner.temp }}/io-policy-test"
           "${{ runner.temp }}/io-policy-test"
 
+      - name: Test Memory Consumer Remote I/O Transaction ownership
+        run: |
+          cc -std=c11 -Wall -Wextra -Wpedantic -Werror -pthread \
+            infiniswap_bd/is_remote_io_transaction.c \
+            infiniswap_bd/tests/remote-io-transaction-test.c \
+            -o "${{ runner.temp }}/remote-io-transaction-test"
+          "${{ runner.temp }}/remote-io-transaction-test"
+          cc -std=c11 -Wall -Wextra -Wpedantic -Werror -pthread \
+            -fsanitize=thread -g \
+            infiniswap_bd/is_remote_io_transaction.c \
+            infiniswap_bd/tests/remote-io-transaction-test.c \
+            -o "${{ runner.temp }}/remote-io-transaction-test-tsan"
+          "${{ runner.temp }}/remote-io-transaction-test-tsan"
+
       - name: Test Memory Consumer RDMA operation ownership
         run: |
           cc -std=c11 -Wall -Wextra -Wpedantic -Werror -pthread \

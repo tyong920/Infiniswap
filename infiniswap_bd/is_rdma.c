@@ -2582,7 +2582,8 @@ void is_rdma_operation_adapter_release_transferred_io(
 {
 	struct is_rdma_operation *operation = is_operation_from_owner(owner);
 
-	operation->io->release(operation->io->context);
+	operation->io->release(operation->io->context,
+		operation->io->generation);
 }
 
 void is_rdma_operation_adapter_destroy(
