@@ -18,6 +18,7 @@
 #include <linux/workqueue.h>
 
 #include "infiniswap_protocol.h"
+#include "is_remote_chunk.h"
 #include "is_remote_io_transaction.h"
 
 #ifdef INFINISWAP_HAVE_LINUX_GENHD_H
@@ -138,7 +139,6 @@ struct is_device {
 	int swap_priority;
 	int last_error;
 	u64 capacity_bytes;
-	u64 remote_capacity_bytes;
 	sector_t capacity_sectors;
 	unsigned long oldest_inflight_started;
 	int minor;
@@ -147,7 +147,6 @@ struct is_device {
 	atomic_t connection_state;
 	atomic_t backing_state;
 	atomic_t remote_lost;
-	atomic_t mapped_remote_chunks;
 	atomic64_t next_io_generation;
 	atomic64_t io_requests_total;
 	atomic64_t io_completed_total;
@@ -173,6 +172,7 @@ struct is_device {
 	struct workqueue_struct *ordered_backing_wq;
 	struct blk_mq_tag_set tag_set;
 	struct gendisk *disk;
+	struct is_remote_chunk_module *remote_chunks;
 	struct is_remote_io_transaction_engine transaction_engine;
 	struct is_rdma_fabric *rdma;
 };

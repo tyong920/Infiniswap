@@ -57,7 +57,6 @@ void is_device_init(struct is_device *device, const char *name)
 	atomic_set(&device->connection_state, IS_CONNECTION_NOT_CONNECTED);
 	atomic_set(&device->backing_state, IS_BACKING_HEALTHY);
 	atomic_set(&device->remote_lost, 0);
-	atomic_set(&device->mapped_remote_chunks, 0);
 	atomic64_set(&device->next_io_generation, 0);
 	atomic64_set(&device->io_requests_total, 0);
 	atomic64_set(&device->io_completed_total, 0);
@@ -232,6 +231,7 @@ int is_device_set_hot_range_threshold(struct is_device *device, const char *buf,
 				      size_t count)
 {
 	u64 threshold;
+	u64 previous;
 	int ret;
 
 	(void)count;
@@ -240,9 +240,14 @@ int is_device_set_hot_range_threshold(struct is_device *device, const char *buf,
 		return ret;
 	if (!threshold || threshold > S64_MAX)
 		return -ERANGE;
+	mutex_lock(&device->lifecycle_lock);
+	previous = READ_ONCE(device->hot_range_threshold);
 	WRITE_ONCE(device->hot_range_threshold, threshold);
-	is_rdma_mapping_parameters_changed(device);
-	return 0;
+	ret = is_rdma_mapping_parameters_changed(device);
+	if (ret)
+		WRITE_ONCE(device->hot_range_threshold, previous);
+	mutex_unlock(&device->lifecycle_lock);
+	return ret;
 }
 
 static int is_device_set_hot_range_weight(u32 *target, const char *buf)
@@ -261,15 +266,37 @@ static int is_device_set_hot_range_weight(u32 *target, const char *buf)
 int is_device_set_hot_range_read_weight(struct is_device *device,
 					const char *buf, size_t count)
 {
+	u32 previous;
+	int ret;
+
 	(void)count;
-	return is_device_set_hot_range_weight(&device->hot_range_read_weight, buf);
+	mutex_lock(&device->lifecycle_lock);
+	previous = READ_ONCE(device->hot_range_read_weight);
+	ret = is_device_set_hot_range_weight(&device->hot_range_read_weight, buf);
+	if (!ret)
+		ret = is_rdma_mapping_parameters_changed(device);
+	if (ret)
+		WRITE_ONCE(device->hot_range_read_weight, previous);
+	mutex_unlock(&device->lifecycle_lock);
+	return ret;
 }
 
 int is_device_set_hot_range_write_weight(struct is_device *device,
 					 const char *buf, size_t count)
 {
+	u32 previous;
+	int ret;
+
 	(void)count;
-	return is_device_set_hot_range_weight(&device->hot_range_write_weight, buf);
+	mutex_lock(&device->lifecycle_lock);
+	previous = READ_ONCE(device->hot_range_write_weight);
+	ret = is_device_set_hot_range_weight(&device->hot_range_write_weight, buf);
+	if (!ret)
+		ret = is_rdma_mapping_parameters_changed(device);
+	if (ret)
+		WRITE_ONCE(device->hot_range_write_weight, previous);
+	mutex_unlock(&device->lifecycle_lock);
+	return ret;
 }
 
 static bool is_runtime_identifier_valid(const char *value)
@@ -1544,12 +1571,9 @@ static bool is_dispatch_remote(struct is_device *device,
 
 	if (device->mode == IS_DEVICE_MODE_BACKED)
 		is_rdma_note_activity(device, sector, bytes, write);
-	if (write) {
-		if (!is_rdma_range_mapped(device, sector, bytes))
-			return false;
-	} else if (!is_rdma_range_valid(device, sector, bytes)) {
+	if (!device->remote_chunks ||
+	    atomic_read(&device->connection_state) != IS_CONNECTION_CONNECTED)
 		return false;
-	}
 
 	{
 		const struct is_remote_io_transaction_spec spec = {
@@ -1829,6 +1853,12 @@ static int is_release_resources(struct is_device *device)
 			return ret;
 	}
 	is_rdma_stop(device);
+	if (device->remote_chunks) {
+		ret = is_remote_chunk_module_destroy(device->remote_chunks);
+		if (ret)
+			return ret;
+		device->remote_chunks = NULL;
+	}
 	if (device->disk && device->disk_added) {
 		del_gendisk(device->disk);
 		device->disk_added = false;
@@ -1949,10 +1979,32 @@ int is_device_activate(struct is_device *device)
 	}
 	previous_state = device->state;
 
+	{
+		u64 remote_chunk_count = device->capacity_bytes /
+			IS_REMOTE_CHUNK_BYTES +
+			!!(device->capacity_bytes % IS_REMOTE_CHUNK_BYTES);
+		const struct is_remote_chunk_config config = {
+			.mode = remote_only ? IS_REMOTE_CHUNK_MODE_REMOTE_ONLY :
+				IS_REMOTE_CHUNK_MODE_BACKED,
+			.chunk_count = remote_configured ?
+				(unsigned int)remote_chunk_count : 1U,
+			.hot_policy = {
+				.threshold = device->hot_range_threshold,
+				.read_weight = device->hot_range_read_weight,
+				.write_weight = device->hot_range_write_weight,
+			},
+		};
+
+		ret = is_remote_chunk_module_create(&config,
+			&device->remote_chunks);
+		if (ret)
+			goto out;
+	}
+
 	if (!remote_only) {
 		ret = is_open_backing_store(device);
 		if (ret)
-			goto out;
+			goto release_resources;
 		ret = is_validate_open_backing_store(device);
 		if (ret)
 			goto release_resources;
@@ -2032,7 +2084,7 @@ int is_device_activate(struct is_device *device)
 	if (remote_only &&
 	    (atomic_read(&device->remote_lost) ||
 	     atomic_read(&device->connection_state) != IS_CONNECTION_CONNECTED ||
-	     READ_ONCE(device->remote_capacity_bytes) != device->capacity_bytes)) {
+	     is_rdma_remote_capacity_bytes(device) != device->capacity_bytes)) {
 		ret = -ENOTCONN;
 		goto release_resources;
 	}
@@ -2096,6 +2148,12 @@ static int is_device_drain_locked(struct is_device *device)
 		device->disk_added = false;
 	}
 	is_set_io_state(device, IS_DEVICE_DRAINED, false);
+	if (device->remote_chunks) {
+		int ret = is_remote_chunk_module_quiesce(device->remote_chunks);
+
+		if (ret && ret != -EALREADY)
+			return ret;
+	}
 	wait_event(device->drain_wait, !atomic_read(&device->inflight));
 	pr_info(IS_DRIVER_NAME ": drained %s\n", device->name);
 	return 0;
