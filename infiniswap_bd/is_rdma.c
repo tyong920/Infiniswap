@@ -117,6 +117,7 @@ struct is_rdma_session {
 	atomic_t send_busy;
 	atomic_t rdma_reads_inflight;
 	atomic_t operation_objects;
+	atomic64_t capacity_observation;
 	atomic_t disconnect_started;
 	bool failure_started;
 	bool disconnect_deferred;
@@ -177,7 +178,6 @@ struct is_rdma_session {
 	bool healthy;
 	bool compatible;
 	enum is_placement_exclude_reason exclude_reason;
-	u32 advertised_capacity_chunks;
 	char provider_id[IS_PROVIDER_NAME_SIZE];
 	char provider_address[IS_PROVIDER_ADDRESS_SIZE];
 	char rdma_device[IS_RDMA_DEVICE_SIZE];
@@ -247,18 +247,18 @@ static unsigned int is_device_remote_chunk_count(const struct is_device *device)
 	return (unsigned int)(device->capacity_bytes / IS_CHUNK_BYTES);
 }
 
-static unsigned int is_snapshot_provider_assigned_chunks(
-	const struct is_remote_chunk_snapshot *snapshot,
-	struct is_remote_chunk_provider_handle provider)
+static const struct is_remote_chunk_provider_snapshot *
+is_snapshot_provider(const struct is_remote_chunk_snapshot *snapshot,
+		     struct is_remote_chunk_provider_handle provider)
 {
 	unsigned int index;
 
 	for (index = 0; index < snapshot->provider_count; index++) {
 		if (is_remote_chunk_provider_handle_equal(
 			snapshot->providers[index].provider, provider))
-			return snapshot->providers[index].assigned_chunks;
+			return &snapshot->providers[index];
 	}
-	return 0;
+	return NULL;
 }
 
 static void *is_session_kzalloc(struct is_rdma_session *session, size_t size,
@@ -292,10 +292,11 @@ static is_placement_u32 is_fabric_rand(void *ctx, is_placement_u32 limit)
 	return (is_placement_u32)(value % limit);
 }
 
-static int is_session_refresh_advertised_capacity(
+static int is_session_record_provider_available(
 	struct is_rdma_session *session, unsigned int available_chunks)
 {
 	struct is_remote_chunk_snapshot *snapshot = NULL;
+	const struct is_remote_chunk_provider_snapshot *provider;
 	unsigned int assigned;
 	int ret;
 
@@ -303,31 +304,43 @@ static int is_session_refresh_advertised_capacity(
 		&snapshot);
 	if (ret)
 		return ret;
-	assigned = is_snapshot_provider_assigned_chunks(snapshot,
-		session->provider_handle);
+	provider = is_snapshot_provider(snapshot, session->provider_handle);
+	assigned = provider ? provider->assigned_chunks : 0;
 	is_remote_chunk_snapshot_release(snapshot);
-	/* Status reports free chunks; add assignments to retain a capacity ceiling. */
-	WRITE_ONCE(session->advertised_capacity_chunks,
-		(u32)min_t(u64, (u64)available_chunks + assigned, U32_MAX));
+	/* Pair the Provider report with the module accounting it observed. */
+	atomic64_set(&session->capacity_observation,
+		((u64)available_chunks << 32) | assigned);
 	return 0;
+}
+
+static unsigned int is_session_observed_available_chunks(
+	struct is_rdma_session *session,
+	const struct is_remote_chunk_snapshot *snapshot)
+{
+	const struct is_remote_chunk_provider_snapshot *provider =
+		is_snapshot_provider(snapshot, session->provider_handle);
+	u64 observation = atomic64_read(&session->capacity_observation);
+	unsigned int available = (unsigned int)(observation >> 32);
+	unsigned int observed_assigned = (unsigned int)observation;
+	unsigned int assigned = provider ? provider->assigned_chunks : 0;
+
+	if (assigned >= observed_assigned) {
+		unsigned int newly_assigned = assigned - observed_assigned;
+
+		return available > newly_assigned ? available - newly_assigned : 0;
+	}
+	return (unsigned int)min_t(u64,
+		(u64)available + observed_assigned - assigned, U32_MAX);
 }
 
 static unsigned int is_session_available_chunks(
 	struct is_rdma_session *session,
 	const struct is_remote_chunk_snapshot *snapshot)
 {
-	unsigned int advertised;
-	unsigned int assigned;
-
 	if (!session->healthy || !session->compatible ||
 	    session->control_state != IS_RDMA_CONTROL_READY)
 		return 0;
-	assigned = is_snapshot_provider_assigned_chunks(snapshot,
-		session->provider_handle);
-	advertised = READ_ONCE(session->advertised_capacity_chunks);
-	if (advertised <= assigned)
-		return 0;
-	return advertised - assigned;
+	return is_session_observed_available_chunks(session, snapshot);
 }
 
 static void is_session_set_exclude(struct is_rdma_session *session,
@@ -1221,7 +1234,7 @@ static int is_handle_status(struct is_rdma_session *session,
 		}
 		available_chunks =
 			status->payload.status.available_committed_chunks;
-		ret = is_session_refresh_advertised_capacity(session,
+		ret = is_session_record_provider_available(session,
 			available_chunks);
 		if (ret)
 			return ret;
@@ -1242,7 +1255,7 @@ static int is_handle_status(struct is_rdma_session *session,
 		return 0;
 	}
 	available_chunks = status->payload.status.available_opportunistic_chunks;
-	ret = is_session_refresh_advertised_capacity(session, available_chunks);
+	ret = is_session_record_provider_available(session, available_chunks);
 	if (ret)
 		return ret;
 	if (available_chunks == 0) {
@@ -1290,7 +1303,7 @@ static int is_handle_backed_heartbeat(
 	if (!(status->payload.status.flags & IS_PROTOCOL_STATUS_HEALTHY))
 		return -EIO;
 	available_chunks = status->payload.status.available_opportunistic_chunks;
-	ret = is_session_refresh_advertised_capacity(session, available_chunks);
+	ret = is_session_record_provider_available(session, available_chunks);
 	if (ret)
 		return ret;
 	if (available_chunks == 0)
@@ -1990,6 +2003,7 @@ static int is_session_init(struct is_rdma_fabric *fabric,
 	atomic_set(&session->send_busy, 0);
 	atomic_set(&session->rdma_reads_inflight, 0);
 	atomic_set(&session->operation_objects, 0);
+	atomic64_set(&session->capacity_observation, 0);
 	atomic_set(&session->disconnect_started, 0);
 	session->failure_started = false;
 	session->resolve_started = false;
@@ -2707,12 +2721,11 @@ ssize_t is_rdma_provider_runtime_status_show(
 		return sysfs_emit(page, "\n");
 	for (index = 0; index < fabric->session_count; index++) {
 		struct is_rdma_session *session = fabric->sessions[index];
-		unsigned int mapped = is_snapshot_provider_assigned_chunks(snapshot,
-			session->provider_handle);
-		unsigned int advertised =
-			READ_ONCE(session->advertised_capacity_chunks);
-		unsigned int available = advertised > mapped ?
-			advertised - mapped : 0;
+		const struct is_remote_chunk_provider_snapshot *provider =
+			is_snapshot_provider(snapshot, session->provider_handle);
+		unsigned int mapped = provider ? provider->usable_chunks : 0;
+		unsigned int available = is_session_observed_available_chunks(session,
+			snapshot);
 
 		if (written >= PAGE_SIZE - 128)
 			break;
