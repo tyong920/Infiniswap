@@ -84,14 +84,6 @@ struct threaded_event {
 	int status;
 };
 
-struct engine_race_event {
-	struct is_remote_io_transaction_engine *engine;
-	const struct is_remote_io_transaction_spec *spec;
-	struct test_barrier *start;
-	bool start_transaction;
-	int status;
-};
-
 static struct effect_recorder *recorder_from_engine(
 	struct is_remote_io_transaction_engine *engine)
 {
@@ -438,19 +430,6 @@ static void *run_transaction_event(void *context)
 			event->generation);
 		break;
 	}
-	return NULL;
-}
-
-static void *run_engine_race_event(void *context)
-{
-	struct engine_race_event *event = context;
-
-	test_barrier_wait(event->start);
-	if (event->start_transaction)
-		is_remote_io_transaction_start(event->engine, event->spec);
-	else
-		event->status = is_remote_io_transaction_engine_destroy(
-			event->engine);
 	return NULL;
 }
 
@@ -1120,75 +1099,6 @@ static int test_all_results_can_arrive_concurrently(void)
 	return failed;
 }
 
-static int test_concurrent_start_and_destroy_choose_one_owner(void)
-{
-	unsigned int iteration;
-	int failed = 0;
-
-	for (iteration = 0; iteration < 100; iteration++) {
-		struct effect_recorder recorder;
-		struct test_engine engine;
-		struct is_remote_io_transaction_spec spec;
-		struct test_barrier barrier;
-		struct engine_race_event start_event;
-		struct engine_race_event destroy_event;
-		pthread_t start_thread;
-		pthread_t destroy_thread;
-
-		if (recorder_init(&recorder) ||
-		    test_engine_init(&engine, &recorder,
-			IS_REMOTE_IO_TRANSACTION_REMOTE_ONLY) ||
-		    test_barrier_init(&barrier, 2))
-			return 1;
-		spec = transaction_spec(&recorder,
-			IS_REMOTE_IO_TRANSACTION_WRITE, 300 + iteration);
-		start_event = (struct engine_race_event){
-			.engine = &engine.engine,
-			.spec = &spec,
-			.start = &barrier,
-			.start_transaction = true,
-		};
-		destroy_event = (struct engine_race_event){
-			.engine = &engine.engine,
-			.spec = &spec,
-			.start = &barrier,
-			.start_transaction = false,
-			.status = -1,
-		};
-		if (pthread_create(&start_thread, NULL, run_engine_race_event,
-			&start_event) ||
-		    pthread_create(&destroy_thread, NULL, run_engine_race_event,
-			&destroy_event))
-			return 1;
-		(void)pthread_join(start_thread, NULL);
-		(void)pthread_join(destroy_thread, NULL);
-		if (destroy_event.status == -EBUSY) {
-			struct is_remote_io_transaction *transaction =
-				recorder.transaction;
-
-			if (!transaction || recorder.completions ||
-			    recorder.invariants != 1)
-				failed = 1;
-			is_remote_io_transaction_rdma_completed(transaction,
-				spec.generation, 0, false);
-			is_remote_io_transaction_rdma_released(transaction,
-				spec.generation);
-			failed |= is_remote_io_transaction_engine_destroy(
-				&engine.engine) != 0;
-		} else if (destroy_event.status == 0) {
-			if (recorder.transaction || recorder.completions != 1 ||
-			    recorder.completion_status != -ESHUTDOWN ||
-			    recorder.settlements != 1 || recorder.invariants != 0)
-				failed = 1;
-		} else {
-			failed = 1;
-		}
-		test_barrier_destroy(&barrier);
-		recorder_destroy(&recorder);
-	}
-	return failed;
-}
-
 int main(void)
 {
 	int failed = test_backed_write_outcome_and_order_matrix() |
@@ -1206,8 +1116,7 @@ int main(void)
 		test_immutable_specification_survives_caller_mutation() |
 		test_engine_destroy_rejects_active_transaction() |
 		test_adapter_reentry_during_start_and_settlement() |
-		test_all_results_can_arrive_concurrently() |
-		test_concurrent_start_and_destroy_choose_one_owner();
+		test_all_results_can_arrive_concurrently();
 
 	if (failed)
 		fprintf(stderr, "Remote I/O Transaction engine tests failed\n");

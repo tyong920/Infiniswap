@@ -34,41 +34,27 @@ static void is_transaction_lock_destroy(is_transaction_lock_t *lock)
 	(void)lock;
 }
 
-#define IS_ENGINE_DESTROYED (1U << 30)
-
 static void is_engine_counter_init(is_remote_io_transaction_counter_t *counter)
 {
 	atomic_set(counter, 0);
 }
 
-static bool is_engine_try_register(
+static void is_engine_counter_increment(
 	is_remote_io_transaction_counter_t *counter)
 {
-	int count = atomic_read(counter);
-
-	while (!((unsigned int)count & IS_ENGINE_DESTROYED)) {
-		int observed = atomic_cmpxchg(counter, count, count + 1);
-
-		if (observed == count)
-			return true;
-		count = observed;
-	}
-	return false;
-}
-
-static int is_engine_try_destroy(is_remote_io_transaction_counter_t *counter)
-{
-	int count = atomic_cmpxchg(counter, 0, (int)IS_ENGINE_DESTROYED);
-
-	if (count == 0)
-		return 0;
-	return ((unsigned int)count & IS_ENGINE_DESTROYED) ? -EINVAL : -EBUSY;
+	atomic_inc(counter);
 }
 
 static void is_engine_counter_decrement(
 	is_remote_io_transaction_counter_t *counter)
 {
 	atomic_dec(counter);
+}
+
+static unsigned int is_engine_counter_read(
+	const is_remote_io_transaction_counter_t *counter)
+{
+	return (unsigned int)atomic_read(counter);
 }
 #else
 #include <errno.h>
@@ -102,42 +88,27 @@ static void is_transaction_lock_destroy(is_transaction_lock_t *lock)
 	(void)pthread_mutex_destroy(lock);
 }
 
-#define IS_ENGINE_DESTROYED (1U << 30)
-
 static void is_engine_counter_init(is_remote_io_transaction_counter_t *counter)
 {
 	atomic_init(counter, 0);
 }
 
-static bool is_engine_try_register(
+static void is_engine_counter_increment(
 	is_remote_io_transaction_counter_t *counter)
 {
-	unsigned int count = atomic_load_explicit(counter, memory_order_acquire);
-
-	while (!(count & IS_ENGINE_DESTROYED)) {
-		if (atomic_compare_exchange_weak_explicit(counter, &count,
-				count + 1, memory_order_acquire,
-				memory_order_relaxed))
-			return true;
-	}
-	return false;
-}
-
-static int is_engine_try_destroy(is_remote_io_transaction_counter_t *counter)
-{
-	unsigned int count = 0;
-
-	if (atomic_compare_exchange_strong_explicit(counter, &count,
-			IS_ENGINE_DESTROYED, memory_order_acq_rel,
-			memory_order_acquire))
-		return 0;
-	return count & IS_ENGINE_DESTROYED ? -EINVAL : -EBUSY;
+	(void)atomic_fetch_add_explicit(counter, 1, memory_order_relaxed);
 }
 
 static void is_engine_counter_decrement(
 	is_remote_io_transaction_counter_t *counter)
 {
 	(void)atomic_fetch_sub_explicit(counter, 1, memory_order_release);
+}
+
+static unsigned int is_engine_counter_read(
+	const is_remote_io_transaction_counter_t *counter)
+{
+	return atomic_load_explicit(counter, memory_order_acquire);
 }
 #endif
 
@@ -347,18 +318,13 @@ int is_remote_io_transaction_engine_init(
 int is_remote_io_transaction_engine_destroy(
 	struct is_remote_io_transaction_engine *engine)
 {
-	int status;
-
-	if (!engine)
+	if (!engine || !engine->initialized)
 		return -EINVAL;
-	status = is_engine_try_destroy(&engine->active_transactions);
-	if (status == -EBUSY) {
+	if (is_engine_counter_read(&engine->active_transactions)) {
 		is_remote_io_transaction_adapter_invariant(engine, NULL, NULL,
 			IS_REMOTE_IO_TRANSACTION_EVENT_ENGINE_DESTROY_ACTIVE);
-		return status;
+		return -EBUSY;
 	}
-	if (status)
-		return status;
 	engine->initialized = 0;
 	return 0;
 }
@@ -373,10 +339,11 @@ void is_remote_io_transaction_start(
 
 	if (!engine || !spec)
 		return;
-	if (!is_engine_try_register(&engine->active_transactions)) {
+	if (!engine->initialized) {
 		is_transaction_reject_start(engine, spec, -ESHUTDOWN, false);
 		return;
 	}
+	is_engine_counter_increment(&engine->active_transactions);
 	if (!is_transaction_spec_valid(spec)) {
 		is_transaction_reject_start(engine, spec, -EINVAL, true);
 		return;
