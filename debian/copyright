@@ -14,7 +14,9 @@ License: GPL-2
  2 is available in /usr/share/common-licenses/GPL-2.
 
 Files: common/infiniswap_protocol.* common/infiniswap_placement.*
-       infiniswap_bd/is_io_policy.h infiniswap_daemon/infiniswap_auth.*
+       infiniswap_bd/is_io_policy.h infiniswap_bd/is_rdma_operation_owner.*
+       infiniswap_bd/tests/rdma-operation-owner-test.c
+       infiniswap_daemon/infiniswap_auth.*
        infiniswap_daemon/infiniswap_consumer_liveness.*
        infiniswap_daemon/infiniswap_memory_manager.*
        infiniswap_daemon/infiniswap_observability.*

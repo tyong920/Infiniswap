@@ -20,6 +20,7 @@
 #include "infiniswap.h"
 #include "infiniswap_placement.h"
 #include "is_rdma.h"
+#include "is_rdma_operation_owner.h"
 
 #define IS_FABRIC_NO_SESSION IS_MAX_PROVIDERS
 
@@ -114,11 +115,10 @@ struct is_rdma_operation {
 	u64 dma_addresses[IS_RDMA_MAX_SEGMENTS];
 	enum dma_data_direction direction;
 	struct delayed_work deadline_work;
-	refcount_t references;
+	struct is_rdma_operation_owner owner;
 	unsigned int mapped_segments;
 	unsigned int logical_chunk_id;
-	atomic_t callback_complete;
-	atomic_t timed_out;
+	bool listed;
 };
 
 struct is_rdma_session {
@@ -2438,17 +2438,6 @@ bool is_rdma_range_valid(struct is_device *device, sector_t sector,
 	return valid;
 }
 
-static void is_operation_put(struct is_rdma_operation *operation)
-{
-	struct is_rdma_session *session = operation->session;
-
-	if (!refcount_dec_and_test(&operation->references))
-		return;
-	atomic_dec(&session->operation_objects);
-	wake_up_all(&session->chunk_wait);
-	kfree(operation);
-}
-
 static void is_set_operation_remote_valid(struct is_rdma_operation *operation,
 					  bool valid)
 {
@@ -2467,53 +2456,109 @@ static void is_set_operation_remote_valid(struct is_rdma_operation *operation,
 	spin_unlock_irqrestore(&fabric->chunk_lock, flags);
 }
 
-static void is_operation_deadline(struct work_struct *work)
+static struct is_rdma_operation *is_operation_from_owner(
+	struct is_rdma_operation_owner *owner)
 {
-	struct is_rdma_operation *operation = container_of(
-		to_delayed_work(work), struct is_rdma_operation, deadline_work);
-	struct is_rdma_session *session = operation->session;
-
-	if (atomic_cmpxchg(&operation->callback_complete, 0, 1) == 0) {
-		atomic_set(&operation->timed_out, 1);
-		is_set_operation_remote_valid(operation, false);
-		atomic64_inc(&session->device->provider_timeouts_total);
-		is_fail_after_provider_timeout(session);
-		operation->io->complete(operation->io->context,
-			operation->io->generation, -ETIMEDOUT, true);
-	}
-	is_operation_put(operation);
+	return container_of(owner, struct is_rdma_operation, owner);
 }
 
-static void is_complete_operation(struct is_rdma_operation *operation,
-				  int status)
+void is_rdma_operation_adapter_arm_deadline(
+	struct is_rdma_operation_owner *owner)
 {
+	struct is_rdma_operation *operation = is_operation_from_owner(owner);
+
+	schedule_delayed_work(&operation->deadline_work,
+		msecs_to_jiffies(
+			operation->session->device->provider_failure_deadline_ms));
+}
+
+bool is_rdma_operation_adapter_cancel_deadline(
+	struct is_rdma_operation_owner *owner)
+{
+	return cancel_delayed_work(
+		&is_operation_from_owner(owner)->deadline_work);
+}
+
+void is_rdma_operation_adapter_retire_posted(
+	struct is_rdma_operation_owner *owner, int status,
+	bool late_completion)
+{
+	struct is_rdma_operation *operation = is_operation_from_owner(owner);
 	struct is_rdma_session *session = operation->session;
-	bool callback_ready;
-	bool remote_valid;
 	unsigned long flags;
 	unsigned int index;
 
-	spin_lock_irqsave(&session->operation_lock, flags);
-	callback_ready = atomic_cmpxchg(&operation->callback_complete, 0, 1) == 0;
-	spin_unlock_irqrestore(&session->operation_lock, flags);
-	if (cancel_delayed_work(&operation->deadline_work))
-		is_operation_put(operation);
 	for (index = 0; index < operation->mapped_segments; index++)
 		ib_dma_unmap_page(session->cm_id->device,
 			operation->dma_addresses[index],
 			operation->io->segments[index].length,
 			operation->direction);
+	operation->mapped_segments = 0;
 	if (!operation->io->write)
 		atomic_set(&session->rdma_reads_inflight, 0);
 	spin_lock_irqsave(&session->operation_lock, flags);
-	list_del(&operation->list);
+	if (operation->listed) {
+		list_del(&operation->list);
+		operation->listed = false;
+	}
 	spin_unlock_irqrestore(&session->operation_lock, flags);
 	atomic_dec(&operation->chunk->inflight);
 	wake_up_all(&session->chunk_wait);
-	if (callback_ready) {
+	if (status)
+		is_rdma_fail(session, status);
+	if (late_completion) {
+		is_set_operation_remote_valid(operation, false);
+		atomic64_inc(&session->device->late_rdma_completions_total);
+	}
+}
+
+void is_rdma_operation_adapter_abort_unposted(
+	struct is_rdma_operation_owner *owner)
+{
+	struct is_rdma_operation *operation = is_operation_from_owner(owner);
+	struct is_rdma_session *session = operation->session;
+	unsigned long flags;
+	unsigned int index;
+
+	spin_lock_irqsave(&session->operation_lock, flags);
+	if (operation->listed) {
+		list_del(&operation->list);
+		operation->listed = false;
+	}
+	spin_unlock_irqrestore(&session->operation_lock, flags);
+	for (index = 0; index < operation->mapped_segments; index++)
+		ib_dma_unmap_page(session->cm_id->device,
+			operation->dma_addresses[index],
+			operation->io->segments[index].length,
+			operation->direction);
+	operation->mapped_segments = 0;
+	atomic_dec(&operation->chunk->inflight);
+	if (!operation->io->write)
+		atomic_set(&session->rdma_reads_inflight, 0);
+	wake_up_all(&session->chunk_wait);
+}
+
+void is_rdma_operation_adapter_publish_terminal(
+	struct is_rdma_operation_owner *owner,
+	enum is_rdma_operation_terminal terminal, int status)
+{
+	struct is_rdma_operation *operation = is_operation_from_owner(owner);
+	struct is_rdma_session *session = operation->session;
+	bool remote_valid = false;
+
+	if (terminal == IS_RDMA_OPERATION_TERMINAL_DEADLINE) {
+		is_set_operation_remote_valid(operation, false);
+		atomic64_inc(&session->device->provider_timeouts_total);
+		operation->io->complete(operation->io->context,
+			operation->io->generation, status, true);
+		is_fail_after_provider_timeout(session);
+		return;
+	}
+	if (!status && is_remote_only(session)) {
+		unsigned long flags;
+
 		spin_lock_irqsave(&session->operation_lock, flags);
-		if (!status && is_remote_only(session) &&
-		    atomic_read(&session->device->remote_lost))
+		if (atomic_read(&session->device->remote_lost))
 			status = -EIO;
 		remote_valid = !status &&
 			atomic_read(&session->device->connection_state) ==
@@ -2522,13 +2567,52 @@ static void is_complete_operation(struct is_rdma_operation *operation,
 		operation->io->complete(operation->io->context,
 			operation->io->generation, status, false);
 		spin_unlock_irqrestore(&session->operation_lock, flags);
-	} else {
-		is_set_operation_remote_valid(operation, false);
-		if (atomic_read(&operation->timed_out))
-			atomic64_inc(&session->device->late_rdma_completions_total);
+		return;
 	}
+	remote_valid = !status &&
+		atomic_read(&session->device->connection_state) ==
+			IS_CONNECTION_CONNECTED;
+	is_set_operation_remote_valid(operation, remote_valid);
+	operation->io->complete(operation->io->context,
+		operation->io->generation, status, false);
+}
+
+void is_rdma_operation_adapter_release_transferred_io(
+	struct is_rdma_operation_owner *owner)
+{
+	struct is_rdma_operation *operation = is_operation_from_owner(owner);
+
 	operation->io->release(operation->io->context);
-	is_operation_put(operation);
+}
+
+void is_rdma_operation_adapter_destroy(
+	struct is_rdma_operation_owner *owner)
+{
+	struct is_rdma_operation *operation = is_operation_from_owner(owner);
+	struct is_rdma_session *session = operation->session;
+
+	atomic_dec(&session->operation_objects);
+	wake_up_all(&session->chunk_wait);
+	kfree(operation);
+}
+
+void is_rdma_operation_adapter_invariant(
+	struct is_rdma_operation_owner *owner,
+	enum is_rdma_operation_owner_event event)
+{
+	struct is_rdma_operation *operation = is_operation_from_owner(owner);
+
+	pr_warn(IS_DRIVER_NAME
+		": illegal RDMA operation lifecycle event %u on %s\n",
+		(unsigned int)event, operation->session->provider_id);
+}
+
+static void is_operation_deadline(struct work_struct *work)
+{
+	struct is_rdma_operation *operation = container_of(
+		to_delayed_work(work), struct is_rdma_operation, deadline_work);
+
+	is_rdma_operation_owner_provider_deadline(&operation->owner);
 }
 
 static void is_data_completion(struct ib_cq *cq, struct ib_wc *wc)
@@ -2538,9 +2622,7 @@ static void is_data_completion(struct ib_cq *cq, struct ib_wc *wc)
 	int status = wc->status == IB_WC_SUCCESS ? 0 : -EIO;
 
 	(void)cq;
-	if (status)
-		is_rdma_fail(operation->session, status);
-	is_complete_operation(operation, status);
+	is_rdma_operation_owner_rdma_completed(&operation->owner, status);
 }
 
 int is_rdma_submit(struct is_device *device, struct is_rdma_io *io)
@@ -2606,8 +2688,6 @@ int is_rdma_submit(struct is_device *device, struct is_rdma_io *io)
 	operation->logical_chunk_id = logical_chunk;
 	operation->direction = io->write ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
 	operation->cqe.done = is_data_completion;
-	atomic_set(&operation->callback_complete, 0);
-	atomic_set(&operation->timed_out, 0);
 	INIT_DELAYED_WORK(&operation->deadline_work, is_operation_deadline);
 	INIT_LIST_HEAD(&operation->list);
 	for (index = 0; index < io->segment_count; index++) {
@@ -2633,26 +2713,22 @@ int is_rdma_submit(struct is_device *device, struct is_rdma_io *io)
 	operation->wr.wr.send_flags = IB_SEND_SIGNALED;
 	operation->wr.remote_addr = chunk->remote_address + remote_offset;
 	operation->wr.rkey = chunk->remote_key;
-	refcount_set(&operation->references, 3);
+	ret = is_rdma_operation_owner_init(&operation->owner);
+	if (ret)
+		goto unmap_segments;
 	atomic_inc(&session->operation_objects);
 	spin_lock_irqsave(&session->operation_lock, flags);
 	list_add_tail(&operation->list, &session->operations);
+	operation->listed = true;
 	spin_unlock_irqrestore(&session->operation_lock, flags);
 	ret = ib_post_send(session->qp, &operation->wr.wr, &bad_wr);
 	if (!ret) {
-		if (atomic_read(&operation->callback_complete)) {
-			is_operation_put(operation);
-		} else {
-			schedule_delayed_work(&operation->deadline_work,
-				msecs_to_jiffies(
-					device->provider_failure_deadline_ms));
-		}
-		is_operation_put(operation);
+		is_rdma_operation_owner_post_succeeded(&operation->owner);
 		return 0;
 	}
-	spin_lock_irqsave(&session->operation_lock, flags);
-	list_del(&operation->list);
-	spin_unlock_irqrestore(&session->operation_lock, flags);
+	is_rdma_operation_owner_post_failed(&operation->owner);
+	return ret;
+
 unmap_segments:
 	while (operation->mapped_segments) {
 		index = --operation->mapped_segments;
@@ -2660,13 +2736,7 @@ unmap_segments:
 			operation->dma_addresses[index],
 			io->segments[index].length, operation->direction);
 	}
-	if (refcount_read(&operation->references)) {
-		is_operation_put(operation);
-		is_operation_put(operation);
-		is_operation_put(operation);
-	} else {
-		kfree(operation);
-	}
+	kfree(operation);
 release_chunk:
 	atomic_dec(&chunk->inflight);
 	wake_up_all(&session->chunk_wait);

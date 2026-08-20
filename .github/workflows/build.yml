@@ -167,6 +167,20 @@ jobs:
             -o "${{ runner.temp }}/io-policy-test"
           "${{ runner.temp }}/io-policy-test"
 
+      - name: Test Memory Consumer RDMA operation ownership
+        run: |
+          cc -std=c11 -Wall -Wextra -Wpedantic -Werror -pthread \
+            infiniswap_bd/is_rdma_operation_owner.c \
+            infiniswap_bd/tests/rdma-operation-owner-test.c \
+            -o "${{ runner.temp }}/rdma-operation-owner-test"
+          "${{ runner.temp }}/rdma-operation-owner-test"
+          cc -std=c11 -Wall -Wextra -Wpedantic -Werror -pthread \
+            -fsanitize=thread -g \
+            infiniswap_bd/is_rdma_operation_owner.c \
+            infiniswap_bd/tests/rdma-operation-owner-test.c \
+            -o "${{ runner.temp }}/rdma-operation-owner-test-tsan"
+          "${{ runner.temp }}/rdma-operation-owner-test-tsan"
+
       - name: Test RDMA tuple discovery
         run: infiniswap_bd/tests/rdma-build-flags-test.sh
 
