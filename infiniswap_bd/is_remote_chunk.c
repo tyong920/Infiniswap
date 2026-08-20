@@ -1010,7 +1010,7 @@ int is_remote_chunk_io_lease_resolve(
 	struct is_remote_chunk_io_lease_internal internal;
 	is_remote_chunk_lock_flags_t flags = 0;
 	struct is_remote_chunk *chunk;
-	bool current;
+	bool mapping_current;
 	int status;
 
 	if (!module || !lease || !result_out ||
@@ -1034,12 +1034,13 @@ int is_remote_chunk_io_lease_resolve(
 
 	internal.state |= IS_REMOTE_CHUNK_LEASE_RESOLVED;
 	chunk = &module->chunks[internal.logical_chunk];
-	current = chunk->mapping_generation == internal.mapping_generation;
-	if (current && internal.direction == IS_REMOTE_CHUNK_IO_WRITE)
+	mapping_current =
+		chunk->mapping_generation == internal.mapping_generation;
+	if (mapping_current && internal.direction == IS_REMOTE_CHUNK_IO_WRITE)
 		is_remote_chunk_validity_update(module->valid_sectors,
 			internal.sector, internal.sector_count,
 			outcome == IS_REMOTE_CHUNK_IO_SUCCESS);
-	*result_out = current ? IS_REMOTE_CHUNK_IO_RESOLVE_CURRENT :
+	*result_out = mapping_current ? IS_REMOTE_CHUNK_IO_RESOLVE_CURRENT :
 		IS_REMOTE_CHUNK_IO_RESOLVE_STALE;
 	is_remote_chunk_lease_encode(lease, &internal);
 	status = 0;
