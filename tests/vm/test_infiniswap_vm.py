@@ -244,6 +244,10 @@ class QemuScenarioTest(unittest.TestCase):
             ("provider-pressure", "start", "backed"),
         )
         self.assertEqual(
+            calls["eviction-delay"],
+            ("rdma-delay", "add", "rxe0", "1000"),
+        )
+        self.assertEqual(
             calls["eviction-observer-start"],
             ("observe-eviction", "start", "provider-0"),
         )

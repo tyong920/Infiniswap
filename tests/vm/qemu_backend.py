@@ -1064,7 +1064,7 @@ class QemuBackend:
             "rdma-delay",
             "add",
             consumer_rail,
-            "250",
+            "1000",
         )
         try:
             self._helper(
