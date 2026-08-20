@@ -5,11 +5,14 @@
 #include <linux/atomic.h>
 #include <linux/build_bug.h>
 #include <linux/errno.h>
+#include <linux/jiffies.h>
+#include <linux/ktime.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/vmalloc.h>
+#include <linux/wait.h>
 
 typedef spinlock_t is_remote_chunk_lock_t;
 typedef unsigned long is_remote_chunk_lock_flags_t;
@@ -76,6 +79,7 @@ static unsigned long long is_remote_chunk_allocate_module_identity(void)
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef pthread_mutex_t is_remote_chunk_lock_t;
 typedef int is_remote_chunk_lock_flags_t;
@@ -144,6 +148,7 @@ static unsigned long long is_remote_chunk_allocate_module_identity(void)
 #endif
 
 #define IS_REMOTE_CHUNK_CLAIM_MAGIC 0x49534348434c4149ULL
+#define IS_REMOTE_CHUNK_EVICTION_MAGIC 0x4953434845564943ULL
 #define IS_REMOTE_CHUNK_LEASE_MAGIC 0x495343484c454153ULL
 #define IS_REMOTE_CHUNK_ACTIVITY_MAX (~0ULL >> 1)
 #define IS_REMOTE_CHUNK_ID_MAX (~0ULL)
@@ -152,11 +157,13 @@ static unsigned long long is_remote_chunk_allocate_module_identity(void)
 #define IS_REMOTE_CHUNK_BITS_PER_WORD (sizeof(unsigned long) * 8U)
 #define IS_REMOTE_CHUNK_LEASE_RESOLVED (1U << 0)
 #define IS_REMOTE_CHUNK_LEASE_RELEASED (1U << 1)
+#define IS_REMOTE_CHUNK_WAIT_SLICE_NS 1000000000ULL
 
 enum is_remote_chunk_state {
 	IS_REMOTE_CHUNK_UNMAPPED = 0,
 	IS_REMOTE_CHUNK_MAPPING,
 	IS_REMOTE_CHUNK_MAPPED,
+	IS_REMOTE_CHUNK_EVICTING,
 };
 
 struct is_remote_chunk {
@@ -168,12 +175,18 @@ struct is_remote_chunk {
 	unsigned long long activity;
 	unsigned long long mapping_generation;
 	unsigned long long mapping_claim_id;
+	unsigned long long eviction_claim_id;
 	unsigned long long transition_generation;
 	unsigned int active_io_leases;
 };
 
 struct is_remote_chunk_module {
 	is_remote_chunk_lock_t lock;
+#ifdef __KERNEL__
+	wait_queue_head_t lease_wait;
+#else
+	pthread_cond_t lease_changed;
+#endif
 	struct is_remote_chunk *chunks;
 	unsigned long *valid_sectors;
 	enum is_remote_chunk_mode mode;
@@ -182,18 +195,33 @@ struct is_remote_chunk_module {
 	unsigned long long identity;
 	unsigned long long next_provider_serial;
 	unsigned long long next_mapping_claim_id;
+	unsigned long long next_eviction_claim_id;
 	unsigned long long next_transition_generation;
 	unsigned long long next_mapping_generation;
 	unsigned long long next_io_lease_id;
 	unsigned long long invariant_count;
 	enum is_remote_chunk_invariant_event latest_invariant;
 	unsigned int active_mapping_claims;
+	unsigned int active_eviction_claims;
+	unsigned int active_eviction_waits;
 	unsigned int active_io_leases;
 	unsigned int assigned_chunks;
 	unsigned int usable_chunks;
+	unsigned char quiescing;
 };
 
 struct is_remote_chunk_mapping_claim_internal {
+	unsigned long long magic;
+	unsigned long long module_identity;
+	struct is_remote_chunk_provider_handle provider;
+	unsigned long long claim_id;
+	unsigned long long transition_generation;
+	unsigned long long batch_digest;
+	unsigned int chunk_count;
+	unsigned int reserved;
+};
+
+struct is_remote_chunk_eviction_claim_internal {
 	unsigned long long magic;
 	unsigned long long module_identity;
 	struct is_remote_chunk_provider_handle provider;
@@ -217,15 +245,41 @@ struct is_remote_chunk_io_lease_internal {
 	unsigned int state;
 };
 
+static int is_remote_chunk_wait_init(struct is_remote_chunk_module *module)
+{
+#ifdef __KERNEL__
+	init_waitqueue_head(&module->lease_wait);
+	return 0;
+#else
+	int status = pthread_cond_init(&module->lease_changed, NULL);
+
+	return status ? -status : 0;
+#endif
+}
+
+static void is_remote_chunk_wait_destroy(struct is_remote_chunk_module *module)
+{
+#ifdef __KERNEL__
+	(void)module;
+#else
+	(void)pthread_cond_destroy(&module->lease_changed);
+#endif
+}
+
 #ifdef __KERNEL__
 static_assert(sizeof(struct is_remote_chunk_mapping_claim_internal) <=
 	IS_REMOTE_CHUNK_MAPPING_CLAIM_BYTES);
+static_assert(sizeof(struct is_remote_chunk_eviction_claim_internal) <=
+	IS_REMOTE_CHUNK_EVICTION_CLAIM_BYTES);
 static_assert(sizeof(struct is_remote_chunk_io_lease_internal) <=
 	IS_REMOTE_CHUNK_IO_LEASE_BYTES);
 #else
 _Static_assert(sizeof(struct is_remote_chunk_mapping_claim_internal) <=
 	IS_REMOTE_CHUNK_MAPPING_CLAIM_BYTES,
 	"mapping claim storage is too small");
+_Static_assert(sizeof(struct is_remote_chunk_eviction_claim_internal) <=
+	IS_REMOTE_CHUNK_EVICTION_CLAIM_BYTES,
+	"eviction claim storage is too small");
 _Static_assert(sizeof(struct is_remote_chunk_io_lease_internal) <=
 	IS_REMOTE_CHUNK_IO_LEASE_BYTES,
 	"I/O lease storage is too small");
@@ -296,6 +350,23 @@ static void is_remote_chunk_claim_encode(
 	memcpy(claim->opaque.bytes, internal, sizeof(*internal));
 }
 
+static void is_remote_chunk_eviction_claim_decode(
+	const struct is_remote_chunk_eviction_claim *claim,
+	struct is_remote_chunk_eviction_claim_internal *internal)
+{
+	memset(internal, 0, sizeof(*internal));
+	if (claim)
+		memcpy(internal, claim->opaque.bytes, sizeof(*internal));
+}
+
+static void is_remote_chunk_eviction_claim_encode(
+	struct is_remote_chunk_eviction_claim *claim,
+	const struct is_remote_chunk_eviction_claim_internal *internal)
+{
+	memset(claim, 0, sizeof(*claim));
+	memcpy(claim->opaque.bytes, internal, sizeof(*internal));
+}
+
 static void is_remote_chunk_lease_decode(
 	const struct is_remote_chunk_io_lease *lease,
 	struct is_remote_chunk_io_lease_internal *internal)
@@ -317,6 +388,30 @@ static unsigned long long is_remote_chunk_lease_storage_identity(
 	const struct is_remote_chunk_io_lease *lease)
 {
 	return (unsigned long long)(unsigned long)lease;
+}
+
+static void is_remote_chunk_wake_lease_waiters_locked(
+	struct is_remote_chunk_module *module)
+{
+#ifdef __KERNEL__
+	wake_up_all(&module->lease_wait);
+#else
+	(void)pthread_cond_broadcast(&module->lease_changed);
+#endif
+}
+
+static unsigned long long is_remote_chunk_monotonic_ns(void)
+{
+#ifdef __KERNEL__
+	return ktime_get_ns();
+#else
+	struct timespec now;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now))
+		return IS_REMOTE_CHUNK_ID_MAX;
+	return (unsigned long long)now.tv_sec * 1000000000ULL +
+		(unsigned long long)now.tv_nsec;
+#endif
 }
 
 static unsigned long is_remote_chunk_low_bits(unsigned int bit_count)
@@ -476,6 +571,55 @@ static bool is_remote_chunk_claim_active_locked(
 	return is_remote_chunk_claim_validate_locked(module, &internal) == 0;
 }
 
+static int is_remote_chunk_eviction_claim_validate_locked(
+	const struct is_remote_chunk_module *module,
+	const struct is_remote_chunk_eviction_claim_internal *claim)
+{
+	bool selected[IS_REMOTE_CHUNK_MAX_CHUNKS] = { false };
+	unsigned int member_count = 0;
+	unsigned int index;
+
+	if (claim->magic != IS_REMOTE_CHUNK_EVICTION_MAGIC || !claim->claim_id ||
+	    !claim->transition_generation || !claim->chunk_count)
+		return -EINVAL;
+	if (claim->module_identity != module->identity)
+		return -ESTALE;
+	if (!is_remote_chunk_provider_valid_locked(module, claim->provider))
+		return -ESTALE;
+	if (claim->chunk_count > module->chunk_count)
+		return -EINVAL;
+
+	for (index = 0; index < module->chunk_count; index++) {
+		const struct is_remote_chunk *chunk = &module->chunks[index];
+
+		if (chunk->eviction_claim_id != claim->claim_id)
+			continue;
+		if (chunk->state != IS_REMOTE_CHUNK_EVICTING ||
+		    chunk->transition_generation != claim->transition_generation ||
+		    !is_remote_chunk_provider_handle_equal(chunk->provider,
+			claim->provider))
+			return -ESTALE;
+		selected[index] = true;
+		member_count++;
+	}
+	if (member_count != claim->chunk_count ||
+	    is_remote_chunk_batch_digest(selected, module->chunk_count) !=
+		claim->batch_digest)
+		return -ESTALE;
+	return 0;
+}
+
+static bool is_remote_chunk_eviction_claim_active_locked(
+	const struct is_remote_chunk_module *module,
+	const struct is_remote_chunk_eviction_claim *claim)
+{
+	struct is_remote_chunk_eviction_claim_internal internal;
+
+	is_remote_chunk_eviction_claim_decode(claim, &internal);
+	return is_remote_chunk_eviction_claim_validate_locked(module,
+		&internal) == 0;
+}
+
 static int is_remote_chunk_mapping_begin_locked(
 	struct is_remote_chunk_module *module,
 	struct is_remote_chunk_provider_handle provider,
@@ -486,6 +630,8 @@ static int is_remote_chunk_mapping_begin_locked(
 	bool selected[IS_REMOTE_CHUNK_MAX_CHUNKS] = { false };
 	unsigned int index;
 
+	if (module->quiescing)
+		return -ESHUTDOWN;
 	if (!is_remote_chunk_provider_valid_locked(module, provider))
 		return -ESTALE;
 	if (is_remote_chunk_claim_active_locked(module, claim_out))
@@ -571,9 +717,18 @@ int is_remote_chunk_module_create(
 		is_remote_chunk_free(module);
 		return status < 0 ? status : -status;
 	}
+	status = is_remote_chunk_wait_init(module);
+	if (status) {
+		is_remote_chunk_lock_destroy(&module->lock);
+		is_remote_chunk_validity_free(module->valid_sectors);
+		is_remote_chunk_free(module->chunks);
+		is_remote_chunk_free(module);
+		return status;
+	}
 	module->identity = is_remote_chunk_allocate_module_identity();
 	if (!module->identity ||
 	    module->identity == IS_REMOTE_CHUNK_ID_MAX) {
+		is_remote_chunk_wait_destroy(module);
 		is_remote_chunk_lock_destroy(&module->lock);
 		is_remote_chunk_validity_free(module->valid_sectors);
 		is_remote_chunk_free(module->chunks);
@@ -587,6 +742,25 @@ int is_remote_chunk_module_create(
 	return 0;
 }
 
+int is_remote_chunk_module_quiesce(struct is_remote_chunk_module *module)
+{
+	is_remote_chunk_lock_flags_t flags = 0;
+	int status = 0;
+
+	if (!module)
+		return -EINVAL;
+	is_remote_chunk_lock(&module->lock, &flags);
+	if (module->quiescing) {
+		is_remote_chunk_note_invariant_locked(module,
+			IS_REMOTE_CHUNK_INVARIANT_MODULE_DUPLICATE_QUIESCE);
+		status = -EALREADY;
+	} else {
+		module->quiescing = 1;
+	}
+	is_remote_chunk_unlock(&module->lock, &flags);
+	return status;
+}
+
 int is_remote_chunk_module_destroy(struct is_remote_chunk_module *module)
 {
 	is_remote_chunk_lock_flags_t flags = 0;
@@ -594,11 +768,16 @@ int is_remote_chunk_module_destroy(struct is_remote_chunk_module *module)
 	if (!module)
 		return -EINVAL;
 	is_remote_chunk_lock(&module->lock, &flags);
-	if (module->active_mapping_claims || module->active_io_leases) {
+	module->quiescing = 1;
+	if (module->active_mapping_claims || module->active_eviction_claims ||
+	    module->active_eviction_waits || module->active_io_leases) {
+		is_remote_chunk_note_invariant_locked(module,
+			IS_REMOTE_CHUNK_INVARIANT_MODULE_DESTROY_ACTIVE);
 		is_remote_chunk_unlock(&module->lock, &flags);
 		return -EBUSY;
 	}
 	is_remote_chunk_unlock(&module->lock, &flags);
+	is_remote_chunk_wait_destroy(module);
 	is_remote_chunk_lock_destroy(&module->lock);
 	is_remote_chunk_validity_free(module->valid_sectors);
 	is_remote_chunk_free(module->chunks);
@@ -615,6 +794,10 @@ int is_remote_chunk_provider_handle_create(
 	if (!module || !provider_out)
 		return -EINVAL;
 	is_remote_chunk_lock(&module->lock, &flags);
+	if (module->quiescing) {
+		is_remote_chunk_unlock(&module->lock, &flags);
+		return -ESHUTDOWN;
+	}
 	if (module->next_provider_serial == IS_REMOTE_CHUNK_ID_MAX) {
 		is_remote_chunk_unlock(&module->lock, &flags);
 		return -EOVERFLOW;
@@ -640,6 +823,10 @@ int is_remote_chunk_hot_policy_set(
 	if (!is_remote_chunk_hot_policy_valid(policy))
 		return -ERANGE;
 	is_remote_chunk_lock(&module->lock, &flags);
+	if (module->quiescing) {
+		is_remote_chunk_unlock(&module->lock, &flags);
+		return -ESHUTDOWN;
+	}
 	module->hot_policy = *policy;
 	if (module->mode == IS_REMOTE_CHUNK_MODE_BACKED) {
 		for (index = 0; index < module->chunk_count; index++) {
@@ -677,6 +864,10 @@ int is_remote_chunk_note_activity(
 		return -ERANGE;
 
 	is_remote_chunk_lock(&module->lock, &flags);
+	if (module->quiescing) {
+		is_remote_chunk_unlock(&module->lock, &flags);
+		return -ESHUTDOWN;
+	}
 	if (module->mode != IS_REMOTE_CHUNK_MODE_BACKED) {
 		is_remote_chunk_unlock(&module->lock, &flags);
 		return -EOPNOTSUPP;
@@ -735,6 +926,10 @@ int is_remote_chunk_mapping_begin_hot(
 	if (!module || !claim_out || !logical_chunk_out)
 		return -EINVAL;
 	is_remote_chunk_lock(&module->lock, &flags);
+	if (module->quiescing) {
+		is_remote_chunk_unlock(&module->lock, &flags);
+		return -ESHUTDOWN;
+	}
 	if (module->mode != IS_REMOTE_CHUNK_MODE_BACKED) {
 		is_remote_chunk_unlock(&module->lock, &flags);
 		return -EOPNOTSUPP;
@@ -828,6 +1023,10 @@ int is_remote_chunk_mapping_commit(
 	status = is_remote_chunk_claim_validate_locked(module, &claim);
 	if (status)
 		goto out;
+	if (module->quiescing) {
+		status = -ESHUTDOWN;
+		goto out;
+	}
 	if (!is_remote_chunk_provider_handle_equal(provider, claim.provider)) {
 		status = -ESTALE;
 		goto out;
@@ -905,6 +1104,421 @@ out:
 	return status;
 }
 
+static int is_remote_chunk_find_provider_chunk_locked(
+	const struct is_remote_chunk_module *module,
+	struct is_remote_chunk_provider_handle provider,
+	unsigned int provider_chunk, bool require_usable,
+	unsigned int *logical_chunk_out)
+{
+	unsigned int index;
+
+	for (index = 0; index < module->chunk_count; index++) {
+		const struct is_remote_chunk *chunk = &module->chunks[index];
+		bool assigned = chunk->state == IS_REMOTE_CHUNK_MAPPED ||
+			chunk->state == IS_REMOTE_CHUNK_EVICTING;
+
+		if (assigned && (!require_usable ||
+			chunk->state == IS_REMOTE_CHUNK_MAPPED) &&
+		    chunk->provider_chunk == provider_chunk &&
+		    is_remote_chunk_provider_handle_equal(chunk->provider, provider)) {
+			*logical_chunk_out = index;
+			return 0;
+		}
+	}
+	return -ENOENT;
+}
+
+int is_remote_chunk_provider_activity_query(
+	struct is_remote_chunk_module *module,
+	struct is_remote_chunk_provider_handle provider,
+	const unsigned int *provider_chunks, unsigned int chunk_count,
+	struct is_remote_chunk_provider_activity *activity_out)
+{
+	unsigned char logical_chunks[IS_REMOTE_CHUNK_MAX_CHUNKS];
+	is_remote_chunk_lock_flags_t flags = 0;
+	unsigned int index;
+	int status = 0;
+
+	if (!module || !provider_chunks || !chunk_count || !activity_out ||
+	    chunk_count > module->chunk_count)
+		return -EINVAL;
+	is_remote_chunk_lock(&module->lock, &flags);
+	if (module->mode != IS_REMOTE_CHUNK_MODE_BACKED) {
+		status = -EOPNOTSUPP;
+		goto out;
+	}
+	if (!is_remote_chunk_provider_valid_locked(module, provider)) {
+		status = -ESTALE;
+		goto out;
+	}
+	for (index = 0; index < chunk_count; index++) {
+		unsigned int logical_chunk;
+		unsigned int other;
+
+		for (other = 0; other < index; other++) {
+			if (provider_chunks[other] == provider_chunks[index]) {
+				status = -EINVAL;
+				goto out;
+			}
+		}
+		status = is_remote_chunk_find_provider_chunk_locked(module, provider,
+			provider_chunks[index], false, &logical_chunk);
+		if (status)
+			goto out;
+		logical_chunks[index] = (unsigned char)logical_chunk;
+	}
+	for (index = 0; index < chunk_count; index++) {
+		activity_out[index].provider_chunk = provider_chunks[index];
+		activity_out[index].activity =
+			module->chunks[logical_chunks[index]].activity;
+	}
+out:
+	is_remote_chunk_unlock(&module->lock, &flags);
+	return status;
+}
+
+int is_remote_chunk_eviction_begin(
+	struct is_remote_chunk_module *module,
+	struct is_remote_chunk_provider_handle provider,
+	const unsigned int *provider_chunks, unsigned int chunk_count,
+	struct is_remote_chunk_eviction_claim *claim_out)
+{
+	struct is_remote_chunk_eviction_claim_internal claim = { 0 };
+	bool selected[IS_REMOTE_CHUNK_MAX_CHUNKS] = { false };
+	is_remote_chunk_lock_flags_t flags = 0;
+	unsigned int index;
+	int status = 0;
+
+	if (!module || !provider_chunks || !chunk_count || !claim_out ||
+	    chunk_count > module->chunk_count)
+		return -EINVAL;
+	is_remote_chunk_lock(&module->lock, &flags);
+	if (module->mode != IS_REMOTE_CHUNK_MODE_BACKED) {
+		status = -EOPNOTSUPP;
+		goto out;
+	}
+	if (module->quiescing) {
+		status = -ESHUTDOWN;
+		goto out;
+	}
+	if (!is_remote_chunk_provider_valid_locked(module, provider)) {
+		status = -ESTALE;
+		goto out;
+	}
+	if (is_remote_chunk_eviction_claim_active_locked(module, claim_out)) {
+		status = -EBUSY;
+		goto out;
+	}
+	for (index = 0; index < chunk_count; index++) {
+		unsigned int logical_chunk;
+
+		status = is_remote_chunk_find_provider_chunk_locked(module, provider,
+			provider_chunks[index], true, &logical_chunk);
+		if (status)
+			goto out;
+		if (selected[logical_chunk]) {
+			status = -EINVAL;
+			goto out;
+		}
+		selected[logical_chunk] = true;
+	}
+	if (module->next_eviction_claim_id == IS_REMOTE_CHUNK_ID_MAX ||
+	    module->next_transition_generation == IS_REMOTE_CHUNK_ID_MAX ||
+	    module->usable_chunks < chunk_count ||
+	    module->active_eviction_claims == ~0U) {
+		status = -EOVERFLOW;
+		goto out;
+	}
+
+	claim.magic = IS_REMOTE_CHUNK_EVICTION_MAGIC;
+	claim.module_identity = module->identity;
+	claim.provider = provider;
+	claim.claim_id = ++module->next_eviction_claim_id;
+	claim.transition_generation = ++module->next_transition_generation;
+	claim.batch_digest = is_remote_chunk_batch_digest(selected,
+		module->chunk_count);
+	claim.chunk_count = chunk_count;
+	for (index = 0; index < module->chunk_count; index++) {
+		struct is_remote_chunk *chunk;
+
+		if (!selected[index])
+			continue;
+		chunk = &module->chunks[index];
+		chunk->state = IS_REMOTE_CHUNK_EVICTING;
+		chunk->eviction_claim_id = claim.claim_id;
+		chunk->transition_generation = claim.transition_generation;
+	}
+	module->usable_chunks -= chunk_count;
+	module->active_eviction_claims++;
+	is_remote_chunk_eviction_claim_encode(claim_out, &claim);
+out:
+	is_remote_chunk_unlock(&module->lock, &flags);
+	return status;
+}
+
+static bool is_remote_chunk_eviction_drained_locked(
+	const struct is_remote_chunk_module *module,
+	const struct is_remote_chunk_eviction_claim_internal *claim)
+{
+	unsigned int index;
+
+	for (index = 0; index < module->chunk_count; index++) {
+		const struct is_remote_chunk *chunk = &module->chunks[index];
+
+		if (chunk->eviction_claim_id == claim->claim_id &&
+		    chunk->active_io_leases)
+			return false;
+	}
+	return true;
+}
+
+#ifdef __KERNEL__
+static bool is_remote_chunk_eviction_wait_ready(
+	struct is_remote_chunk_module *module,
+	const struct is_remote_chunk_eviction_claim *claim_storage)
+{
+	struct is_remote_chunk_eviction_claim_internal claim;
+	is_remote_chunk_lock_flags_t flags = 0;
+	bool ready;
+
+	is_remote_chunk_eviction_claim_decode(claim_storage, &claim);
+	is_remote_chunk_lock(&module->lock, &flags);
+	ready = is_remote_chunk_eviction_claim_validate_locked(module, &claim) != 0 ||
+		is_remote_chunk_eviction_drained_locked(module, &claim);
+	is_remote_chunk_unlock(&module->lock, &flags);
+	return ready;
+}
+#endif
+
+int is_remote_chunk_eviction_wait(
+	struct is_remote_chunk_module *module,
+	const struct is_remote_chunk_eviction_claim *claim_storage,
+	unsigned long long deadline_monotonic_ns)
+{
+	struct is_remote_chunk_eviction_claim_internal claim;
+	is_remote_chunk_lock_flags_t flags = 0;
+	int status;
+
+	if (!module || !claim_storage || !deadline_monotonic_ns)
+		return -EINVAL;
+	is_remote_chunk_eviction_claim_decode(claim_storage, &claim);
+	is_remote_chunk_lock(&module->lock, &flags);
+	status = is_remote_chunk_eviction_claim_validate_locked(module, &claim);
+	if (status)
+		goto out;
+	if (module->active_eviction_waits == ~0U) {
+		status = -EOVERFLOW;
+		goto out;
+	}
+	module->active_eviction_waits++;
+	for (;;) {
+		unsigned long long now;
+
+		status = is_remote_chunk_eviction_claim_validate_locked(module, &claim);
+		if (status || is_remote_chunk_eviction_drained_locked(module, &claim))
+			break;
+		now = is_remote_chunk_monotonic_ns();
+		if (now == IS_REMOTE_CHUNK_ID_MAX) {
+			status = -EIO;
+			break;
+		}
+		if (now >= deadline_monotonic_ns) {
+			status = -ETIMEDOUT;
+			break;
+		}
+#ifdef __KERNEL__
+		{
+			unsigned long long remaining_ns = deadline_monotonic_ns - now;
+			unsigned long remaining;
+
+			if (remaining_ns > IS_REMOTE_CHUNK_WAIT_SLICE_NS)
+				remaining_ns = IS_REMOTE_CHUNK_WAIT_SLICE_NS;
+			remaining = nsecs_to_jiffies(remaining_ns);
+
+			if (!remaining)
+				remaining = 1;
+			is_remote_chunk_unlock(&module->lock, &flags);
+			(void)wait_event_timeout(module->lease_wait,
+				is_remote_chunk_eviction_wait_ready(module, claim_storage),
+				remaining);
+			is_remote_chunk_lock(&module->lock, &flags);
+		}
+#else
+		{
+			struct timespec realtime;
+			unsigned long long remaining_ns = deadline_monotonic_ns - now;
+			unsigned long long absolute_ns;
+			int wait_status;
+
+			if (remaining_ns > IS_REMOTE_CHUNK_WAIT_SLICE_NS)
+				remaining_ns = IS_REMOTE_CHUNK_WAIT_SLICE_NS;
+			if (clock_gettime(CLOCK_REALTIME, &realtime)) {
+				status = -EIO;
+				break;
+			}
+			absolute_ns = (unsigned long long)realtime.tv_nsec +
+				remaining_ns;
+			realtime.tv_sec += (time_t)(absolute_ns / 1000000000ULL);
+			realtime.tv_nsec = (long)(absolute_ns % 1000000000ULL);
+			wait_status = pthread_cond_timedwait(&module->lease_changed,
+				&module->lock, &realtime);
+			if (wait_status && wait_status != ETIMEDOUT) {
+				status = -wait_status;
+				break;
+			}
+		}
+#endif
+	}
+	module->active_eviction_waits--;
+out:
+	is_remote_chunk_unlock(&module->lock, &flags);
+	return status;
+}
+
+static void is_remote_chunk_reset_mapping_locked(
+	struct is_remote_chunk_module *module, unsigned int logical_chunk,
+	bool reset_activity)
+{
+	struct is_remote_chunk *chunk = &module->chunks[logical_chunk];
+
+	is_remote_chunk_validity_update(module->valid_sectors,
+		(unsigned long long)logical_chunk *
+			IS_REMOTE_CHUNK_SECTORS_PER_CHUNK,
+		(unsigned int)IS_REMOTE_CHUNK_SECTORS_PER_CHUNK, false);
+	chunk->mapping_generation = ++module->next_mapping_generation;
+	memset(&chunk->provider, 0, sizeof(chunk->provider));
+	chunk->provider_chunk = 0;
+	chunk->remote_address = 0;
+	chunk->remote_key = 0;
+	chunk->mapping_claim_id = 0;
+	chunk->eviction_claim_id = 0;
+	chunk->transition_generation = 0;
+	if (reset_activity)
+		chunk->activity = 0;
+	chunk->state = IS_REMOTE_CHUNK_UNMAPPED;
+}
+
+int is_remote_chunk_eviction_finish(
+	struct is_remote_chunk_module *module,
+	const struct is_remote_chunk_eviction_claim *claim_storage)
+{
+	struct is_remote_chunk_eviction_claim_internal claim;
+	is_remote_chunk_lock_flags_t flags = 0;
+	unsigned int index;
+	int status;
+
+	if (!module || !claim_storage)
+		return -EINVAL;
+	is_remote_chunk_eviction_claim_decode(claim_storage, &claim);
+	is_remote_chunk_lock(&module->lock, &flags);
+	status = is_remote_chunk_eviction_claim_validate_locked(module, &claim);
+	if (status)
+		goto out;
+	if (!is_remote_chunk_eviction_drained_locked(module, &claim)) {
+		is_remote_chunk_note_invariant_locked(module,
+			IS_REMOTE_CHUNK_INVARIANT_EVICTION_FINISH_ACTIVE_LEASES);
+		status = -EBUSY;
+		goto out;
+	}
+	if (module->next_mapping_generation >
+	    IS_REMOTE_CHUNK_ID_MAX - claim.chunk_count ||
+	    module->assigned_chunks < claim.chunk_count ||
+	    !module->active_eviction_claims) {
+		status = -EOVERFLOW;
+		goto out;
+	}
+	for (index = 0; index < module->chunk_count; index++) {
+		if (module->chunks[index].eviction_claim_id == claim.claim_id)
+			is_remote_chunk_reset_mapping_locked(module, index, true);
+	}
+	module->assigned_chunks -= claim.chunk_count;
+	module->active_eviction_claims--;
+	is_remote_chunk_wake_lease_waiters_locked(module);
+	status = 0;
+out:
+	is_remote_chunk_unlock(&module->lock, &flags);
+	return status;
+}
+
+int is_remote_chunk_provider_failed(
+	struct is_remote_chunk_module *module,
+	struct is_remote_chunk_provider_handle provider,
+	struct is_remote_chunk_provider_failure_facts *facts_out)
+{
+	struct is_remote_chunk_provider_failure_facts facts = { 0 };
+	is_remote_chunk_lock_flags_t flags = 0;
+	unsigned int mapping_claims = 0;
+	unsigned int eviction_claims = 0;
+	unsigned int index;
+	int status = 0;
+
+	if (!module || !facts_out)
+		return -EINVAL;
+	is_remote_chunk_lock(&module->lock, &flags);
+	if (!is_remote_chunk_provider_valid_locked(module, provider)) {
+		status = -ESTALE;
+		goto out;
+	}
+	for (index = 0; index < module->chunk_count; index++) {
+		const struct is_remote_chunk *chunk = &module->chunks[index];
+		unsigned int previous;
+
+		if (chunk->state == IS_REMOTE_CHUNK_UNMAPPED ||
+		    !is_remote_chunk_provider_handle_equal(chunk->provider, provider))
+			continue;
+		facts.affected_chunks++;
+		facts.active_io_leases += chunk->active_io_leases;
+		/* Mapping and eviction claims are Provider-scoped batches. */
+		if (chunk->state == IS_REMOTE_CHUNK_MAPPING) {
+			facts.mapping_chunks++;
+			for (previous = 0; previous < index; previous++) {
+				if (module->chunks[previous].mapping_claim_id ==
+				    chunk->mapping_claim_id)
+					break;
+			}
+			mapping_claims += previous == index;
+		} else {
+			facts.assigned_chunks++;
+			if (chunk->state == IS_REMOTE_CHUNK_MAPPED) {
+				facts.usable_chunks++;
+			} else {
+				facts.evicting_chunks++;
+				for (previous = 0; previous < index; previous++) {
+					if (module->chunks[previous].eviction_claim_id ==
+					    chunk->eviction_claim_id)
+						break;
+				}
+				eviction_claims += previous == index;
+			}
+		}
+	}
+	if (module->next_mapping_generation >
+	    IS_REMOTE_CHUNK_ID_MAX - facts.affected_chunks ||
+	    module->assigned_chunks < facts.assigned_chunks ||
+	    module->usable_chunks < facts.usable_chunks ||
+	    module->active_mapping_claims < mapping_claims ||
+	    module->active_eviction_claims < eviction_claims) {
+		status = -EOVERFLOW;
+		goto out;
+	}
+	for (index = 0; index < module->chunk_count; index++) {
+		struct is_remote_chunk *chunk = &module->chunks[index];
+
+		if (chunk->state != IS_REMOTE_CHUNK_UNMAPPED &&
+		    is_remote_chunk_provider_handle_equal(chunk->provider, provider))
+			is_remote_chunk_reset_mapping_locked(module, index, false);
+	}
+	module->assigned_chunks -= facts.assigned_chunks;
+	module->usable_chunks -= facts.usable_chunks;
+	module->active_mapping_claims -= mapping_claims;
+	module->active_eviction_claims -= eviction_claims;
+	is_remote_chunk_wake_lease_waiters_locked(module);
+	*facts_out = facts;
+out:
+	is_remote_chunk_unlock(&module->lock, &flags);
+	return status;
+}
+
 int is_remote_chunk_io_lease_acquire(
 	struct is_remote_chunk_module *module,
 	const struct is_remote_chunk_io_request *request,
@@ -939,6 +1553,10 @@ int is_remote_chunk_io_lease_acquire(
 		return -ERANGE;
 
 	is_remote_chunk_lock(&module->lock, &flags);
+	if (module->quiescing) {
+		status = -ESHUTDOWN;
+		goto out;
+	}
 	is_remote_chunk_lease_decode(lease, &previous);
 	if (previous.magic && previous.magic != IS_REMOTE_CHUNK_LEASE_MAGIC) {
 		status = -EINVAL;
@@ -1088,6 +1706,7 @@ int is_remote_chunk_io_lease_release(
 	module->active_io_leases--;
 	internal.state |= IS_REMOTE_CHUNK_LEASE_RELEASED;
 	is_remote_chunk_lease_encode(lease, &internal);
+	is_remote_chunk_wake_lease_waiters_locked(module);
 	status = 0;
 out:
 	is_remote_chunk_unlock(&module->lock, &flags);
@@ -1141,9 +1760,11 @@ int is_remote_chunk_snapshot_take(
 	snapshot->assigned_chunks = module->assigned_chunks;
 	snapshot->usable_chunks = module->usable_chunks;
 	snapshot->active_mapping_claims = module->active_mapping_claims;
+	snapshot->active_eviction_claims = module->active_eviction_claims;
 	snapshot->active_io_leases = module->active_io_leases;
 	snapshot->invariant_count = module->invariant_count;
 	snapshot->latest_invariant = module->latest_invariant;
+	snapshot->quiescing = module->quiescing != 0;
 	snapshot->hot_policy = module->hot_policy;
 	for (index = 0; index < module->chunk_count; index++) {
 		const struct is_remote_chunk *chunk = &module->chunks[index];
@@ -1156,20 +1777,25 @@ int is_remote_chunk_snapshot_take(
 		}
 		if (chunk->state == IS_REMOTE_CHUNK_MAPPING) {
 			snapshot->mapping_chunks++;
-		} else if (chunk->state == IS_REMOTE_CHUNK_MAPPED) {
+		} else if (chunk->state == IS_REMOTE_CHUNK_MAPPED ||
+			   chunk->state == IS_REMOTE_CHUNK_EVICTING) {
 			struct is_remote_chunk_placement_snapshot *placement =
 				&snapshot->placements[snapshot->placement_count++];
 			unsigned int provider_index =
 				is_remote_chunk_snapshot_provider_index(snapshot,
 					chunk->provider);
+			bool usable = chunk->state == IS_REMOTE_CHUNK_MAPPED;
 
 			placement->provider = chunk->provider;
 			placement->logical_chunk = index;
-			placement->usable = true;
+			placement->usable = usable;
 			snapshot->providers[provider_index].assigned_chunks++;
-			snapshot->providers[provider_index].usable_chunks++;
+			if (usable)
+				snapshot->providers[provider_index].usable_chunks++;
+			else
+				snapshot->evicting_chunks++;
 			derived_assigned++;
-			derived_usable++;
+			derived_usable += usable;
 		}
 	}
 	if (derived_assigned != module->assigned_chunks ||

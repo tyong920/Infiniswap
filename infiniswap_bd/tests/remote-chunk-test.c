@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <time.h>
 
 #define TEST_THRESHOLD 8ULL
 #define TEST_READ_WEIGHT 1U
@@ -64,6 +65,17 @@ struct concurrent_lease_event {
 	int status;
 };
 
+static unsigned long long monotonic_deadline_after_ms(unsigned int timeout_ms)
+{
+	struct timespec now;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now))
+		return 0;
+	return (unsigned long long)now.tv_sec * 1000000000ULL +
+		(unsigned long long)now.tv_nsec +
+		(unsigned long long)timeout_ms * 1000000ULL;
+}
+
 static struct is_remote_chunk_mapping_grant mapping_grant(
 	unsigned int logical_chunk, unsigned int provider_chunk)
 {
@@ -75,6 +87,38 @@ static struct is_remote_chunk_mapping_grant mapping_grant(
 	};
 
 	return grant;
+}
+
+static int map_backed_chunk(struct is_remote_chunk_module *module,
+	struct is_remote_chunk_provider_handle provider,
+	unsigned int logical_chunk, unsigned int provider_chunk)
+{
+	struct is_remote_chunk_mapping_claim claim =
+		IS_REMOTE_CHUNK_MAPPING_CLAIM_INIT;
+	struct is_remote_chunk_mapping_grant grant =
+		mapping_grant(logical_chunk, provider_chunk);
+	unsigned int selected = ~0U;
+	bool mapping_needed = false;
+	int status;
+
+	status = is_remote_chunk_note_activity(module, logical_chunk, 1,
+		IS_REMOTE_CHUNK_ACTIVITY_WRITE, &mapping_needed);
+	if (!status)
+		status = is_remote_chunk_note_activity(module, logical_chunk, 1,
+			IS_REMOTE_CHUNK_ACTIVITY_WRITE, &mapping_needed);
+	if (!status && !mapping_needed)
+		status = -EINVAL;
+	if (!status)
+		status = is_remote_chunk_mapping_begin_hot(module, provider, &claim,
+			&selected);
+	if (!status && selected != logical_chunk)
+		status = -EINVAL;
+	if (!status)
+		status = is_remote_chunk_mapping_commit(module, &claim, provider,
+			&grant, 1);
+	if (status)
+		(void)is_remote_chunk_mapping_abort(module, &claim);
+	return status;
 }
 
 static int map_remote_only_chunk(struct is_remote_chunk_module *module,
@@ -727,7 +771,7 @@ static int test_illegal_lease_lifetimes_report_typed_invariants(void)
 	    is_remote_chunk_io_lease_release(module, &lease) != -EALREADY)
 		failed = 1;
 	if (is_remote_chunk_snapshot_take(module, &snapshot) ||
-	    snapshot->active_io_leases != 0 || snapshot->invariant_count != 3 ||
+	    snapshot->active_io_leases != 0 || snapshot->invariant_count != 4 ||
 	    snapshot->latest_invariant !=
 		IS_REMOTE_CHUNK_INVARIANT_LEASE_DUPLICATE_RELEASE)
 		failed = 1;
@@ -1012,6 +1056,546 @@ static int test_io_admission_is_atomic_and_returns_mapping(void)
 	return failed;
 }
 
+static int test_provider_activity_query_and_eviction_are_atomic(void)
+{
+	struct is_remote_chunk_module *module = NULL;
+	struct is_remote_chunk_provider_handle provider;
+	struct is_remote_chunk_eviction_claim claim =
+		IS_REMOTE_CHUNK_EVICTION_CLAIM_INIT;
+	const unsigned int provider_chunks[] = { 21, 20 };
+	const unsigned int duplicate_chunks[] = { 20, 20 };
+	const unsigned int malformed_chunks[] = { 20, 99 };
+	struct is_remote_chunk_provider_activity activity[2] = {
+		{ .provider_chunk = 999, .activity = 999 },
+		{ .provider_chunk = 999, .activity = 999 },
+	};
+	struct is_remote_chunk_snapshot *snapshot = NULL;
+	struct is_remote_chunk_mapping_claim mapping_claim =
+		IS_REMOTE_CHUNK_MAPPING_CLAIM_INIT;
+	unsigned int logical_chunk = ~0U;
+	int failed = 0;
+
+	if (is_remote_chunk_module_create(&backed_config, &module) ||
+	    is_remote_chunk_provider_handle_create(module, &provider) ||
+	    map_backed_chunk(module, provider, 0, 20) ||
+	    map_backed_chunk(module, provider, 1, 21))
+		return 1;
+	if (is_remote_chunk_provider_activity_query(module, provider,
+		provider_chunks, 2, activity) ||
+	    activity[0].provider_chunk != 21 || activity[0].activity != 8 ||
+	    activity[1].provider_chunk != 20 || activity[1].activity != 8)
+		failed = 1;
+	if (is_remote_chunk_provider_activity_query(module, provider,
+		duplicate_chunks, 2, activity) != -EINVAL ||
+	    activity[0].provider_chunk != 21 || activity[0].activity != 8 ||
+	    activity[1].provider_chunk != 20 || activity[1].activity != 8)
+		failed = 1;
+	if (is_remote_chunk_provider_activity_query(module, provider,
+		malformed_chunks, 2, activity) != -ENOENT ||
+	    activity[0].provider_chunk != 21 || activity[0].activity != 8 ||
+	    activity[1].provider_chunk != 20 || activity[1].activity != 8)
+		failed = 1;
+	if (is_remote_chunk_eviction_begin(module, provider, duplicate_chunks, 2,
+		&claim) != -EINVAL ||
+	    is_remote_chunk_eviction_begin(module, provider, malformed_chunks, 2,
+		&claim) != -ENOENT)
+		failed = 1;
+	failed |= expect_snapshot(module, 2, 2, 0, 0, 2,
+		"malformed eviction batch");
+	if (is_remote_chunk_eviction_begin(module, provider, provider_chunks, 2,
+		&claim))
+		failed = 1;
+	if (is_remote_chunk_snapshot_take(module, &snapshot) ||
+	    snapshot->assigned_chunks != 2 || snapshot->usable_chunks != 0 ||
+	    snapshot->evicting_chunks != 2 ||
+	    snapshot->active_eviction_claims != 1 ||
+	    snapshot->placement_count != 2 || snapshot->placements[0].usable ||
+	    snapshot->placements[1].usable)
+		failed = 1;
+	is_remote_chunk_snapshot_release(snapshot);
+	if (is_remote_chunk_eviction_wait(module, &claim,
+		monotonic_deadline_after_ms(100)) ||
+	    is_remote_chunk_eviction_finish(module, &claim))
+		failed = 1;
+	failed |= expect_snapshot(module, 0, 0, 0, 0, 0,
+		"finished eviction batch");
+	if (is_remote_chunk_mapping_begin_hot(module, provider, &mapping_claim,
+		&logical_chunk) != -ENOENT)
+		failed = 1;
+	failed |= is_remote_chunk_module_destroy(module) != 0;
+	return failed;
+}
+
+static int test_eviction_wait_times_out_without_choosing_policy(void)
+{
+	struct is_remote_chunk_module *module = NULL;
+	struct is_remote_chunk_provider_handle provider;
+	struct is_remote_chunk_eviction_claim claim =
+		IS_REMOTE_CHUNK_EVICTION_CLAIM_INIT;
+	struct is_remote_chunk_io_lease lease = IS_REMOTE_CHUNK_IO_LEASE_INIT;
+	struct is_remote_chunk_io_lease rejected = IS_REMOTE_CHUNK_IO_LEASE_INIT;
+	struct is_remote_chunk_io_request request = {
+		.direction = IS_REMOTE_CHUNK_IO_WRITE,
+		.sector = 8,
+		.bytes = 4096,
+	};
+	struct is_remote_chunk_transport_mapping mapping;
+	struct is_remote_chunk_snapshot *snapshot = NULL;
+	enum is_remote_chunk_io_resolve_result result;
+	const unsigned int provider_chunk = 20;
+	int failed = 0;
+
+	if (is_remote_chunk_module_create(&backed_config, &module) ||
+	    is_remote_chunk_provider_handle_create(module, &provider) ||
+	    map_backed_chunk(module, provider, 0, provider_chunk) ||
+	    is_remote_chunk_io_lease_acquire(module, &request, &lease, &mapping) ||
+	    is_remote_chunk_eviction_begin(module, provider, &provider_chunk, 1,
+		&claim))
+		return 1;
+	if (is_remote_chunk_io_lease_acquire(module, &request, &rejected,
+		&mapping) != -ENXIO ||
+	    is_remote_chunk_eviction_wait(module, &claim,
+		monotonic_deadline_after_ms(1)) != -ETIMEDOUT ||
+	    is_remote_chunk_module_destroy(module) != -EBUSY ||
+	    is_remote_chunk_eviction_finish(module, &claim) != -EBUSY)
+		failed = 1;
+	if (is_remote_chunk_snapshot_take(module, &snapshot) ||
+	    snapshot->assigned_chunks != 1 || snapshot->usable_chunks != 0 ||
+	    snapshot->evicting_chunks != 1 || snapshot->active_io_leases != 1 ||
+	    snapshot->invariant_count != 2 ||
+	    snapshot->latest_invariant !=
+		IS_REMOTE_CHUNK_INVARIANT_EVICTION_FINISH_ACTIVE_LEASES)
+		failed = 1;
+	is_remote_chunk_snapshot_release(snapshot);
+	if (is_remote_chunk_io_lease_resolve(module, &lease,
+		IS_REMOTE_CHUNK_IO_SUCCESS, &result) ||
+	    is_remote_chunk_io_lease_release(module, &lease) ||
+	    is_remote_chunk_eviction_wait(module, &claim,
+		monotonic_deadline_after_ms(100)) ||
+	    is_remote_chunk_eviction_finish(module, &claim))
+		failed = 1;
+	failed |= is_remote_chunk_module_destroy(module) != 0;
+	return failed;
+}
+
+static int test_remote_only_rejects_provider_eviction(void)
+{
+	struct is_remote_chunk_module *module = NULL;
+	struct is_remote_chunk_provider_handle provider;
+	struct is_remote_chunk_eviction_claim claim =
+		IS_REMOTE_CHUNK_EVICTION_CLAIM_INIT;
+	const unsigned int provider_chunk = 20;
+	int failed = 0;
+
+	if (is_remote_chunk_module_create(&remote_only_config, &module) ||
+	    is_remote_chunk_provider_handle_create(module, &provider) ||
+	    map_remote_only_chunk(module, provider, 0, provider_chunk))
+		return 1;
+	if (is_remote_chunk_eviction_begin(module, provider, &provider_chunk, 1,
+		&claim) != -EOPNOTSUPP)
+		failed = 1;
+	failed |= expect_snapshot(module, 1, 1, 0, 0, 1,
+		"Committed Remote Chunk eviction");
+	failed |= is_remote_chunk_module_destroy(module) != 0;
+	return failed;
+}
+
+struct concurrent_provider_failure {
+	struct is_remote_chunk_module *module;
+	struct is_remote_chunk_provider_handle provider;
+	struct is_remote_chunk_provider_failure_facts facts;
+	struct test_gate *start;
+	int status;
+};
+
+struct concurrent_eviction_begin {
+	struct is_remote_chunk_module *module;
+	struct is_remote_chunk_provider_handle provider;
+	unsigned int provider_chunk;
+	struct is_remote_chunk_eviction_claim claim;
+	struct test_gate *start;
+	int status;
+};
+
+static void *run_provider_failure(void *context)
+{
+	struct concurrent_provider_failure *event = context;
+
+	test_gate_wait(event->start);
+	event->status = is_remote_chunk_provider_failed(event->module,
+		event->provider, &event->facts);
+	return NULL;
+}
+
+static void *run_eviction_begin(void *context)
+{
+	struct concurrent_eviction_begin *event = context;
+
+	test_gate_wait(event->start);
+	event->status = is_remote_chunk_eviction_begin(event->module,
+		event->provider, &event->provider_chunk, 1, &event->claim);
+	return NULL;
+}
+
+static int test_provider_failure_invalidates_atomically_and_preserves_activity(void)
+{
+	struct is_remote_chunk_module *module = NULL;
+	struct is_remote_chunk_provider_handle failed_provider;
+	struct is_remote_chunk_provider_handle replacement_provider;
+	struct is_remote_chunk_eviction_claim eviction_claim =
+		IS_REMOTE_CHUNK_EVICTION_CLAIM_INIT;
+	struct is_remote_chunk_mapping_claim mapping_claim =
+		IS_REMOTE_CHUNK_MAPPING_CLAIM_INIT;
+	struct is_remote_chunk_mapping_claim replacement_claim =
+		IS_REMOTE_CHUNK_MAPPING_CLAIM_INIT;
+	struct is_remote_chunk_mapping_grant replacement_grant =
+		mapping_grant(0, 30);
+	struct is_remote_chunk_provider_failure_facts facts;
+	struct is_remote_chunk_snapshot *snapshot = NULL;
+	struct is_remote_chunk_io_lease lease = IS_REMOTE_CHUNK_IO_LEASE_INIT;
+	struct is_remote_chunk_io_request request = {
+		.direction = IS_REMOTE_CHUNK_IO_WRITE,
+		.sector = 8,
+		.bytes = 4096,
+	};
+	struct is_remote_chunk_transport_mapping mapping;
+	enum is_remote_chunk_io_resolve_result result;
+	const unsigned int evicted_provider_chunk = 21;
+	unsigned int logical_chunk = ~0U;
+	bool mapping_needed = false;
+	int failed = 0;
+
+	if (is_remote_chunk_module_create(&backed_config, &module) ||
+	    is_remote_chunk_provider_handle_create(module, &failed_provider) ||
+	    is_remote_chunk_provider_handle_create(module, &replacement_provider) ||
+	    map_backed_chunk(module, failed_provider, 0, 20) ||
+	    map_backed_chunk(module, failed_provider, 1, 21) ||
+	    is_remote_chunk_io_lease_acquire(module, &request, &lease, &mapping) ||
+	    is_remote_chunk_eviction_begin(module, failed_provider,
+		&evicted_provider_chunk, 1, &eviction_claim) ||
+	    is_remote_chunk_note_activity(module, 2, 1,
+		IS_REMOTE_CHUNK_ACTIVITY_WRITE, &mapping_needed) ||
+	    is_remote_chunk_note_activity(module, 2, 1,
+		IS_REMOTE_CHUNK_ACTIVITY_WRITE, &mapping_needed) || !mapping_needed ||
+	    is_remote_chunk_mapping_begin_hot(module, failed_provider,
+		&mapping_claim, &logical_chunk) || logical_chunk != 2)
+		return 1;
+	if (is_remote_chunk_provider_failed(module, failed_provider, &facts) ||
+	    facts.affected_chunks != 3 || facts.assigned_chunks != 2 ||
+	    facts.usable_chunks != 1 || facts.mapping_chunks != 1 ||
+	    facts.evicting_chunks != 1 || facts.active_io_leases != 1)
+		failed = 1;
+	if (is_remote_chunk_snapshot_take(module, &snapshot) ||
+	    snapshot->assigned_chunks != 0 || snapshot->usable_chunks != 0 ||
+	    snapshot->mapping_chunks != 0 || snapshot->evicting_chunks != 0 ||
+	    snapshot->active_mapping_claims != 0 ||
+	    snapshot->active_eviction_claims != 0 ||
+	    snapshot->active_io_leases != 1 || snapshot->hot_ranges != 3 ||
+	    snapshot->mapping_candidates != 3)
+		failed = 1;
+	is_remote_chunk_snapshot_release(snapshot);
+	if (is_remote_chunk_mapping_abort(module, &mapping_claim) != -ESTALE ||
+	    is_remote_chunk_eviction_finish(module, &eviction_claim) != -ESTALE)
+		failed = 1;
+	logical_chunk = ~0U;
+	if (is_remote_chunk_mapping_begin_hot(module, replacement_provider,
+		&replacement_claim, &logical_chunk) || logical_chunk != 0 ||
+	    is_remote_chunk_mapping_commit(module, &replacement_claim,
+		replacement_provider, &replacement_grant, 1))
+		failed = 1;
+	if (is_remote_chunk_io_lease_resolve(module, &lease,
+		IS_REMOTE_CHUNK_IO_SUCCESS, &result) ||
+	    result != IS_REMOTE_CHUNK_IO_RESOLVE_STALE ||
+	    is_remote_chunk_io_lease_release(module, &lease))
+		failed = 1;
+	failed |= expect_read_admission(module, 8, 4096, -ENODATA);
+	failed |= is_remote_chunk_module_destroy(module) != 0;
+	return failed;
+}
+
+static int test_remote_only_provider_failure_returns_policy_neutral_facts(void)
+{
+	struct is_remote_chunk_module *module = NULL;
+	struct is_remote_chunk_provider_handle provider;
+	struct is_remote_chunk_provider_failure_facts facts;
+	int failed = 0;
+
+	if (is_remote_chunk_module_create(&remote_only_config, &module) ||
+	    is_remote_chunk_provider_handle_create(module, &provider) ||
+	    map_remote_only_chunk(module, provider, 0, 20) ||
+	    map_remote_only_chunk(module, provider, 1, 21))
+		return 1;
+	if (is_remote_chunk_provider_failed(module, provider, &facts) ||
+	    facts.affected_chunks != 2 || facts.assigned_chunks != 2 ||
+	    facts.usable_chunks != 2 || facts.mapping_chunks ||
+	    facts.evicting_chunks || facts.active_io_leases)
+		failed = 1;
+	failed |= expect_snapshot(module, 0, 0, 0, 0, 0,
+		"Remote-Only Provider failure");
+	failed |= is_remote_chunk_module_destroy(module) != 0;
+	return failed;
+}
+
+static int test_concurrent_provider_failure_and_eviction_are_atomic(void)
+{
+	struct is_remote_chunk_module *module = NULL;
+	struct is_remote_chunk_provider_handle provider;
+	struct concurrent_provider_failure failure;
+	struct concurrent_eviction_begin eviction;
+	struct test_gate start;
+	pthread_t failure_thread;
+	pthread_t eviction_thread;
+	int failed = 0;
+
+	if (is_remote_chunk_module_create(&backed_config, &module) ||
+	    is_remote_chunk_provider_handle_create(module, &provider) ||
+	    map_backed_chunk(module, provider, 0, 20) || test_gate_init(&start))
+		return 1;
+	failure = (struct concurrent_provider_failure) {
+		.module = module,
+		.provider = provider,
+		.start = &start,
+		.status = -999,
+	};
+	eviction = (struct concurrent_eviction_begin) {
+		.module = module,
+		.provider = provider,
+		.provider_chunk = 20,
+		.claim = IS_REMOTE_CHUNK_EVICTION_CLAIM_INIT,
+		.start = &start,
+		.status = -999,
+	};
+	if (pthread_create(&failure_thread, NULL, run_provider_failure, &failure) ||
+	    pthread_create(&eviction_thread, NULL, run_eviction_begin, &eviction))
+		return 1;
+	test_gate_open(&start);
+	(void)pthread_join(failure_thread, NULL);
+	(void)pthread_join(eviction_thread, NULL);
+	test_gate_destroy(&start);
+	if (failure.status || failure.facts.affected_chunks != 1 ||
+	    failure.facts.assigned_chunks != 1 ||
+	    (eviction.status != 0 && eviction.status != -ENOENT))
+		failed = 1;
+	if (!eviction.status &&
+	    is_remote_chunk_eviction_finish(module, &eviction.claim) != -ESTALE)
+		failed = 1;
+	failed |= expect_snapshot(module, 0, 0, 0, 0, 0,
+		"concurrent failure and eviction");
+	failed |= is_remote_chunk_module_destroy(module) != 0;
+	return failed;
+}
+
+struct concurrent_eviction_wait {
+	struct is_remote_chunk_module *module;
+	const struct is_remote_chunk_eviction_claim *claim;
+	struct test_gate *start;
+	int status;
+};
+
+static void *run_eviction_wait(void *context)
+{
+	struct concurrent_eviction_wait *event = context;
+
+	test_gate_wait(event->start);
+	event->status = is_remote_chunk_eviction_wait(event->module, event->claim,
+		monotonic_deadline_after_ms(1000));
+	return NULL;
+}
+
+static int test_concurrent_lease_release_wakes_eviction_wait(void)
+{
+	struct is_remote_chunk_module *module = NULL;
+	struct is_remote_chunk_provider_handle provider;
+	struct is_remote_chunk_eviction_claim claim =
+		IS_REMOTE_CHUNK_EVICTION_CLAIM_INIT;
+	struct is_remote_chunk_io_lease lease = IS_REMOTE_CHUNK_IO_LEASE_INIT;
+	struct is_remote_chunk_io_request request = {
+		.direction = IS_REMOTE_CHUNK_IO_WRITE,
+		.sector = 8,
+		.bytes = 4096,
+	};
+	struct is_remote_chunk_transport_mapping mapping;
+	enum is_remote_chunk_io_resolve_result result;
+	struct concurrent_eviction_wait wait_event;
+	struct concurrent_lease_event release_event;
+	struct test_gate start;
+	pthread_t wait_thread;
+	pthread_t release_thread;
+	const unsigned int provider_chunk = 20;
+	int failed = 0;
+
+	if (is_remote_chunk_module_create(&backed_config, &module) ||
+	    is_remote_chunk_provider_handle_create(module, &provider) ||
+	    map_backed_chunk(module, provider, 0, provider_chunk) ||
+	    is_remote_chunk_io_lease_acquire(module, &request, &lease, &mapping) ||
+	    is_remote_chunk_eviction_begin(module, provider, &provider_chunk, 1,
+		&claim) ||
+	    is_remote_chunk_io_lease_resolve(module, &lease,
+		IS_REMOTE_CHUNK_IO_SUCCESS, &result) || test_gate_init(&start))
+		return 1;
+	wait_event = (struct concurrent_eviction_wait) {
+		.module = module,
+		.claim = &claim,
+		.start = &start,
+		.status = -999,
+	};
+	release_event = (struct concurrent_lease_event) {
+		.module = module,
+		.lease = &lease,
+		.start = &start,
+		.status = -999,
+	};
+	if (pthread_create(&wait_thread, NULL, run_eviction_wait, &wait_event) ||
+	    pthread_create(&release_thread, NULL, run_lease_release,
+		&release_event))
+		return 1;
+	test_gate_open(&start);
+	(void)pthread_join(wait_thread, NULL);
+	(void)pthread_join(release_thread, NULL);
+	test_gate_destroy(&start);
+	if (wait_event.status || release_event.status ||
+	    is_remote_chunk_eviction_finish(module, &claim))
+		failed = 1;
+	failed |= is_remote_chunk_module_destroy(module) != 0;
+	return failed;
+}
+
+static int test_concurrent_completion_and_provider_failure_are_generation_safe(void)
+{
+	struct is_remote_chunk_module *module = NULL;
+	struct is_remote_chunk_provider_handle provider;
+	struct is_remote_chunk_io_lease lease = IS_REMOTE_CHUNK_IO_LEASE_INIT;
+	struct is_remote_chunk_io_request request = {
+		.direction = IS_REMOTE_CHUNK_IO_WRITE,
+		.sector = 8,
+		.bytes = 4096,
+	};
+	struct is_remote_chunk_transport_mapping mapping;
+	struct concurrent_lease_event completion;
+	struct concurrent_provider_failure failure;
+	struct is_remote_chunk_snapshot *snapshot = NULL;
+	struct test_gate start;
+	pthread_t completion_thread;
+	pthread_t failure_thread;
+	int failed = 0;
+
+	if (is_remote_chunk_module_create(&backed_config, &module) ||
+	    is_remote_chunk_provider_handle_create(module, &provider) ||
+	    map_backed_chunk(module, provider, 0, 20) ||
+	    is_remote_chunk_io_lease_acquire(module, &request, &lease, &mapping) ||
+	    test_gate_init(&start))
+		return 1;
+	completion = (struct concurrent_lease_event) {
+		.module = module,
+		.lease = &lease,
+		.start = &start,
+		.result = IS_REMOTE_CHUNK_IO_RESOLVE_NONE,
+		.status = -999,
+	};
+	failure = (struct concurrent_provider_failure) {
+		.module = module,
+		.provider = provider,
+		.start = &start,
+		.status = -999,
+	};
+	if (pthread_create(&completion_thread, NULL, run_lease_resolve,
+		&completion) ||
+	    pthread_create(&failure_thread, NULL, run_provider_failure, &failure))
+		return 1;
+	test_gate_open(&start);
+	(void)pthread_join(completion_thread, NULL);
+	(void)pthread_join(failure_thread, NULL);
+	test_gate_destroy(&start);
+	if (completion.status ||
+	    (completion.result != IS_REMOTE_CHUNK_IO_RESOLVE_CURRENT &&
+	     completion.result != IS_REMOTE_CHUNK_IO_RESOLVE_STALE) ||
+	    failure.status || failure.facts.affected_chunks != 1 ||
+	    failure.facts.active_io_leases != 1 ||
+	    is_remote_chunk_io_lease_release(module, &lease))
+		failed = 1;
+	if (is_remote_chunk_snapshot_take(module, &snapshot) ||
+	    snapshot->assigned_chunks || snapshot->usable_chunks ||
+	    snapshot->active_io_leases || snapshot->invariant_count)
+		failed = 1;
+	is_remote_chunk_snapshot_release(snapshot);
+	failed |= is_remote_chunk_module_destroy(module) != 0;
+	return failed;
+}
+
+static int test_quiesce_rejects_new_ownership_while_accepted_work_retires(void)
+{
+	struct is_remote_chunk_module *module = NULL;
+	struct is_remote_chunk_provider_handle provider;
+	struct is_remote_chunk_provider_handle rejected_provider;
+	struct is_remote_chunk_mapping_claim mapping_claim =
+		IS_REMOTE_CHUNK_MAPPING_CLAIM_INIT;
+	struct is_remote_chunk_mapping_claim rejected_claim =
+		IS_REMOTE_CHUNK_MAPPING_CLAIM_INIT;
+	struct is_remote_chunk_io_lease lease = IS_REMOTE_CHUNK_IO_LEASE_INIT;
+	struct is_remote_chunk_io_lease rejected_lease =
+		IS_REMOTE_CHUNK_IO_LEASE_INIT;
+	struct is_remote_chunk_io_request request = {
+		.direction = IS_REMOTE_CHUNK_IO_WRITE,
+		.sector = 8,
+		.bytes = 4096,
+	};
+	struct is_remote_chunk_transport_mapping mapping;
+	struct is_remote_chunk_snapshot *snapshot = NULL;
+	struct is_remote_chunk_hot_policy policy = backed_config.hot_policy;
+	enum is_remote_chunk_io_resolve_result result;
+	unsigned int logical_chunk = ~0U;
+	bool mapping_needed = false;
+	int failed = 0;
+
+	if (is_remote_chunk_module_create(&backed_config, &module) ||
+	    is_remote_chunk_provider_handle_create(module, &provider) ||
+	    map_backed_chunk(module, provider, 0, 20) ||
+	    is_remote_chunk_io_lease_acquire(module, &request, &lease, &mapping) ||
+	    is_remote_chunk_note_activity(module, 1, 1,
+		IS_REMOTE_CHUNK_ACTIVITY_WRITE, &mapping_needed) ||
+	    is_remote_chunk_note_activity(module, 1, 1,
+		IS_REMOTE_CHUNK_ACTIVITY_WRITE, &mapping_needed) ||
+	    is_remote_chunk_mapping_begin_hot(module, provider, &mapping_claim,
+		&logical_chunk) || logical_chunk != 1)
+		return 1;
+	if (is_remote_chunk_module_quiesce(module) ||
+	    is_remote_chunk_module_quiesce(module) != -EALREADY ||
+	    is_remote_chunk_provider_handle_create(module, &rejected_provider) !=
+		-ESHUTDOWN ||
+	    is_remote_chunk_hot_policy_set(module, &policy, &mapping_needed) !=
+		-ESHUTDOWN ||
+	    is_remote_chunk_note_activity(module, 2, 1,
+		IS_REMOTE_CHUNK_ACTIVITY_WRITE, &mapping_needed) != -ESHUTDOWN ||
+	    is_remote_chunk_mapping_begin_hot(module, provider, &rejected_claim,
+		&logical_chunk) != -ESHUTDOWN ||
+	    is_remote_chunk_io_lease_acquire(module, &request, &rejected_lease,
+		&mapping) != -ESHUTDOWN)
+		failed = 1;
+	if (is_remote_chunk_snapshot_take(module, &snapshot) ||
+	    !snapshot->quiescing || snapshot->active_mapping_claims != 1 ||
+	    snapshot->active_io_leases != 1 || snapshot->invariant_count != 1 ||
+	    snapshot->latest_invariant !=
+		IS_REMOTE_CHUNK_INVARIANT_MODULE_DUPLICATE_QUIESCE)
+		failed = 1;
+	is_remote_chunk_snapshot_release(snapshot);
+	{
+		struct is_remote_chunk_mapping_grant grant =
+			mapping_grant(1, 21);
+
+		if (is_remote_chunk_mapping_commit(module, &mapping_claim, provider,
+			&grant, 1) != -ESHUTDOWN)
+			failed = 1;
+	}
+	if (is_remote_chunk_module_destroy(module) != -EBUSY ||
+	    is_remote_chunk_mapping_abort(module, &mapping_claim) ||
+	    is_remote_chunk_io_lease_resolve(module, &lease,
+		IS_REMOTE_CHUNK_IO_SUCCESS, &result) ||
+	    is_remote_chunk_io_lease_release(module, &lease) ||
+	    is_remote_chunk_module_destroy(module))
+		failed = 1;
+	return failed;
+}
+
 int main(void)
 {
 	int failed = test_explicit_mapping_commit_is_atomic() |
@@ -1027,7 +1611,16 @@ int main(void)
 		test_write_outcomes_control_sector_validity() |
 		test_illegal_lease_lifetimes_report_typed_invariants() |
 		test_concurrent_lease_events_have_one_winner() |
-		test_concurrent_independent_lease_lifetimes();
+		test_concurrent_independent_lease_lifetimes() |
+		test_provider_activity_query_and_eviction_are_atomic() |
+		test_eviction_wait_times_out_without_choosing_policy() |
+		test_remote_only_rejects_provider_eviction() |
+		test_provider_failure_invalidates_atomically_and_preserves_activity() |
+		test_remote_only_provider_failure_returns_policy_neutral_facts() |
+		test_concurrent_provider_failure_and_eviction_are_atomic() |
+		test_concurrent_lease_release_wakes_eviction_wait() |
+		test_concurrent_completion_and_provider_failure_are_generation_safe() |
+		test_quiesce_rejects_new_ownership_while_accepted_work_retires();
 
 	if (failed)
 		fprintf(stderr, "Remote Chunk public-interface tests failed\n");

@@ -10,6 +10,7 @@
 #endif
 
 #define IS_REMOTE_CHUNK_MAPPING_CLAIM_BYTES 64U
+#define IS_REMOTE_CHUNK_EVICTION_CLAIM_BYTES 64U
 #define IS_REMOTE_CHUNK_IO_LEASE_BYTES 64U
 #define IS_REMOTE_CHUNK_MAX_CHUNKS 128U
 #define IS_REMOTE_CHUNK_HOT_WEIGHT_MAX 1000000U
@@ -51,6 +52,9 @@ enum is_remote_chunk_invariant_event {
 	IS_REMOTE_CHUNK_INVARIANT_LEASE_RELEASE_BEFORE_RESOLVE,
 	IS_REMOTE_CHUNK_INVARIANT_LEASE_DUPLICATE_RESOLVE,
 	IS_REMOTE_CHUNK_INVARIANT_LEASE_DUPLICATE_RELEASE,
+	IS_REMOTE_CHUNK_INVARIANT_EVICTION_FINISH_ACTIVE_LEASES,
+	IS_REMOTE_CHUNK_INVARIANT_MODULE_DUPLICATE_QUIESCE,
+	IS_REMOTE_CHUNK_INVARIANT_MODULE_DESTROY_ACTIVE,
 };
 
 struct is_remote_chunk_hot_policy {
@@ -80,6 +84,17 @@ struct is_remote_chunk_mapping_claim {
 };
 
 #define IS_REMOTE_CHUNK_MAPPING_CLAIM_INIT { .opaque = { .bytes = { 0 } } }
+
+/* Initialize caller-owned claim storage before its first eviction begin. */
+struct is_remote_chunk_eviction_claim {
+	union {
+		void *pointer_alignment;
+		unsigned long long integer_alignment;
+		unsigned char bytes[IS_REMOTE_CHUNK_EVICTION_CLAIM_BYTES];
+	} opaque;
+};
+
+#define IS_REMOTE_CHUNK_EVICTION_CLAIM_INIT { .opaque = { .bytes = { 0 } } }
 
 /*
  * Lease storage is single-use and address-bound. It must not be copied, moved,
@@ -117,6 +132,20 @@ struct is_remote_chunk_mapping_grant {
 	unsigned int remote_key;
 };
 
+struct is_remote_chunk_provider_activity {
+	unsigned int provider_chunk;
+	unsigned long long activity;
+};
+
+struct is_remote_chunk_provider_failure_facts {
+	unsigned int affected_chunks;
+	unsigned int assigned_chunks;
+	unsigned int usable_chunks;
+	unsigned int mapping_chunks;
+	unsigned int evicting_chunks;
+	unsigned int active_io_leases;
+};
+
 struct is_remote_chunk_provider_snapshot {
 	struct is_remote_chunk_provider_handle provider;
 	unsigned int assigned_chunks;
@@ -136,12 +165,15 @@ struct is_remote_chunk_snapshot {
 	unsigned int assigned_chunks;
 	unsigned int usable_chunks;
 	unsigned int mapping_chunks;
+	unsigned int evicting_chunks;
 	unsigned int active_mapping_claims;
+	unsigned int active_eviction_claims;
 	unsigned int hot_ranges;
 	unsigned int mapping_candidates;
 	unsigned int active_io_leases;
 	unsigned long long invariant_count;
 	enum is_remote_chunk_invariant_event latest_invariant;
+	bool quiescing;
 	struct is_remote_chunk_hot_policy hot_policy;
 	unsigned int provider_count;
 	struct is_remote_chunk_provider_snapshot *providers;
@@ -152,6 +184,8 @@ struct is_remote_chunk_snapshot {
 int is_remote_chunk_module_create(
 	const struct is_remote_chunk_config *config,
 	struct is_remote_chunk_module **module_out);
+/* Destroy enters quiesce before refusing any active claims, waits, or leases. */
+int is_remote_chunk_module_quiesce(struct is_remote_chunk_module *module);
 int is_remote_chunk_module_destroy(struct is_remote_chunk_module *module);
 
 int is_remote_chunk_provider_handle_create(
@@ -193,6 +227,37 @@ int is_remote_chunk_mapping_commit(
 int is_remote_chunk_mapping_abort(
 	struct is_remote_chunk_module *module,
 	const struct is_remote_chunk_mapping_claim *claim);
+
+/* Query validates the complete Provider chunk batch before changing output. */
+int is_remote_chunk_provider_activity_query(
+	struct is_remote_chunk_module *module,
+	struct is_remote_chunk_provider_handle provider,
+	const unsigned int *provider_chunks, unsigned int chunk_count,
+	struct is_remote_chunk_provider_activity *activity_out);
+
+/*
+ * Eviction is Backed Mode only. Begin atomically closes lease admission for the
+ * complete batch while retaining Provider assignment and assigned capacity.
+ */
+int is_remote_chunk_eviction_begin(
+	struct is_remote_chunk_module *module,
+	struct is_remote_chunk_provider_handle provider,
+	const unsigned int *provider_chunks, unsigned int chunk_count,
+	struct is_remote_chunk_eviction_claim *claim_out);
+/* The caller supplies an absolute CLOCK_MONOTONIC deadline in nanoseconds. */
+int is_remote_chunk_eviction_wait(
+	struct is_remote_chunk_module *module,
+	const struct is_remote_chunk_eviction_claim *claim,
+	unsigned long long deadline_monotonic_ns);
+int is_remote_chunk_eviction_finish(
+	struct is_remote_chunk_module *module,
+	const struct is_remote_chunk_eviction_claim *claim);
+
+/* Invalidates one Provider epoch atomically without choosing mode policy. */
+int is_remote_chunk_provider_failed(
+	struct is_remote_chunk_module *module,
+	struct is_remote_chunk_provider_handle provider,
+	struct is_remote_chunk_provider_failure_facts *facts_out);
 
 /*
  * Lease operations do not sleep or allocate. Acquire atomically checks one
