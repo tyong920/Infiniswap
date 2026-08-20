@@ -203,6 +203,9 @@ int is_device_set_acknowledgement_policy(struct is_device *device,
 					 const char *buf, size_t count);
 int is_device_set_failure_deadline(struct is_device *device, const char *buf,
 				   size_t count);
+int is_device_hot_range_policy_snapshot(
+	struct is_device *device,
+	struct is_remote_chunk_hot_policy *policy_out);
 int is_device_set_hot_range_threshold(struct is_device *device, const char *buf,
 				      size_t count);
 int is_device_set_hot_range_read_weight(struct is_device *device,

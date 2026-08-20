@@ -142,30 +142,12 @@ static ssize_t is_device_provider_failure_deadline_ms_store(
 	return is_store_result(device, ret, count);
 }
 
-static int is_device_hot_policy(
-	struct is_device *device, struct is_remote_chunk_hot_policy *policy)
-{
-	struct is_remote_chunk_snapshot *snapshot = NULL;
-	int ret = 0;
-
-	mutex_lock(&device->lifecycle_lock);
-	if (!device->remote_chunks) {
-		*policy = device->remote_chunk_hot_policy_config;
-	} else {
-		ret = is_remote_chunk_snapshot_take(device->remote_chunks, &snapshot);
-		if (!ret)
-			*policy = snapshot->hot_policy;
-	}
-	is_remote_chunk_snapshot_release(snapshot);
-	mutex_unlock(&device->lifecycle_lock);
-	return ret;
-}
-
 static ssize_t is_device_hot_range_threshold_show(struct config_item *item,
 						   char *page)
 {
 	struct is_remote_chunk_hot_policy policy;
-	int ret = is_device_hot_policy(to_is_device(item), &policy);
+	int ret = is_device_hot_range_policy_snapshot(to_is_device(item),
+		&policy);
 
 	return ret ? ret : sysfs_emit(page, "%llu\n", policy.threshold);
 }
@@ -184,7 +166,8 @@ static ssize_t is_device_hot_range_read_weight_show(struct config_item *item,
 						     char *page)
 {
 	struct is_remote_chunk_hot_policy policy;
-	int ret = is_device_hot_policy(to_is_device(item), &policy);
+	int ret = is_device_hot_range_policy_snapshot(to_is_device(item),
+		&policy);
 
 	return ret ? ret : sysfs_emit(page, "%u\n", policy.read_weight);
 }
@@ -203,7 +186,8 @@ static ssize_t is_device_hot_range_write_weight_show(struct config_item *item,
 						      char *page)
 {
 	struct is_remote_chunk_hot_policy policy;
-	int ret = is_device_hot_policy(to_is_device(item), &policy);
+	int ret = is_device_hot_range_policy_snapshot(to_is_device(item),
+		&policy);
 
 	return ret ? ret : sysfs_emit(page, "%u\n", policy.write_weight);
 }

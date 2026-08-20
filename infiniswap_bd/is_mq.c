@@ -240,6 +240,20 @@ static int is_device_hot_policy_locked(
 	return is_remote_chunk_hot_policy_snapshot(device->remote_chunks, policy);
 }
 
+int is_device_hot_range_policy_snapshot(
+	struct is_device *device,
+	struct is_remote_chunk_hot_policy *policy_out)
+{
+	int ret;
+
+	if (!device || !policy_out)
+		return -EINVAL;
+	mutex_lock(&device->lifecycle_lock);
+	ret = is_device_hot_policy_locked(device, policy_out);
+	mutex_unlock(&device->lifecycle_lock);
+	return ret;
+}
+
 static int is_device_set_hot_policy_locked(
 	struct is_device *device,
 	const struct is_remote_chunk_hot_policy *policy)
