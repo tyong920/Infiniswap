@@ -2,71 +2,117 @@
 #ifndef INFINISWAP_REMOTE_IO_TRANSACTION_H
 #define INFINISWAP_REMOTE_IO_TRANSACTION_H
 
-#include "is_io_policy.h"
-
 #ifdef __KERNEL__
-#include <linux/spinlock.h>
+#include <linux/atomic.h>
 #include <linux/types.h>
 
-typedef spinlock_t is_remote_io_transaction_lock_t;
+typedef atomic_t is_remote_io_transaction_counter_t;
 #else
-#include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
+#include <stddef.h>
 
-typedef pthread_mutex_t is_remote_io_transaction_lock_t;
+typedef atomic_uint is_remote_io_transaction_counter_t;
 #endif
 
+struct is_remote_io_transaction;
+
+enum is_remote_io_transaction_mode {
+	IS_REMOTE_IO_TRANSACTION_BACKED_STRICT = 1,
+	IS_REMOTE_IO_TRANSACTION_BACKED_REMOTE_FIRST,
+	IS_REMOTE_IO_TRANSACTION_REMOTE_ONLY,
+};
+
+enum is_remote_io_transaction_direction {
+	IS_REMOTE_IO_TRANSACTION_READ = 1,
+	IS_REMOTE_IO_TRANSACTION_WRITE,
+};
+
+/* The engine copies this immutable specification before start returns. */
+struct is_remote_io_transaction_spec {
+	enum is_remote_io_transaction_direction direction;
+	unsigned long long sector;
+	unsigned int bytes;
+	unsigned long long generation;
+	void *payload;
+};
+
+struct is_remote_io_transaction_engine {
+	is_remote_io_transaction_counter_t active_transactions;
+	enum is_remote_io_transaction_mode mode;
+	unsigned char initialized;
+};
+
+struct is_remote_io_transaction_allocation {
+	void *transaction_storage;
+	void *adapter_context;
+};
+
 enum is_remote_io_transaction_event {
-	IS_REMOTE_IO_TRANSACTION_EVENT_DISPATCHER_RELEASED = 1,
-	IS_REMOTE_IO_TRANSACTION_EVENT_LOCAL_COMPLETED,
-	IS_REMOTE_IO_TRANSACTION_EVENT_REMOTE_COMPLETED,
-	IS_REMOTE_IO_TRANSACTION_EVENT_TRANSPORT_RELEASED,
+	IS_REMOTE_IO_TRANSACTION_EVENT_BACKING_COMPLETED = 1,
+	IS_REMOTE_IO_TRANSACTION_EVENT_RDMA_COMPLETED,
+	IS_REMOTE_IO_TRANSACTION_EVENT_RDMA_RELEASED,
+	IS_REMOTE_IO_TRANSACTION_EVENT_ENGINE_DESTROY_ACTIVE,
 };
 
-/*
- * Each claim names the only producer allowed to deliver its lifecycle event.
- * An event consumes that claim before Adapter effects become observable; the
- * producer must not access the transaction after the event returns. Active
- * events keep Adapter re-entry alive while effects run unlocked.
- */
-struct is_remote_io_transaction {
-	is_remote_io_transaction_lock_t lock;
-	struct is_io_policy policy;
-	unsigned int active_events;
-	unsigned char dispatcher_claim;
-	unsigned char local_branch_claim;
-	unsigned char remote_result_claim;
-	unsigned char remote_transport_claim;
-	unsigned char invariant_reported;
-	unsigned char settling;
-};
+int is_remote_io_transaction_engine_init(
+	struct is_remote_io_transaction_engine *engine,
+	enum is_remote_io_transaction_mode mode);
+int is_remote_io_transaction_engine_destroy(
+	struct is_remote_io_transaction_engine *engine);
 
-int is_remote_io_transaction_init(struct is_remote_io_transaction *transaction,
-			       enum is_io_policy_kind kind,
-			       unsigned long long generation);
-void is_remote_io_transaction_dispatcher_released(
-	struct is_remote_io_transaction *transaction);
-void is_remote_io_transaction_local_completed(
+/* Start always consumes payload ownership, including synchronous failures. */
+void is_remote_io_transaction_start(
+	struct is_remote_io_transaction_engine *engine,
+	const struct is_remote_io_transaction_spec *spec);
+
+/* Typed lifecycle entries used only by the environment Adapters. */
+void is_remote_io_transaction_backing_completed(
 	struct is_remote_io_transaction *transaction, int status);
-void is_remote_io_transaction_remote_completed(
-	struct is_remote_io_transaction *transaction, unsigned long long generation,
-	int status, bool cancelled);
-void is_remote_io_transaction_transport_released(
-	struct is_remote_io_transaction *transaction, unsigned long long generation);
+void is_remote_io_transaction_rdma_completed(
+	struct is_remote_io_transaction *transaction,
+	unsigned long long generation, int status, bool cancelled);
+void is_remote_io_transaction_rdma_released(
+	struct is_remote_io_transaction *transaction,
+	unsigned long long generation);
 
 /* Link-time Adapters implemented by the kernel environment and host tests. */
+int is_remote_io_transaction_adapter_allocate(
+	struct is_remote_io_transaction_engine *engine,
+	const struct is_remote_io_transaction_spec *spec,
+	size_t transaction_size, size_t transaction_alignment,
+	struct is_remote_io_transaction_allocation *allocation);
+int is_remote_io_transaction_adapter_prepare(
+	struct is_remote_io_transaction_engine *engine,
+	const struct is_remote_io_transaction_spec *spec, bool prepare_backing,
+	struct is_remote_io_transaction *transaction, void *adapter_context);
+int is_remote_io_transaction_adapter_submit_backing(
+	struct is_remote_io_transaction_engine *engine,
+	const struct is_remote_io_transaction_spec *spec,
+	struct is_remote_io_transaction *transaction, void *adapter_context);
+int is_remote_io_transaction_adapter_submit_rdma(
+	struct is_remote_io_transaction_engine *engine,
+	const struct is_remote_io_transaction_spec *spec,
+	struct is_remote_io_transaction *transaction, void *adapter_context);
 void is_remote_io_transaction_adapter_complete(
-	struct is_remote_io_transaction *transaction, int status);
+	struct is_remote_io_transaction_engine *engine,
+	const struct is_remote_io_transaction_spec *spec, void *adapter_context,
+	int status);
 void is_remote_io_transaction_adapter_backing_degraded(
-	struct is_remote_io_transaction *transaction);
+	struct is_remote_io_transaction_engine *engine,
+	const struct is_remote_io_transaction_spec *spec, void *adapter_context);
 void is_remote_io_transaction_adapter_mark_local_only(
-	struct is_remote_io_transaction *transaction);
-void is_remote_io_transaction_adapter_submit_local(
-	struct is_remote_io_transaction *transaction);
+	struct is_remote_io_transaction_engine *engine,
+	const struct is_remote_io_transaction_spec *spec, void *adapter_context);
+void is_remote_io_transaction_adapter_release(
+	struct is_remote_io_transaction_engine *engine,
+	const struct is_remote_io_transaction_spec *spec, void *adapter_context);
 void is_remote_io_transaction_adapter_settle(
-	struct is_remote_io_transaction *transaction);
+	struct is_remote_io_transaction_engine *engine,
+	const struct is_remote_io_transaction_spec *spec);
 void is_remote_io_transaction_adapter_invariant(
-	struct is_remote_io_transaction *transaction,
+	struct is_remote_io_transaction_engine *engine,
+	const struct is_remote_io_transaction_spec *spec, void *adapter_context,
 	enum is_remote_io_transaction_event event);
 
 #endif /* INFINISWAP_REMOTE_IO_TRANSACTION_H */

@@ -160,13 +160,6 @@ jobs:
           tests/vm/run --help >/dev/null
           tests/vm/compare --help >/dev/null
 
-      - name: Test Memory Consumer completion policy
-        run: |
-          cc -std=c11 -Wall -Wextra -Wpedantic -Werror \
-            infiniswap_bd/tests/io-policy-test.c \
-            -o "${{ runner.temp }}/io-policy-test"
-          "${{ runner.temp }}/io-policy-test"
-
       - name: Test Memory Consumer Remote I/O Transaction ownership
         run: |
           cc -std=c11 -Wall -Wextra -Wpedantic -Werror -pthread \

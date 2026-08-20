@@ -74,6 +74,7 @@ void is_device_init(struct is_device *device, const char *name)
 	atomic64_set(&device->remote_lost_transitions_total, 0);
 	atomic64_set(&device->backing_invalid_sectors, 0);
 	device->mode = IS_DEVICE_MODE_UNSET;
+	device->transaction_engine.initialized = 0;
 	device->acknowledgement_policy = IS_ACKNOWLEDGEMENT_POLICY_STRICT;
 	device->provider_failure_deadline_ms =
 		IS_PROTOCOL_FAILURE_DEADLINE_DEFAULT_MS;
@@ -1142,89 +1143,22 @@ struct is_remote_request {
 	sector_t sector;
 	unsigned int bytes;
 	unsigned int command_flags;
-	struct is_remote_io_transaction transaction;
+	struct is_remote_io_transaction *transaction;
 	atomic_t pending_bios;
 	atomic_t local_status;
-	unsigned int backing_retries;
-	bool remote_first_write;
+	unsigned int backing_submissions;
+	bool prepared;
 	struct work_struct local_work;
+	struct bio *backing_bio;
 	struct is_rdma_io rdma_io;
 	struct page *owned_pages[IS_RDMA_MAX_SEGMENTS];
 	unsigned int owned_page_count;
 };
 
-static struct is_remote_request *is_remote_request_from_transaction(
-	struct is_remote_io_transaction *transaction)
+static struct is_device *is_transaction_engine_device(
+	struct is_remote_io_transaction_engine *engine)
 {
-	return container_of(transaction, struct is_remote_request, transaction);
-}
-
-static void is_remote_local_complete(struct is_remote_request *remote,
-				     blk_status_t status);
-
-void is_remote_io_transaction_adapter_complete(
-	struct is_remote_io_transaction *transaction, int status)
-{
-	struct is_remote_request *remote =
-		is_remote_request_from_transaction(transaction);
-
-	is_complete_request(remote->device, remote->request,
-		(__force blk_status_t)status);
-}
-
-void is_remote_io_transaction_adapter_backing_degraded(
-	struct is_remote_io_transaction *transaction)
-{
-	struct is_remote_request *remote =
-		is_remote_request_from_transaction(transaction);
-
-	is_degrade_backing(remote->device, remote->sector, remote->bytes, EIO);
-}
-
-void is_remote_io_transaction_adapter_mark_local_only(
-	struct is_remote_io_transaction *transaction)
-{
-	struct is_remote_request *remote =
-		is_remote_request_from_transaction(transaction);
-
-	atomic64_inc(&remote->device->local_only_writes_total);
-}
-
-void is_remote_io_transaction_adapter_submit_local(
-	struct is_remote_io_transaction *transaction)
-{
-	struct is_remote_request *remote =
-		is_remote_request_from_transaction(transaction);
-
-	if (!queue_work(remote->device->ordered_backing_wq, &remote->local_work))
-		is_remote_io_transaction_local_completed(transaction,
-			(__force int)BLK_STS_IOERR);
-}
-
-void is_remote_io_transaction_adapter_settle(
-	struct is_remote_io_transaction *transaction)
-{
-	struct is_remote_request *remote =
-		is_remote_request_from_transaction(transaction);
-	unsigned int index;
-
-	for (index = 0; index < remote->owned_page_count; index++)
-		__free_page(remote->owned_pages[index]);
-	is_finish_inflight(remote->device);
-	kfree(remote);
-}
-
-void is_remote_io_transaction_adapter_invariant(
-	struct is_remote_io_transaction *transaction,
-	enum is_remote_io_transaction_event event)
-{
-	struct is_remote_request *remote =
-		is_remote_request_from_transaction(transaction);
-
-	pr_warn(IS_DRIVER_NAME
-		": illegal Remote I/O Transaction event %u for generation %llu\n",
-		(unsigned int)event,
-		(unsigned long long)remote->rdma_io.generation);
+	return container_of(engine, struct is_device, transaction_engine);
 }
 
 static int is_copy_owned_pages_to_request(struct is_remote_request *remote)
@@ -1256,25 +1190,18 @@ static void is_remote_rdma_complete(void *context, u64 generation, int status,
 {
 	struct is_remote_request *remote = context;
 
-	if (generation != remote->rdma_io.generation) {
-		is_remote_io_transaction_remote_completed(&remote->transaction,
-			generation, status ? errno_to_blk_status(status) : BLK_STS_OK,
-			cancelled);
-		return;
-	}
-	if (!status && !cancelled && !remote->rdma_io.write)
+	if (generation == remote->rdma_io.generation && !status && !cancelled &&
+	    !remote->rdma_io.write)
 		status = is_copy_owned_pages_to_request(remote);
-	is_remote_io_transaction_remote_completed(&remote->transaction,
-		generation, status ? errno_to_blk_status(status) : BLK_STS_OK,
-		cancelled);
+	is_remote_io_transaction_rdma_completed(remote->transaction, generation,
+		status, cancelled);
 }
 
 static void is_remote_transport_release(void *context, u64 generation)
 {
 	struct is_remote_request *remote = context;
 
-	is_remote_io_transaction_transport_released(&remote->transaction,
-		generation);
+	is_remote_io_transaction_rdma_released(remote->transaction, generation);
 }
 
 static void is_remote_local_complete(struct is_remote_request *remote,
@@ -1286,8 +1213,8 @@ static void is_remote_local_complete(struct is_remote_request *remote,
 	if (!atomic_dec_and_test(&remote->pending_bios))
 		return;
 	status = (__force blk_status_t)atomic_read(&remote->local_status);
-	is_remote_io_transaction_local_completed(&remote->transaction,
-		(__force int)status);
+	is_remote_io_transaction_backing_completed(remote->transaction,
+		blk_status_to_errno(status));
 }
 
 static void is_remote_backing_end_io(struct bio *bio)
@@ -1296,15 +1223,6 @@ static void is_remote_backing_end_io(struct bio *bio)
 	blk_status_t status = bio->bi_status;
 
 	bio_put(bio);
-	if (status != BLK_STS_OK && remote->rdma_io.write &&
-	    remote->remote_first_write &&
-	    remote->backing_retries < IS_BACKING_RETRY_LIMIT) {
-		remote->backing_retries++;
-		atomic64_inc(&remote->device->backing_retries_total);
-		if (queue_work(remote->device->ordered_backing_wq,
-			       &remote->local_work))
-			return;
-	}
 	is_remote_local_complete(remote, status);
 }
 
@@ -1400,34 +1318,6 @@ static int is_prepare_owned_pages(struct is_remote_request *remote, bool copy)
 		copied == blk_rq_bytes(remote->request) ? 0 : -EIO;
 }
 
-static struct is_remote_request *is_alloc_remote_request(
-	struct is_device *device, struct request *request)
-{
-	struct is_remote_request *remote;
-
-	if (device->rdma_numa_node == NUMA_NO_NODE)
-		remote = kzalloc(sizeof(*remote), GFP_KERNEL);
-	else
-		remote = kzalloc_node(sizeof(*remote), GFP_KERNEL,
-			device->rdma_numa_node);
-
-	if (!remote)
-		return NULL;
-	remote->device = device;
-	remote->request = request;
-	remote->sector = blk_rq_pos(request);
-	remote->bytes = blk_rq_bytes(request);
-	remote->command_flags = request->cmd_flags;
-	remote->rdma_io.sector = remote->sector;
-	remote->rdma_io.bytes = remote->bytes;
-	remote->rdma_io.generation = atomic64_inc_return(
-		&device->next_io_generation);
-	remote->rdma_io.context = remote;
-	remote->rdma_io.complete = is_remote_rdma_complete;
-	remote->rdma_io.release = is_remote_transport_release;
-	return remote;
-}
-
 static void is_submit_remote_local_work(struct work_struct *work)
 {
 	struct is_remote_request *remote = container_of(
@@ -1435,14 +1325,15 @@ static void is_submit_remote_local_work(struct work_struct *work)
 	struct bio *source;
 	blk_status_t status = BLK_STS_OK;
 
-	if (remote->rdma_io.write) {
+	if (remote->rdma_io.write && remote->prepared) {
 		if (is_submit_owned_backing_write(remote))
 			is_remote_local_complete(remote, BLK_STS_RESOURCE);
 		return;
 	}
 	atomic_set(&remote->local_status, BLK_STS_OK);
 	atomic_set(&remote->pending_bios, 1);
-	if (!is_backing_range_valid(remote->device, remote->sector,
+	if (!remote->rdma_io.write &&
+	    !is_backing_range_valid(remote->device, remote->sector,
 				    remote->bytes)) {
 		is_remote_local_complete(remote, BLK_STS_IOERR);
 		return;
@@ -1465,106 +1356,183 @@ static void is_submit_remote_local_work(struct work_struct *work)
 	is_remote_local_complete(remote, status);
 }
 
-static bool is_dispatch_remote_read(struct is_device *device,
-				    struct request *request)
+int is_remote_io_transaction_adapter_allocate(
+	struct is_remote_io_transaction_engine *engine,
+	const struct is_remote_io_transaction_spec *spec,
+	size_t transaction_size, size_t transaction_alignment,
+	struct is_remote_io_transaction_allocation *allocation)
 {
-	struct is_remote_request *remote =
-		is_alloc_remote_request(device, request);
-	u64 generation;
-	int ret;
+	struct is_device *device = is_transaction_engine_device(engine);
+	struct request *request = spec->payload;
+	struct is_remote_request *remote;
+	size_t transaction_offset = ALIGN(sizeof(*remote), transaction_alignment);
+	size_t allocation_size;
 
-	if (!remote)
-		return false;
-	INIT_WORK(&remote->local_work, is_submit_remote_local_work);
-	ret = is_prepare_owned_pages(remote, false);
-	if (ret)
-		goto free_remote;
-	remote->rdma_io.write = false;
-	generation = remote->rdma_io.generation;
-	if (device->mode == IS_DEVICE_MODE_REMOTE_ONLY)
-		ret = is_remote_io_transaction_init(&remote->transaction,
-			IS_IO_POLICY_REMOTE_ONLY_READ, generation);
+	if (transaction_size > SIZE_MAX - transaction_offset)
+		return -EOVERFLOW;
+	allocation_size = transaction_offset + transaction_size;
+	if (device->rdma_numa_node == NUMA_NO_NODE)
+		remote = kzalloc(allocation_size, GFP_KERNEL);
 	else
-		ret = is_remote_io_transaction_init(&remote->transaction,
-			IS_IO_POLICY_REMOTE_READ, generation);
-	if (ret)
-		goto free_remote;
-	ret = is_rdma_submit(device, &remote->rdma_io);
-	if (ret) {
-		is_remote_transport_release(remote, generation);
-		is_remote_rdma_complete(remote, generation, ret, false);
-	}
-	is_remote_io_transaction_dispatcher_released(&remote->transaction);
-	return true;
+		remote = kzalloc_node(allocation_size, GFP_KERNEL,
+			device->rdma_numa_node);
+	if (!remote)
+		return -ENOMEM;
 
-free_remote:
-	while (remote->owned_page_count)
-		__free_page(remote->owned_pages[--remote->owned_page_count]);
-	kfree(remote);
-	return false;
+	remote->device = device;
+	remote->request = request;
+	remote->sector = (sector_t)spec->sector;
+	remote->bytes = spec->bytes;
+	remote->command_flags = request->cmd_flags;
+	remote->transaction = (struct is_remote_io_transaction *)
+		((u8 *)remote + transaction_offset);
+	remote->rdma_io.sector = remote->sector;
+	remote->rdma_io.bytes = remote->bytes;
+	remote->rdma_io.write =
+		spec->direction == IS_REMOTE_IO_TRANSACTION_WRITE;
+	remote->rdma_io.generation = spec->generation;
+	remote->rdma_io.context = remote;
+	remote->rdma_io.complete = is_remote_rdma_complete;
+	remote->rdma_io.release = is_remote_transport_release;
+	INIT_WORK(&remote->local_work, is_submit_remote_local_work);
+	allocation->transaction_storage = remote->transaction;
+	allocation->adapter_context = remote;
+	return 0;
 }
 
-static bool is_dispatch_remote_write(struct is_device *device,
-				     struct request *request)
+int is_remote_io_transaction_adapter_prepare(
+	struct is_remote_io_transaction_engine *engine,
+	const struct is_remote_io_transaction_spec *spec, bool prepare_backing,
+	struct is_remote_io_transaction *transaction, void *adapter_context)
 {
-	struct is_remote_request *remote =
-		is_alloc_remote_request(device, request);
-	struct bio *bio = NULL;
-	u64 generation;
-	unsigned int index;
-	int ret;
+	struct is_remote_request *remote = adapter_context;
+	int status;
 
-	if (!remote)
-		return false;
-	INIT_WORK(&remote->local_work, is_submit_remote_local_work);
-	ret = is_prepare_owned_pages(remote, true);
-	if (ret)
-		goto free_remote;
-	if (device->mode == IS_DEVICE_MODE_BACKED) {
-		enum is_io_policy_kind kind;
+	(void)engine;
+	(void)spec;
+	(void)transaction;
+	status = is_prepare_owned_pages(remote, remote->rdma_io.write);
+	if (!status && prepare_backing) {
+		remote->backing_bio = is_build_owned_bio(remote);
+		if (!remote->backing_bio)
+			status = -ENOMEM;
+	}
+	if (!status)
+		remote->prepared = true;
+	return status;
+}
 
-		bio = is_build_owned_bio(remote);
-		if (!bio)
-			goto free_remote;
-		kind = device->acknowledgement_policy ==
-			IS_ACKNOWLEDGEMENT_POLICY_REMOTE_FIRST ?
-			IS_IO_POLICY_REMOTE_FIRST_WRITE : IS_IO_POLICY_STRICT_WRITE;
-		remote->remote_first_write =
-			kind == IS_IO_POLICY_REMOTE_FIRST_WRITE;
-		ret = is_remote_io_transaction_init(&remote->transaction, kind,
-			remote->rdma_io.generation);
-		if (ret) {
-			bio_put(bio);
-			goto free_remote;
-		}
+int is_remote_io_transaction_adapter_submit_backing(
+	struct is_remote_io_transaction_engine *engine,
+	const struct is_remote_io_transaction_spec *spec,
+	struct is_remote_io_transaction *transaction, void *adapter_context)
+{
+	struct is_remote_request *remote = adapter_context;
+
+	(void)engine;
+	(void)spec;
+	(void)transaction;
+	if (remote->backing_submissions++)
+		atomic64_inc(&remote->device->backing_retries_total);
+	if (remote->rdma_io.write && remote->prepared) {
 		atomic_set(&remote->local_status, BLK_STS_OK);
 		atomic_set(&remote->pending_bios, 1);
-	} else {
-		ret = is_remote_io_transaction_init(&remote->transaction,
-			IS_IO_POLICY_REMOTE_ONLY_WRITE,
-			remote->rdma_io.generation);
-		if (ret)
-			goto free_remote;
 	}
-	remote->rdma_io.write = true;
-	generation = remote->rdma_io.generation;
+	if (!remote->rdma_io.write || !remote->prepared ||
+	    remote->backing_submissions > 1)
+		return queue_work(remote->device->ordered_backing_wq,
+			&remote->local_work) ? 0 : -EIO;
 
-	/* Backed policies submit their recovery copy before Remote Memory. */
-	if (bio)
-		submit_bio_noacct(bio);
-	ret = is_rdma_submit(device, &remote->rdma_io);
-	if (ret) {
-		is_remote_transport_release(remote, generation);
-		is_remote_rdma_complete(remote, generation, ret, false);
-	}
-	is_remote_io_transaction_dispatcher_released(&remote->transaction);
-	return true;
+	submit_bio_noacct(remote->backing_bio);
+	remote->backing_bio = NULL;
+	return 0;
+}
 
-free_remote:
+int is_remote_io_transaction_adapter_submit_rdma(
+	struct is_remote_io_transaction_engine *engine,
+	const struct is_remote_io_transaction_spec *spec,
+	struct is_remote_io_transaction *transaction, void *adapter_context)
+{
+	struct is_remote_request *remote = adapter_context;
+
+	(void)engine;
+	(void)spec;
+	(void)transaction;
+	return is_rdma_submit(remote->device, &remote->rdma_io);
+}
+
+void is_remote_io_transaction_adapter_complete(
+	struct is_remote_io_transaction_engine *engine,
+	const struct is_remote_io_transaction_spec *spec, void *adapter_context,
+	int status)
+{
+	struct is_device *device = is_transaction_engine_device(engine);
+	struct request *request = spec->payload;
+
+	(void)adapter_context;
+	is_complete_request(device, request,
+		status ? errno_to_blk_status(status) : BLK_STS_OK);
+}
+
+void is_remote_io_transaction_adapter_backing_degraded(
+	struct is_remote_io_transaction_engine *engine,
+	const struct is_remote_io_transaction_spec *spec, void *adapter_context)
+{
+	(void)adapter_context;
+	is_degrade_backing(is_transaction_engine_device(engine),
+		(sector_t)spec->sector, spec->bytes, EIO);
+}
+
+void is_remote_io_transaction_adapter_mark_local_only(
+	struct is_remote_io_transaction_engine *engine,
+	const struct is_remote_io_transaction_spec *spec, void *adapter_context)
+{
+	(void)spec;
+	(void)adapter_context;
+	atomic64_inc(&is_transaction_engine_device(engine)->local_only_writes_total);
+}
+
+void is_remote_io_transaction_adapter_release(
+	struct is_remote_io_transaction_engine *engine,
+	const struct is_remote_io_transaction_spec *spec, void *adapter_context)
+{
+	struct is_remote_request *remote = adapter_context;
+	unsigned int index;
+
+	(void)engine;
+	(void)spec;
+	if (remote->backing_bio)
+		bio_put(remote->backing_bio);
 	for (index = 0; index < remote->owned_page_count; index++)
 		__free_page(remote->owned_pages[index]);
 	kfree(remote);
-	return false;
+}
+
+void is_remote_io_transaction_adapter_settle(
+	struct is_remote_io_transaction_engine *engine,
+	const struct is_remote_io_transaction_spec *spec)
+{
+	(void)spec;
+	is_finish_inflight(is_transaction_engine_device(engine));
+}
+
+void is_remote_io_transaction_adapter_invariant(
+	struct is_remote_io_transaction_engine *engine,
+	const struct is_remote_io_transaction_spec *spec, void *adapter_context,
+	enum is_remote_io_transaction_event event)
+{
+	struct is_device *device = is_transaction_engine_device(engine);
+
+	(void)adapter_context;
+	if (spec) {
+		pr_warn(IS_DRIVER_NAME
+			": illegal Remote I/O Transaction event %u for generation %llu\n",
+			(unsigned int)event, spec->generation);
+	} else {
+		pr_warn(IS_DRIVER_NAME
+			": refused to destroy active Remote I/O Transaction engine for %s\n",
+			device->name);
+	}
 }
 
 static bool is_dispatch_remote(struct is_device *device,
@@ -1579,11 +1547,24 @@ static bool is_dispatch_remote(struct is_device *device,
 	if (write) {
 		if (!is_rdma_range_mapped(device, sector, bytes))
 			return false;
-		return is_dispatch_remote_write(device, request);
-	}
-	if (!is_rdma_range_valid(device, sector, bytes))
+	} else if (!is_rdma_range_valid(device, sector, bytes)) {
 		return false;
-	return is_dispatch_remote_read(device, request);
+	}
+
+	{
+		const struct is_remote_io_transaction_spec spec = {
+			.direction = write ? IS_REMOTE_IO_TRANSACTION_WRITE :
+				IS_REMOTE_IO_TRANSACTION_READ,
+			.sector = sector,
+			.bytes = bytes,
+			.generation = atomic64_inc_return(
+				&device->next_io_generation),
+			.payload = request,
+		};
+
+		is_remote_io_transaction_start(&device->transaction_engine, &spec);
+	}
+	return true;
 }
 
 static void is_complete_accepted_request(struct is_device *device,
@@ -1672,17 +1653,6 @@ static void is_issue_flush(struct is_device *device, struct request *request)
 	is_complete_accepted_request(device, request, status);
 }
 
-static bool is_mapped_remote_first_write(struct is_device *device,
-					 struct request *request)
-{
-	return device->mode == IS_DEVICE_MODE_BACKED &&
-	       req_op(request) == REQ_OP_WRITE &&
-	       device->acknowledgement_policy ==
-			IS_ACKNOWLEDGEMENT_POLICY_REMOTE_FIRST &&
-	       is_rdma_range_mapped(device, blk_rq_pos(request),
-				    blk_rq_bytes(request));
-}
-
 static void is_dispatch_backing_work(struct work_struct *work)
 {
 	struct is_request_ctx *ctx = container_of(work, struct is_request_ctx,
@@ -1694,11 +1664,6 @@ static void is_dispatch_backing_work(struct work_struct *work)
 		is_issue_flush(device, request);
 	} else if (is_dispatch_remote(device, request)) {
 		return;
-	} else if (is_mapped_remote_first_write(device, request) &&
-		   is_dispatch_remote(device, request)) {
-		return;
-	} else if (is_mapped_remote_first_write(device, request)) {
-		is_complete_accepted_request(device, request, BLK_STS_RESOURCE);
 	} else if (device->mode == IS_DEVICE_MODE_REMOTE_ONLY) {
 		is_complete_accepted_request(device, request, BLK_STS_IOERR);
 	} else if (req_op(request) == REQ_OP_READ &&
@@ -1853,8 +1818,16 @@ static void is_configure_queue(struct is_device *device)
 	blk_queue_flag_clear(QUEUE_FLAG_ADD_RANDOM, queue);
 }
 
-static void is_release_resources(struct is_device *device)
+static int is_release_resources(struct is_device *device)
 {
+	int ret;
+
+	if (device->transaction_engine.initialized) {
+		ret = is_remote_io_transaction_engine_destroy(
+			&device->transaction_engine);
+		if (ret)
+			return ret;
+	}
 	is_rdma_stop(device);
 	if (device->disk && device->disk_added) {
 		del_gendisk(device->disk);
@@ -1888,6 +1861,7 @@ static void is_release_resources(struct is_device *device)
 		device->minor = -1;
 	}
 	is_close_backing_store(device);
+	return 0;
 }
 
 static int is_validate_open_backing_store(struct is_device *device)
@@ -2063,6 +2037,15 @@ int is_device_activate(struct is_device *device)
 		goto release_resources;
 	}
 
+	ret = is_remote_io_transaction_engine_init(&device->transaction_engine,
+		remote_only ? IS_REMOTE_IO_TRANSACTION_REMOTE_ONLY :
+		(device->acknowledgement_policy ==
+			IS_ACKNOWLEDGEMENT_POLICY_REMOTE_FIRST ?
+			IS_REMOTE_IO_TRANSACTION_BACKED_REMOTE_FIRST :
+			IS_REMOTE_IO_TRANSACTION_BACKED_STRICT));
+	if (ret)
+		goto release_resources;
+
 	is_set_io_state(device, IS_DEVICE_ACTIVE, true);
 	ret = add_disk(device->disk);
 	if (ret) {
@@ -2083,7 +2066,7 @@ release_resources:
 	if (remote_state_locked)
 		mutex_unlock(&device->remote_state_lock);
 	is_set_io_state(device, previous_state, false);
-	is_release_resources(device);
+	WARN_ON(is_release_resources(device));
 out:
 	mutex_unlock(&device->lifecycle_lock);
 	return ret;
@@ -2149,7 +2132,9 @@ int is_device_stop(struct is_device *device)
 		goto out;
 	}
 
-	is_release_resources(device);
+	ret = is_release_resources(device);
+	if (ret)
+		goto out;
 	is_set_io_state(device, IS_DEVICE_STOPPED, false);
 	pr_info(IS_DRIVER_NAME ": stopped %s\n", device->name);
 out:

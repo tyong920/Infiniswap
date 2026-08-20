@@ -18,6 +18,7 @@
 #include <linux/workqueue.h>
 
 #include "infiniswap_protocol.h"
+#include "is_remote_io_transaction.h"
 
 #ifdef INFINISWAP_HAVE_LINUX_GENHD_H
 #include <linux/genhd.h>
@@ -37,7 +38,6 @@
 #define IS_HOT_RANGE_THRESHOLD_DEFAULT 8U
 #define IS_HOT_RANGE_READ_WEIGHT_DEFAULT 1U
 #define IS_HOT_RANGE_WRITE_WEIGHT_DEFAULT 4U
-#define IS_BACKING_RETRY_LIMIT 1U
 #define IS_REMOTE_CHUNK_BYTES (1ULL << 30)
 #define IS_MAX_REMOTE_CHUNKS IS_PROTOCOL_MAX_CHUNKS_PER_FRAME
 #define IS_MAX_PROVIDERS 64U
@@ -173,6 +173,7 @@ struct is_device {
 	struct workqueue_struct *ordered_backing_wq;
 	struct blk_mq_tag_set tag_set;
 	struct gendisk *disk;
+	struct is_remote_io_transaction_engine transaction_engine;
 	struct is_rdma_fabric *rdma;
 };
 
