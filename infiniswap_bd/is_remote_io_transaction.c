@@ -44,25 +44,25 @@ static void is_engine_counter_init(is_remote_io_transaction_counter_t *counter)
 static bool is_engine_try_register(
 	is_remote_io_transaction_counter_t *counter)
 {
-	int current = atomic_read(counter);
+	int count = atomic_read(counter);
 
-	while (!((unsigned int)current & IS_ENGINE_DESTROYED)) {
-		int observed = atomic_cmpxchg(counter, current, current + 1);
+	while (!((unsigned int)count & IS_ENGINE_DESTROYED)) {
+		int observed = atomic_cmpxchg(counter, count, count + 1);
 
-		if (observed == current)
+		if (observed == count)
 			return true;
-		current = observed;
+		count = observed;
 	}
 	return false;
 }
 
 static int is_engine_try_destroy(is_remote_io_transaction_counter_t *counter)
 {
-	int current = atomic_cmpxchg(counter, 0, (int)IS_ENGINE_DESTROYED);
+	int count = atomic_cmpxchg(counter, 0, (int)IS_ENGINE_DESTROYED);
 
-	if (current == 0)
+	if (count == 0)
 		return 0;
-	return ((unsigned int)current & IS_ENGINE_DESTROYED) ? -EINVAL : -EBUSY;
+	return ((unsigned int)count & IS_ENGINE_DESTROYED) ? -EINVAL : -EBUSY;
 }
 
 static void is_engine_counter_decrement(
@@ -112,11 +112,11 @@ static void is_engine_counter_init(is_remote_io_transaction_counter_t *counter)
 static bool is_engine_try_register(
 	is_remote_io_transaction_counter_t *counter)
 {
-	unsigned int current = atomic_load_explicit(counter, memory_order_acquire);
+	unsigned int count = atomic_load_explicit(counter, memory_order_acquire);
 
-	while (!(current & IS_ENGINE_DESTROYED)) {
-		if (atomic_compare_exchange_weak_explicit(counter, &current,
-				current + 1, memory_order_acquire,
+	while (!(count & IS_ENGINE_DESTROYED)) {
+		if (atomic_compare_exchange_weak_explicit(counter, &count,
+				count + 1, memory_order_acquire,
 				memory_order_relaxed))
 			return true;
 	}
@@ -125,13 +125,13 @@ static bool is_engine_try_register(
 
 static int is_engine_try_destroy(is_remote_io_transaction_counter_t *counter)
 {
-	unsigned int current = 0;
+	unsigned int count = 0;
 
-	if (atomic_compare_exchange_strong_explicit(counter, &current,
+	if (atomic_compare_exchange_strong_explicit(counter, &count,
 			IS_ENGINE_DESTROYED, memory_order_acq_rel,
 			memory_order_acquire))
 		return 0;
-	return current & IS_ENGINE_DESTROYED ? -EINVAL : -EBUSY;
+	return count & IS_ENGINE_DESTROYED ? -EINVAL : -EBUSY;
 }
 
 static void is_engine_counter_decrement(
