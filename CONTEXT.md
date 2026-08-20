@@ -48,6 +48,10 @@ _Avoid_: Fast mode, async mode
 A Backed Mode acknowledgement policy that waits for both writes to finish before reporting. A successful Backing Store write preserves correctness when the Remote Memory write fails, leaving Local-Only Data.
 _Avoid_: Safe mode, synchronous mode
 
+**Remote I/O Transaction**:
+The full lifecycle of one accepted read or write that uses Remote Memory and, in Backed Mode, may also use the Backing Store. A request may be acknowledged before its Remote I/O Transaction settles under the Remote-First Policy; the transaction settles only after every participating path reaches a terminal result and no transaction-owned resources remain.
+_Avoid_: Block request, RDMA operation, completion callback
+
 **Backing-Degraded**:
 A Backed Mode device state in which the Backing Store can no longer maintain the promised recovery copy. New writes are rejected until an operator restores a valid backed device.
 _Avoid_: Remote-Only Mode, warning state
