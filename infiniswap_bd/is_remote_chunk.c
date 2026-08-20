@@ -5,6 +5,7 @@
 #include <linux/atomic.h>
 #include <linux/build_bug.h>
 #include <linux/errno.h>
+#include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
