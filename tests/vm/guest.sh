@@ -115,13 +115,30 @@ psk_restore() {
 
 provider_start() {
   local port=$1 psk_file=$2 provider_id=${3:-provider-vm} psk
+  local host_reserve_gib=${4:-0} max_opportunistic_gib=${5:-2}
+  local max_committed_gib=${6:-2} available_gib
+
+  systemctl stop infiniswap-vm-provider.service 2>/dev/null || true
+  systemctl reset-failed infiniswap-vm-provider.service 2>/dev/null || true
+  if [[ $host_reserve_gib == auto ]]; then
+    available_gib=$(awk '/^MemAvailable:/ {print int($2 / 1048576)}' /proc/meminfo)
+    [[ $available_gib =~ ^[0-9]+$ ]] || fail "could not read Provider MemAvailable"
+    ((available_gib >= 2)) || fail "Provider needs at least 2 GiB available"
+    host_reserve_gib=$((available_gib - 1))
+  fi
+  [[ $host_reserve_gib =~ ^[0-9]+$ &&
+     $max_opportunistic_gib =~ ^[0-9]+$ &&
+     $max_committed_gib =~ ^[0-9]+$ ]] ||
+    fail "invalid Provider memory policy"
+  ((max_opportunistic_gib + max_committed_gib > 0)) ||
+    fail "Provider memory policy has no Remote Chunk capacity"
   psk=$(<"$psk_file")
   [[ $psk =~ ^[[:xdigit:]]{64}$ ]] || fail "invalid Provider PSK file"
-  cat > /etc/infiniswap-vm-memory.conf <<'EOF'
+  cat > /etc/infiniswap-vm-memory.conf <<EOF
 version = 1
-host_reserve_gib = 0
-max_opportunistic_gib = 2
-max_committed_gib = 2
+host_reserve_gib = $host_reserve_gib
+max_opportunistic_gib = $max_opportunistic_gib
+max_committed_gib = $max_committed_gib
 EOF
   cat > /etc/infiniswap-vm-consumers.conf <<EOF
 version = 1
@@ -130,13 +147,11 @@ version = 1
 current_key_id = key-vm
 current_psk_hex = $psk
 max_connections = 8
-max_opportunistic_gib = 2
-max_committed_gib = 2
+max_opportunistic_gib = $max_opportunistic_gib
+max_committed_gib = $max_committed_gib
 revoked = false
 EOF
   chmod 0600 /etc/infiniswap-vm-consumers.conf
-  systemctl stop infiniswap-vm-provider.service 2>/dev/null || true
-  systemctl reset-failed infiniswap-vm-provider.service 2>/dev/null || true
   systemd-run --quiet --unit=infiniswap-vm-provider \
     --property=LimitMEMLOCK=infinity --property=Nice=5 \
     --setenv="INFINISWAP_PROVIDER_ID=$provider_id" -- \
@@ -293,6 +308,349 @@ PY
     fail "Remote-Only heartbeat validation observed a Provider timeout"
 }
 
+remote_chunk_contracts() {
+  local binary=$artifacts/remote-chunk-certification-test
+  local report=$artifacts/remote-chunk-contracts.json
+
+  cc -std=c11 -Wall -Wextra -Wpedantic -Werror -pthread \
+    "$repo/infiniswap_bd/is_remote_chunk.c" \
+    "$repo/infiniswap_bd/tests/remote-chunk-test.c" -o "$binary"
+  "$binary" --certification-report >"$report"
+  python3 - "$report" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="ascii") as source:
+    report = json.load(source)
+expected = {
+    "atomic_batches",
+    "eviction_drain",
+    "generation_safety",
+    "remote_only",
+}
+if (
+    report.get("kind") != "infiniswap.remote-chunk-certification"
+    or report.get("status") != "passed"
+    or set(report.get("checks", {})) != expected
+    or any(value != "passed" for value in report["checks"].values())
+):
+    raise SystemExit("Remote Chunk certification contracts failed")
+PY
+}
+
+rdma_delay() {
+  local action=$1 rail=$2 delay_ms=${3:-0} netdev
+  local mark=28 comment=infiniswap-vm-rdma-data-delay
+
+  command -v tc >/dev/null || fail "tc is required for RDMA delay injection"
+  command -v iptables >/dev/null || fail "iptables is required for RDMA delay injection"
+  netdev=$(rdma link show "$rail/1" |
+    awk '{for (i=1; i<=NF; i++) if ($i == "netdev") print $(i+1)}')
+  [[ -n $netdev ]] || fail "could not resolve the netdev for $rail/1"
+  case $action in
+    add)
+      [[ $delay_ms =~ ^[1-9][0-9]*$ ]] || fail "invalid RDMA delay"
+      while iptables -w -t mangle -D OUTPUT -o "$netdev" -p udp \
+        --dport 4791 -m length --length 512:65535 -m comment \
+        --comment "$comment" -j MARK --set-mark "$mark" 2>/dev/null; do :; done
+      tc qdisc del dev "$netdev" root 2>/dev/null || true
+      tc qdisc add dev "$netdev" root handle 1: prio bands 2 \
+        priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+      tc qdisc add dev "$netdev" parent 1:2 handle 20: netem \
+        delay "${delay_ms}ms"
+      tc filter add dev "$netdev" protocol ip parent 1: prio 1 \
+        handle "$mark" fw flowid 1:2
+      iptables -w -t mangle -I OUTPUT -o "$netdev" -p udp --dport 4791 \
+        -m length --length 512:65535 -m comment --comment "$comment" \
+        -j MARK --set-mark "$mark"
+      ;;
+    clear)
+      while iptables -w -t mangle -D OUTPUT -o "$netdev" -p udp \
+        --dport 4791 -m length --length 512:65535 -m comment \
+        --comment "$comment" -j MARK --set-mark "$mark" 2>/dev/null; do :; done
+      tc qdisc del dev "$netdev" root 2>/dev/null || true
+      ;;
+    *) fail "unknown RDMA delay action: $action" ;;
+  esac
+}
+
+eviction_io() {
+  local action=$1 unit=infiniswap-vm-eviction-io
+  local output=$artifacts/fio-atomic-eviction.json result
+
+  case $action in
+    start)
+      systemctl stop "$unit.service" 2>/dev/null || true
+      systemctl reset-failed "$unit.service" 2>/dev/null || true
+      rm -f "$output"
+      systemd-run --quiet --unit="$unit" --service-type=exec -- \
+        fio --name=atomic-eviction --filename="$device" --direct=1 \
+          --ioengine=libaio --rw=randwrite --bs=4k --iodepth=32 --size=64m \
+          --time_based=1 --runtime=15 --verify=crc32c --do_verify=1 \
+          --verify_fatal=1 --group_reporting --output-format=json \
+          --output="$output"
+      ;;
+    wait)
+      for _ in {1..1200}; do
+        systemctl is-active --quiet "$unit.service" || break
+        sleep 0.1
+      done
+      systemctl is-active --quiet "$unit.service" &&
+        fail "atomic eviction I/O did not finish"
+      result=$(systemctl show -p Result --value "$unit.service")
+      [[ $result == success ]] || fail "atomic eviction I/O result was $result"
+      python3 - "$output" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    output = source.read()
+start = output.find("{")
+if start < 0:
+    raise SystemExit("atomic eviction fio output is not JSON")
+report = json.loads(output[start:])
+if not report.get("jobs") or any(job.get("error", 0) for job in report["jobs"]):
+    raise SystemExit("atomic eviction fio reported an I/O error")
+PY
+      systemctl reset-failed "$unit.service" 2>/dev/null || true
+      ;;
+    stop)
+      systemctl stop "$unit.service" 2>/dev/null || true
+      systemctl reset-failed "$unit.service" 2>/dev/null || true
+      ;;
+    *) fail "unknown eviction I/O action: $action" ;;
+  esac
+}
+
+observe_eviction() {
+  local action=$1 provider_id=${2:-} unit=infiniswap-vm-eviction-observer
+  local script=/var/tmp/infiniswap-vm-observe-eviction
+  local output=$artifacts/atomic-eviction.json result
+
+  case $action in
+    start)
+      [[ -n $provider_id ]] || fail "eviction observer requires a Provider ID"
+      systemctl stop "$unit.service" 2>/dev/null || true
+      systemctl reset-failed "$unit.service" 2>/dev/null || true
+      rm -f "$output"
+      cat >"$script" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+group=$1
+output=$2
+provider_id=$3
+device=$4
+started=$(date +%s%3N)
+deadline=$((started + 60000))
+local_before=$(<"$group/local_only_writes_total")
+accepted_io=false
+admission_closed=false
+assignment_retained=false
+fallback_submitted_while_draining=false
+fallback_observed=false
+release_complete=false
+admission_ms=-1
+release_ms=-1
+
+while (($(date +%s%3N) <= deadline)); do
+  now=$(date +%s%3N)
+  mapped=$(<"$group/mapped_remote_chunks")
+  placement=$(<"$group/remote_chunk_placements")
+  local_after=$(<"$group/local_only_writes_total")
+  inflight=$(<"$group/inflight_io")
+  ((inflight > 0)) && accepted_io=true
+  if ((mapped == 0)); then
+    if [[ $admission_closed == false ]]; then
+      admission_closed=true
+      admission_ms=$((now - started))
+    fi
+    [[ $placement == *"0:$provider_id"* ]] && assignment_retained=true
+    if [[ $placement == *"0:$provider_id"* &&
+          $fallback_submitted_while_draining == false ]]; then
+      timeout 10 dd if=/dev/zero of="$device" bs=4096 seek=200000 \
+        count=1 oflag=direct conv=notrunc status=none
+      fallback_submitted_while_draining=true
+    fi
+  fi
+  ((local_after > local_before)) && fallback_observed=true
+  if [[ $admission_closed == true && $placement == *"0:unmapped"* ]]; then
+    release_complete=true
+    release_ms=$((now - started))
+  fi
+  if [[ $accepted_io == true && $admission_closed == true &&
+        $assignment_retained == true &&
+        $fallback_submitted_while_draining == true &&
+        $fallback_observed == true && $release_complete == true ]]; then
+    printf '{"schema_version":1,"kind":"infiniswap.atomic-eviction",' >"$output"
+    printf '"status":"passed","accepted_io_observed":true,' >>"$output"
+    printf '"admission_closed":true,"assignment_retained_while_draining":true,' >>"$output"
+    printf '"fallback_submitted_while_draining":true,' >>"$output"
+    printf '"fallback_writes":%s,' \
+      "$((local_after - local_before))" >>"$output"
+    printf '"release_complete":true,' >>"$output"
+    printf '"admission_ms":%s,"release_ms":%s}\n' \
+      "$admission_ms" "$release_ms" >>"$output"
+    exit 0
+  fi
+  sleep 0.005
+done
+printf 'eviction evidence incomplete: accepted=%s admission=%s retained=%s fallback_submitted=%s fallback_complete=%s release=%s\n' \
+  "$accepted_io" "$admission_closed" "$assignment_retained" \
+  "$fallback_submitted_while_draining" "$fallback_observed" \
+  "$release_complete" >&2
+exit 1
+SH
+      chmod 0755 "$script"
+      systemd-run --quiet --unit="$unit" --service-type=exec -- \
+        "$script" "$group" "$output" "$provider_id" "$device"
+      ;;
+    wait)
+      for _ in {1..700}; do
+        systemctl is-active --quiet "$unit.service" || break
+        sleep 0.1
+      done
+      systemctl is-active --quiet "$unit.service" &&
+        fail "eviction observer did not finish"
+      result=$(systemctl show -p Result --value "$unit.service")
+      if [[ $result != success ]]; then
+        journalctl -u "$unit.service" --no-pager -n 50 >&2 || true
+        fail "eviction observer result was $result"
+      fi
+      python3 - "$output" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="ascii") as source:
+    report = json.load(source)
+required = (
+    "accepted_io_observed",
+    "admission_closed",
+    "assignment_retained_while_draining",
+    "fallback_submitted_while_draining",
+    "release_complete",
+)
+if report.get("status") != "passed" or not all(report.get(key) for key in required):
+    raise SystemExit("atomic eviction evidence is incomplete")
+if report.get("fallback_writes", 0) < 1:
+    raise SystemExit("atomic eviction did not observe Backing Store fallback")
+PY
+      systemctl reset-failed "$unit.service" 2>/dev/null || true
+      ;;
+    stop)
+      systemctl stop "$unit.service" 2>/dev/null || true
+      systemctl reset-failed "$unit.service" 2>/dev/null || true
+      ;;
+    *) fail "unknown eviction observer action: $action" ;;
+  esac
+}
+
+provider_pressure() {
+  local action=$1 label=${2:-current} unit=infiniswap-vm-provider-pressure
+  local script=/var/tmp/infiniswap-vm-provider-pressure.py
+  local ready=/var/tmp/infiniswap-vm-provider-pressure.ready
+  local status=$artifacts/provider-pressure-$label.json result
+
+  case $action in
+    start)
+      systemctl stop "$unit.service" 2>/dev/null || true
+      systemctl reset-failed "$unit.service" 2>/dev/null || true
+      rm -f "$ready" "$status"
+      cat >"$script" <<'PY'
+import json
+import re
+import sys
+import time
+from pathlib import Path
+
+ready = Path(sys.argv[1])
+status = Path(sys.argv[2])
+configuration = Path("/etc/infiniswap-vm-memory.conf").read_text(encoding="ascii")
+match = re.search(r"^host_reserve_gib = ([0-9]+)$", configuration, re.MULTILINE)
+if not match:
+    raise SystemExit("Provider Host Reserve is absent")
+reserve_gib = int(match.group(1))
+target = max(512 * 1024 * 1024, reserve_gib * 1024**3 - 256 * 1024 * 1024)
+chunk_size = 64 * 1024 * 1024
+allocations = []
+started = time.monotonic()
+
+try:
+    Path("/proc/self/oom_score_adj").write_text("1000\n", encoding="ascii")
+except OSError:
+    pass
+
+def available_bytes():
+    with open("/proc/meminfo", encoding="ascii") as source:
+        for line in source:
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    raise RuntimeError("MemAvailable is absent")
+
+while available_bytes() >= target:
+    if time.monotonic() - started > 120:
+        raise SystemExit("Provider pressure did not reach its target")
+    allocation = bytearray(chunk_size)
+    for offset in range(0, chunk_size, 4096):
+        allocation[offset] = 0x5A
+    allocations.append(allocation)
+    time.sleep(0.01)
+
+payload = {
+    "schema_version": 1,
+    "kind": "infiniswap.provider-pressure",
+    "status": "target-reached",
+    "allocated_bytes": len(allocations) * chunk_size,
+    "mem_available_bytes": available_bytes(),
+    "target_bytes": target,
+    "host_reserve_gib": reserve_gib,
+}
+status.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="ascii")
+ready.write_text("ready\n", encoding="ascii")
+while True:
+    time.sleep(1)
+PY
+      systemd-run --quiet --unit="$unit" --service-type=exec -- \
+        python3 "$script" "$ready" "$status"
+      for _ in {1..1300}; do
+        [[ -f $ready ]] && return 0
+        systemctl is-active --quiet "$unit.service" || break
+        sleep 0.1
+      done
+      result=$(systemctl show -p Result --value "$unit.service")
+      journalctl -u "$unit.service" --no-pager -n 50 >&2 || true
+      fail "Provider pressure did not start (result $result)"
+      ;;
+    stop)
+      systemctl stop "$unit.service" 2>/dev/null || true
+      systemctl reset-failed "$unit.service" 2>/dev/null || true
+      rm -f "$ready"
+      ;;
+    *) fail "unknown Provider pressure action: $action" ;;
+  esac
+}
+
+verify_remote_only_committed() {
+  local provider_id=$1 seconds=$2 started now placement
+
+  [[ $seconds =~ ^[1-9][0-9]*$ ]] || fail "invalid committed-check duration"
+  started=$(date +%s)
+  while true; do
+    [[ $(<"$group/mapped_remote_chunks") == 1 ]] ||
+      fail "Provider pressure evicted a Committed Remote Chunk"
+    [[ $(<"$group/remote_capacity_bytes") == "$chunk_bytes" ]] ||
+      fail "Provider pressure changed committed capacity"
+    placement=$(<"$group/remote_chunk_placements")
+    [[ $placement == *"0:$provider_id"* ]] ||
+      fail "Committed Remote Chunk lost its Provider assignment: $placement"
+    [[ $(<"$group/connection_state") == connected ]] ||
+      fail "Remote-Only connection changed under Provider pressure"
+    now=$(date +%s)
+    ((now - started >= seconds)) && break
+    sleep 0.05
+  done
+}
+
 run_fio() {
   local label=$1 duration=${2:-0} rw=randrw
   local -a args
@@ -443,6 +801,7 @@ snapshot() {
       for attribute in state operational_state connection_state backing_state \
         provider_exclusions provider_runtime_status remote_chunk_placements \
         mapped_remote_chunks remote_capacity_bytes provider_timeouts_total \
+        late_rdma_completions_total local_only_writes_total \
         remote_lost_transitions_total backing_degraded_transitions_total \
         rejected_writes_total authentication_failures_total \
         admission_rejections_total io_requests_total io_completed_total \
@@ -622,6 +981,9 @@ collect() {
 
 cleanup_guest() {
   set +e
+  systemctl stop infiniswap-vm-eviction-io.service \
+    infiniswap-vm-eviction-observer.service \
+    infiniswap-vm-provider-pressure.service 2>/dev/null || true
   for address in "$@"; do
     network_fault clear "$address"
   done
@@ -666,6 +1028,12 @@ case $command in
   fio-performance) run_fio_performance "$@" ;;
   performance-evidence) performance_evidence "$@" ;;
   verify-remote-only-heartbeats) verify_remote_only_heartbeats "$@" ;;
+  remote-chunk-contracts) remote_chunk_contracts ;;
+  rdma-delay) rdma_delay "$@" ;;
+  eviction-io) eviction_io "$@" ;;
+  observe-eviction) observe_eviction "$@" ;;
+  provider-pressure) provider_pressure "$@" ;;
+  verify-remote-only-committed) verify_remote_only_committed "$@" ;;
   snapshot) snapshot "$@" ;;
   assert-alert) assert_alert "$@" ;;
   swap-pressure) swap_pressure ;;

@@ -22,6 +22,7 @@ class ScenarioRecordingBackend(qemu_backend.QemuBackend):
         self.device_calls = []
         self.waited_for_reboot = False
         self.previous_boot_id = None
+        self.transports_reset = False
 
     def _helper(self, handle, guest, label, *args, **kwargs):
         self.helper_calls.append((label, args, kwargs))
@@ -48,6 +49,9 @@ class ScenarioRecordingBackend(qemu_backend.QemuBackend):
 
     def _reset_provider_guests(self, handle):
         pass
+
+    def _reset_transports(self, handle):
+        self.transports_reset = True
 
 
 class PerformanceRecordingBackend(ScenarioRecordingBackend):
@@ -196,6 +200,96 @@ class QemuScenarioTest(unittest.TestCase):
                 "InfiniswapBackingDegraded",
                 "absent",
             ),
+        )
+
+    def test_remote_chunk_certification_exercises_atomicity_and_mode_policies(self):
+        backend = ScenarioRecordingBackend()
+        consumer = SimpleNamespace(
+            name="consumer", links=[{"consumer_rail": "rxe0"}]
+        )
+        provider = SimpleNamespace(
+            name="provider-0", links=[{"provider_rail": "rxe0"}]
+        )
+        handle = SimpleNamespace(
+            consumer=consumer,
+            providers=[provider],
+            guests=[consumer, provider],
+        )
+
+        result = backend._scenario_remote_chunk_certification(handle)
+
+        calls = {label: args for label, args, _kwargs in backend.helper_calls}
+        self.assertEqual(result.status, "passed")
+        self.assertEqual(
+            [call[0][1] for call in backend.device_calls],
+            ["backed", "remote-only"],
+        )
+        self.assertEqual(
+            calls["remote-chunk-contracts"], ("remote-chunk-contracts",)
+        )
+        self.assertEqual(
+            calls["provider-eviction-policy"],
+            (
+                "provider-start",
+                "19420",
+                "/etc/infiniswap-vm.psk",
+                "provider-0",
+                "auto",
+                "1",
+                "2",
+            ),
+        )
+        self.assertEqual(
+            calls["eviction-pressure-start"],
+            ("provider-pressure", "start", "backed"),
+        )
+        self.assertEqual(
+            calls["eviction-observer-start"],
+            ("observe-eviction", "start", "provider-0"),
+        )
+        self.assertEqual(
+            calls["eviction-observe"], ("observe-eviction", "wait")
+        )
+        self.assertEqual(
+            calls["committed-under-pressure"],
+            ("verify-remote-only-committed", "provider-0", "5"),
+        )
+        self.assertEqual(
+            calls["committed-pressure-start"],
+            ("provider-pressure", "start", "remote-only"),
+        )
+        self.assertEqual(
+            calls["remote-only-lost"],
+            ("wait-field", "connection_state", "remote-lost", "400"),
+        )
+        self.assertEqual(
+            calls["remote-only-operational-lost"],
+            ("wait-field", "operational_state", "remote-lost", "20"),
+        )
+        self.assertEqual(
+            calls["remote-only-lost-once"],
+            ("wait-field", "remote_lost_transitions_total", "1", "20"),
+        )
+        self.assertEqual(
+            calls["remote-only-io-failure"], ("expect-io-failure",)
+        )
+        self.assertTrue(backend.transports_reset)
+        self.assertIn(
+            "guest:consumer:remote-chunk-contracts.json", result.artifacts
+        )
+        self.assertIn(
+            "guest:consumer:atomic-eviction.json", result.artifacts
+        )
+        self.assertIn(
+            "guest:provider-0:provider-pressure-backed.json", result.artifacts
+        )
+        self.assertIn(
+            "guest:provider-0:provider-pressure-remote-only.json",
+            result.artifacts,
+        )
+        self.assertIn(
+            "guest:consumer:status-remote-chunk-remote-lost.json",
+            result.artifacts,
         )
 
     def test_remote_only_fio_crosses_multiple_heartbeat_intervals(self):
@@ -542,6 +636,7 @@ class VmValidationCliTest(unittest.TestCase):
             "fio-verification",
             "swap-pressure",
             "normal-shutdown",
+            "remote-chunk-certification",
             "provider-process-kill",
             "network-interruption",
             "backing-store-error",
@@ -643,6 +738,46 @@ class VmValidationCliTest(unittest.TestCase):
         self.assertEqual(
             [scenario["id"] for scenario in report["matrix"][0]["scenarios"]],
             ["build-deploy", "fio-verification", "resource-leak-check"],
+        )
+
+    def test_focused_remote_chunk_plan_expands_prerequisites(self):
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            result = infiniswap_vm.main(
+                [
+                    "--preflight-only",
+                    "--json",
+                    "--scenario",
+                    "remote-chunk-certification",
+                    "--kernel",
+                    "6.8",
+                    "--topology",
+                    "2",
+                    "--artifacts",
+                    directory,
+                ],
+                stdout=stdout,
+                stderr=io.StringIO(),
+                environment=self.supported_host(),
+            )
+            report = json.loads(stdout.getvalue())
+
+        self.assertEqual(result, 0)
+        self.assertFalse(report["profile"]["certifiable"])
+        self.assertEqual(
+            report["certification"],
+            {
+                "status": "non-certifiable",
+                "reason": "focused Soft-RoCE Remote Chunk evidence",
+            },
+        )
+        self.assertEqual(
+            [scenario["id"] for scenario in report["matrix"][0]["scenarios"]],
+            [
+                "build-deploy",
+                "remote-chunk-certification",
+                "resource-leak-check",
+            ],
         )
 
     def test_failure_still_cleans_resources_and_records_skipped_scenarios(self):

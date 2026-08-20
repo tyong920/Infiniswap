@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 
 #define TEST_THRESHOLD 8ULL
@@ -1601,9 +1602,46 @@ static int test_quiesce_rejects_new_ownership_while_accepted_work_retires(void)
 	return failed;
 }
 
-int main(void)
+static int run_certification_contracts(void)
 {
-	int failed = test_explicit_mapping_commit_is_atomic() |
+	int atomic_batches = test_malformed_commit_does_not_partially_map() |
+		test_provider_activity_query_and_eviction_are_atomic();
+	int eviction_drain = test_eviction_wait_times_out_without_choosing_policy() |
+		test_concurrent_lease_release_wakes_eviction_wait();
+	int generation_safety =
+		test_provider_failure_invalidates_atomically_and_preserves_activity() |
+		test_concurrent_completion_and_provider_failure_are_generation_safe();
+	int remote_only = test_remote_only_rejects_provider_eviction() |
+		test_remote_only_provider_failure_returns_policy_neutral_facts();
+	int failed = atomic_batches | eviction_drain | generation_safety |
+		remote_only;
+
+	printf("{\"schema_version\":1,\"kind\":"
+	       "\"infiniswap.remote-chunk-certification\","
+	       "\"status\":\"%s\",\"checks\":{"
+	       "\"atomic_batches\":\"%s\","
+	       "\"eviction_drain\":\"%s\","
+	       "\"generation_safety\":\"%s\","
+	       "\"remote_only\":\"%s\"}}\n",
+	       failed ? "failed" : "passed",
+	       atomic_batches ? "failed" : "passed",
+	       eviction_drain ? "failed" : "passed",
+	       generation_safety ? "failed" : "passed",
+	       remote_only ? "failed" : "passed");
+	return failed;
+}
+
+int main(int argc, char **argv)
+{
+	int failed;
+
+	if (argc == 2 && strcmp(argv[1], "--certification-report") == 0)
+		return run_certification_contracts();
+	if (argc != 1) {
+		fprintf(stderr, "usage: %s [--certification-report]\n", argv[0]);
+		return 2;
+	}
+	failed = test_explicit_mapping_commit_is_atomic() |
 		test_malformed_commit_does_not_partially_map() |
 		test_duplicate_and_wrong_provider_commits_are_rejected() |
 		test_delayed_claim_cannot_commit_after_abort_and_remap() |

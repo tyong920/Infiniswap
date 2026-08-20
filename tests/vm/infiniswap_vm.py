@@ -34,6 +34,7 @@ DEFAULT_SCENARIOS = (
     "fio-verification",
     "swap-pressure",
     "normal-shutdown",
+    "remote-chunk-certification",
     "provider-process-kill",
     "network-interruption",
     "backing-store-error",
@@ -42,7 +43,10 @@ DEFAULT_SCENARIOS = (
     "resource-leak-check",
     "soak",
 )
-SCENARIO_PREREQUISITES = {"fio-verification": ("build-deploy",)}
+SCENARIO_PREREQUISITES = {
+    "fio-verification": ("build-deploy",),
+    "remote-chunk-certification": ("build-deploy",),
+}
 CLEANUP_SCENARIO = "resource-leak-check"
 
 REQUIRED_HOST_COMMANDS = (
@@ -150,9 +154,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--topology", choices=("all", "2", "3"), default="all")
     parser.add_argument(
         "--scenario",
-        choices=("all", "fio-verification"),
+        choices=("all", "fio-verification", "remote-chunk-certification"),
         default="all",
-        help="run the default certifiable plan or focused fio evidence",
+        help="run the default certifiable plan or focused evidence",
     )
     parser.add_argument("--soak-hours", type=float, default=24.0)
     parser.add_argument("--artifacts", type=Path, default=_default_artifacts())
@@ -617,10 +621,15 @@ def main(
         "matrix": _planned_matrix(args, requested),
     }
     if args.scenario != "all":
+        reason = (
+            "focused Soft-RoCE performance evidence"
+            if args.scenario == "fio-verification"
+            else "focused Soft-RoCE Remote Chunk evidence"
+        )
         report["selection"]["scenario"] = args.scenario
         report["certification"] = {
             "status": "non-certifiable",
-            "reason": "focused Soft-RoCE performance evidence",
+            "reason": reason,
         }
     _persist_report(args.artifacts, report)
     if preflight_status == "passed" and not args.preflight_only:

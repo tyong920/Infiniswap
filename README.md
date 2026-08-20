@@ -517,13 +517,15 @@ and swap operations occur inside disposable guests.
 
 Each matrix entry builds from the current checkout and exercises Backed and
 Remote-Only verified `fio`, multi-Provider placement, guest-only swap pressure,
-normal device shutdown, Provider `SIGKILL`, RXE packet interruption, a
-Device Mapper Backing Store error, Consumer reboot, safe module reload, and the
-soak. Data mismatch, Provider deadline failure, unexpected I/O success, kernel
-warning/oops/panic, hung I/O, cleanup failure, or leaked QEMU process/socket/disk
-fails the machine-readable `report.json`. Guest journal, dmesg, status,
-configfs metrics, `fio` JSON, QEMU serial output, and command logs are retained
-under the reported `results/vm/<run-id>/` directory.
+atomic Backed Mode eviction and fallback, Committed Remote Chunk protection,
+malformed batch and stale-completion contracts, normal device shutdown,
+Provider `SIGKILL`, RXE packet interruption, a Device Mapper Backing Store
+error, Consumer reboot, safe module reload, and the soak. Data mismatch,
+Provider deadline failure, unexpected I/O success, kernel warning/oops/panic,
+hung I/O, cleanup failure, or leaked QEMU process/socket/disk fails the
+machine-readable `report.json`. Guest journal, dmesg, status, configfs metrics,
+`fio` JSON, QEMU serial output, and command logs are retained under the reported
+`results/vm/<run-id>/` directory.
 
 Use `--keep-on-failure` to retain failed guests and their QMP sockets/disks for
 inspection. A focused smoke run may lower resources within the selected cap and
@@ -533,6 +535,26 @@ set the soak to zero, but its report is marked non-certifiable:
 tests/vm/run --kernel 6.8 --topology 2 --soak-hours 0 \
   --memory-gib 8 --disk-gib 24 --keep-on-failure
 ```
+
+To run only the Remote Chunk integration gate, select
+`remote-chunk-certification`. The harness expands the selection to build/deploy
+first and resource cleanup last. It emits machine-readable public-interface
+evidence for atomic malformed-batch rejection and generation-safe Provider
+failure, then uses guest RXE delay and Provider-local memory pressure to observe
+Backed Mode eviction closing admission, draining accepted Remote I/O, routing
+new writes to the Backing Store, and completing release. The same run proves
+Committed Remote Chunks survive pressure before Provider loss enters terminal
+Remote-Lost:
+
+```bash
+tests/vm/run --scenario remote-chunk-certification \
+  --kernel 6.8 --topology 2 --soak-hours 0 \
+  --artifacts results/vm/remote-chunk-certification --json
+```
+
+This focused selection is non-certifiable. The default plan remains the release
+certificate and includes the same Remote Chunk gate for every kernel/topology
+entry.
 
 For repeatable completion-path performance evidence, select only
 `fio-verification`. The harness expands that selection to build/deploy first and
