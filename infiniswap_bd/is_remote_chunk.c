@@ -8,6 +8,7 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
+#include <linux/vmalloc.h>
 
 typedef spinlock_t is_remote_chunk_lock_t;
 typedef unsigned long is_remote_chunk_lock_flags_t;
@@ -50,6 +51,16 @@ static void *is_remote_chunk_allocate_array(size_t count, size_t size)
 static void is_remote_chunk_free(void *allocation)
 {
 	kfree(allocation);
+}
+
+static unsigned long *is_remote_chunk_validity_allocate(size_t word_count)
+{
+	return kvcalloc(word_count, sizeof(unsigned long), GFP_KERNEL);
+}
+
+static void is_remote_chunk_validity_free(unsigned long *validity)
+{
+	kvfree(validity);
 }
 
 static unsigned long long is_remote_chunk_allocate_module_identity(void)
@@ -112,6 +123,18 @@ static void is_remote_chunk_free(void *allocation)
 	free(allocation);
 }
 
+static unsigned long *is_remote_chunk_validity_allocate(size_t word_count)
+{
+	if (word_count > SIZE_MAX / sizeof(unsigned long))
+		return NULL;
+	return calloc(word_count, sizeof(unsigned long));
+}
+
+static void is_remote_chunk_validity_free(unsigned long *validity)
+{
+	free(validity);
+}
+
 static unsigned long long is_remote_chunk_allocate_module_identity(void)
 {
 	return atomic_fetch_add_explicit(&is_remote_chunk_next_module_identity, 1,
@@ -120,10 +143,14 @@ static unsigned long long is_remote_chunk_allocate_module_identity(void)
 #endif
 
 #define IS_REMOTE_CHUNK_CLAIM_MAGIC 0x49534348434c4149ULL
+#define IS_REMOTE_CHUNK_LEASE_MAGIC 0x495343484c454153ULL
 #define IS_REMOTE_CHUNK_ACTIVITY_MAX (~0ULL >> 1)
 #define IS_REMOTE_CHUNK_ID_MAX (~0ULL)
 #define IS_REMOTE_CHUNK_DIGEST_OFFSET 1469598103934665603ULL
 #define IS_REMOTE_CHUNK_DIGEST_PRIME 1099511628211ULL
+#define IS_REMOTE_CHUNK_BITS_PER_WORD (sizeof(unsigned long) * 8U)
+#define IS_REMOTE_CHUNK_LEASE_RESOLVED (1U << 0)
+#define IS_REMOTE_CHUNK_LEASE_RELEASED (1U << 1)
 
 enum is_remote_chunk_state {
 	IS_REMOTE_CHUNK_UNMAPPED = 0,
@@ -141,11 +168,13 @@ struct is_remote_chunk {
 	unsigned long long mapping_generation;
 	unsigned long long mapping_claim_id;
 	unsigned long long transition_generation;
+	unsigned int active_io_leases;
 };
 
 struct is_remote_chunk_module {
 	is_remote_chunk_lock_t lock;
 	struct is_remote_chunk *chunks;
+	unsigned long *valid_sectors;
 	enum is_remote_chunk_mode mode;
 	unsigned int chunk_count;
 	struct is_remote_chunk_hot_policy hot_policy;
@@ -154,7 +183,11 @@ struct is_remote_chunk_module {
 	unsigned long long next_mapping_claim_id;
 	unsigned long long next_transition_generation;
 	unsigned long long next_mapping_generation;
+	unsigned long long next_io_lease_id;
+	unsigned long long invariant_count;
+	enum is_remote_chunk_invariant_event latest_invariant;
 	unsigned int active_mapping_claims;
+	unsigned int active_io_leases;
 	unsigned int assigned_chunks;
 	unsigned int usable_chunks;
 };
@@ -170,13 +203,31 @@ struct is_remote_chunk_mapping_claim_internal {
 	unsigned int reserved;
 };
 
+struct is_remote_chunk_io_lease_internal {
+	unsigned long long magic;
+	unsigned long long module_identity;
+	unsigned long long storage_identity;
+	unsigned long long lease_id;
+	unsigned long long mapping_generation;
+	unsigned long long sector;
+	unsigned int sector_count;
+	unsigned int logical_chunk;
+	unsigned int direction;
+	unsigned int state;
+};
+
 #ifdef __KERNEL__
 static_assert(sizeof(struct is_remote_chunk_mapping_claim_internal) <=
 	IS_REMOTE_CHUNK_MAPPING_CLAIM_BYTES);
+static_assert(sizeof(struct is_remote_chunk_io_lease_internal) <=
+	IS_REMOTE_CHUNK_IO_LEASE_BYTES);
 #else
 _Static_assert(sizeof(struct is_remote_chunk_mapping_claim_internal) <=
 	IS_REMOTE_CHUNK_MAPPING_CLAIM_BYTES,
 	"mapping claim storage is too small");
+_Static_assert(sizeof(struct is_remote_chunk_io_lease_internal) <=
+	IS_REMOTE_CHUNK_IO_LEASE_BYTES,
+	"I/O lease storage is too small");
 #endif
 
 static bool is_remote_chunk_mode_valid(enum is_remote_chunk_mode mode)
@@ -242,6 +293,138 @@ static void is_remote_chunk_claim_encode(
 {
 	memset(claim, 0, sizeof(*claim));
 	memcpy(claim->opaque.bytes, internal, sizeof(*internal));
+}
+
+static void is_remote_chunk_lease_decode(
+	const struct is_remote_chunk_io_lease *lease,
+	struct is_remote_chunk_io_lease_internal *internal)
+{
+	memset(internal, 0, sizeof(*internal));
+	if (lease)
+		memcpy(internal, lease->opaque.bytes, sizeof(*internal));
+}
+
+static void is_remote_chunk_lease_encode(
+	struct is_remote_chunk_io_lease *lease,
+	const struct is_remote_chunk_io_lease_internal *internal)
+{
+	memset(lease, 0, sizeof(*lease));
+	memcpy(lease->opaque.bytes, internal, sizeof(*internal));
+}
+
+static unsigned long long is_remote_chunk_lease_storage_identity(
+	const struct is_remote_chunk_io_lease *lease)
+{
+	return (unsigned long long)(unsigned long)lease;
+}
+
+static unsigned long is_remote_chunk_low_bits(unsigned int bit_count)
+{
+	if (bit_count >= IS_REMOTE_CHUNK_BITS_PER_WORD)
+		return ~0UL;
+	return (1UL << bit_count) - 1UL;
+}
+
+static unsigned long is_remote_chunk_word_range_mask(unsigned int first_bit,
+	unsigned int last_bit)
+{
+	return is_remote_chunk_low_bits(last_bit) &
+		~is_remote_chunk_low_bits(first_bit);
+}
+
+enum is_remote_chunk_validity_operation {
+	IS_REMOTE_CHUNK_VALIDITY_TEST = 0,
+	IS_REMOTE_CHUNK_VALIDITY_CLEAR,
+	IS_REMOTE_CHUNK_VALIDITY_SET,
+};
+
+static bool is_remote_chunk_validity_apply(unsigned long *validity,
+	unsigned long long first_sector, unsigned int sector_count,
+	enum is_remote_chunk_validity_operation operation)
+{
+	unsigned long long last_sector = first_sector + sector_count;
+	unsigned long long first_word =
+		first_sector / IS_REMOTE_CHUNK_BITS_PER_WORD;
+	unsigned long long last_word =
+		(last_sector - 1ULL) / IS_REMOTE_CHUNK_BITS_PER_WORD;
+	unsigned long long word;
+
+	for (word = first_word; word <= last_word; word++) {
+		unsigned long long word_first =
+			word * IS_REMOTE_CHUNK_BITS_PER_WORD;
+		unsigned int first_bit = first_sector > word_first ?
+			(unsigned int)(first_sector - word_first) : 0;
+		unsigned int last_bit = last_sector <
+				word_first + IS_REMOTE_CHUNK_BITS_PER_WORD ?
+			(unsigned int)(last_sector - word_first) :
+			IS_REMOTE_CHUNK_BITS_PER_WORD;
+		unsigned long mask = is_remote_chunk_word_range_mask(first_bit,
+			last_bit);
+
+		if (operation == IS_REMOTE_CHUNK_VALIDITY_TEST) {
+			if ((validity[word] & mask) != mask)
+				return false;
+		} else if (operation == IS_REMOTE_CHUNK_VALIDITY_SET) {
+			validity[word] |= mask;
+		} else {
+			validity[word] &= ~mask;
+		}
+	}
+	return true;
+}
+
+static void is_remote_chunk_validity_update(unsigned long *validity,
+	unsigned long long first_sector, unsigned int sector_count, bool valid)
+{
+	(void)is_remote_chunk_validity_apply(validity, first_sector, sector_count,
+		valid ? IS_REMOTE_CHUNK_VALIDITY_SET :
+		IS_REMOTE_CHUNK_VALIDITY_CLEAR);
+}
+
+static bool is_remote_chunk_validity_test(unsigned long *validity,
+	unsigned long long first_sector, unsigned int sector_count)
+{
+	return is_remote_chunk_validity_apply(validity, first_sector, sector_count,
+		IS_REMOTE_CHUNK_VALIDITY_TEST);
+}
+
+static int is_remote_chunk_lease_validate_locked(
+	const struct is_remote_chunk_module *module,
+	const struct is_remote_chunk_io_lease *lease,
+	const struct is_remote_chunk_io_lease_internal *internal)
+{
+	if (internal->magic != IS_REMOTE_CHUNK_LEASE_MAGIC ||
+	    !internal->lease_id || !internal->mapping_generation ||
+	    !internal->sector_count ||
+	    internal->storage_identity !=
+		is_remote_chunk_lease_storage_identity(lease))
+		return -EINVAL;
+	if (internal->module_identity != module->identity)
+		return -ESTALE;
+	if (internal->lease_id > module->next_io_lease_id ||
+	    internal->mapping_generation > module->next_mapping_generation ||
+	    internal->logical_chunk >= module->chunk_count ||
+	    internal->sector / IS_REMOTE_CHUNK_SECTORS_PER_CHUNK !=
+		internal->logical_chunk ||
+	    internal->sector_count > IS_REMOTE_CHUNK_SECTORS_PER_CHUNK -
+		(internal->sector % IS_REMOTE_CHUNK_SECTORS_PER_CHUNK) ||
+	    (internal->direction != IS_REMOTE_CHUNK_IO_READ &&
+	     internal->direction != IS_REMOTE_CHUNK_IO_WRITE) ||
+	    (internal->state & ~(IS_REMOTE_CHUNK_LEASE_RESOLVED |
+		IS_REMOTE_CHUNK_LEASE_RELEASED)) ||
+	    ((internal->state & IS_REMOTE_CHUNK_LEASE_RELEASED) &&
+	     !(internal->state & IS_REMOTE_CHUNK_LEASE_RESOLVED)))
+		return -EINVAL;
+	return 0;
+}
+
+static void is_remote_chunk_note_invariant_locked(
+	struct is_remote_chunk_module *module,
+	enum is_remote_chunk_invariant_event event)
+{
+	if (module->invariant_count != IS_REMOTE_CHUNK_ID_MAX)
+		module->invariant_count++;
+	module->latest_invariant = event;
 }
 
 static int is_remote_chunk_claim_validate_locked(
@@ -372,8 +555,17 @@ int is_remote_chunk_module_create(
 		is_remote_chunk_free(module);
 		return -ENOMEM;
 	}
+	module->valid_sectors = is_remote_chunk_validity_allocate(
+		(size_t)config->chunk_count * IS_REMOTE_CHUNK_SECTORS_PER_CHUNK /
+		IS_REMOTE_CHUNK_BITS_PER_WORD);
+	if (!module->valid_sectors) {
+		is_remote_chunk_free(module->chunks);
+		is_remote_chunk_free(module);
+		return -ENOMEM;
+	}
 	status = is_remote_chunk_lock_init(&module->lock);
 	if (status) {
+		is_remote_chunk_validity_free(module->valid_sectors);
 		is_remote_chunk_free(module->chunks);
 		is_remote_chunk_free(module);
 		return status < 0 ? status : -status;
@@ -382,6 +574,7 @@ int is_remote_chunk_module_create(
 	if (!module->identity ||
 	    module->identity == IS_REMOTE_CHUNK_ID_MAX) {
 		is_remote_chunk_lock_destroy(&module->lock);
+		is_remote_chunk_validity_free(module->valid_sectors);
 		is_remote_chunk_free(module->chunks);
 		is_remote_chunk_free(module);
 		return -EOVERFLOW;
@@ -400,12 +593,13 @@ int is_remote_chunk_module_destroy(struct is_remote_chunk_module *module)
 	if (!module)
 		return -EINVAL;
 	is_remote_chunk_lock(&module->lock, &flags);
-	if (module->active_mapping_claims) {
+	if (module->active_mapping_claims || module->active_io_leases) {
 		is_remote_chunk_unlock(&module->lock, &flags);
 		return -EBUSY;
 	}
 	is_remote_chunk_unlock(&module->lock, &flags);
 	is_remote_chunk_lock_destroy(&module->lock);
+	is_remote_chunk_validity_free(module->valid_sectors);
 	is_remote_chunk_free(module->chunks);
 	is_remote_chunk_free(module);
 	return 0;
@@ -577,7 +771,10 @@ static int is_remote_chunk_mapping_grants_validate_locked(
 		unsigned int other;
 
 		if (grant->logical_chunk >= module->chunk_count ||
-		    !grant->remote_address || !grant->remote_key)
+		    !grant->remote_address || !grant->remote_key ||
+		    grant->remote_address > IS_REMOTE_CHUNK_ID_MAX -
+			(IS_REMOTE_CHUNK_SECTORS_PER_CHUNK *
+			 IS_REMOTE_CHUNK_SECTOR_BYTES - 1ULL))
 			return -EINVAL;
 		if (selected[grant->logical_chunk])
 			return -EINVAL;
@@ -657,6 +854,10 @@ int is_remote_chunk_mapping_commit(
 		chunk->remote_address = grant->remote_address;
 		chunk->remote_key = grant->remote_key;
 		chunk->mapping_generation = ++module->next_mapping_generation;
+		is_remote_chunk_validity_update(module->valid_sectors,
+			(unsigned long long)grant->logical_chunk *
+				IS_REMOTE_CHUNK_SECTORS_PER_CHUNK,
+			(unsigned int)IS_REMOTE_CHUNK_SECTORS_PER_CHUNK, false);
 		chunk->mapping_claim_id = 0;
 		chunk->transition_generation = 0;
 		chunk->state = IS_REMOTE_CHUNK_MAPPED;
@@ -703,6 +904,194 @@ out:
 	return status;
 }
 
+int is_remote_chunk_io_lease_acquire(
+	struct is_remote_chunk_module *module,
+	const struct is_remote_chunk_io_request *request,
+	struct is_remote_chunk_io_lease *lease,
+	struct is_remote_chunk_transport_mapping *mapping_out)
+{
+	struct is_remote_chunk_io_lease_internal previous;
+	struct is_remote_chunk_io_lease_internal internal = { 0 };
+	is_remote_chunk_lock_flags_t flags = 0;
+	struct is_remote_chunk *chunk;
+	unsigned long long last_sector;
+	unsigned long long remote_offset;
+	unsigned int sector_count;
+	unsigned int logical_chunk;
+	int status = 0;
+
+	if (!module || !request || !lease || !mapping_out)
+		return -EINVAL;
+	memset(mapping_out, 0, sizeof(*mapping_out));
+	if ((request->direction != IS_REMOTE_CHUNK_IO_READ &&
+	     request->direction != IS_REMOTE_CHUNK_IO_WRITE) ||
+	    !request->bytes || request->bytes % IS_REMOTE_CHUNK_SECTOR_BYTES)
+		return -EINVAL;
+	sector_count = request->bytes / IS_REMOTE_CHUNK_SECTOR_BYTES;
+	if (request->sector > IS_REMOTE_CHUNK_ID_MAX - (sector_count - 1U))
+		return -ERANGE;
+	last_sector = request->sector + sector_count - 1U;
+	logical_chunk = (unsigned int)(request->sector /
+		IS_REMOTE_CHUNK_SECTORS_PER_CHUNK);
+	if (logical_chunk >= module->chunk_count ||
+	    last_sector / IS_REMOTE_CHUNK_SECTORS_PER_CHUNK != logical_chunk)
+		return -ERANGE;
+
+	is_remote_chunk_lock(&module->lock, &flags);
+	is_remote_chunk_lease_decode(lease, &previous);
+	if (previous.magic && previous.magic != IS_REMOTE_CHUNK_LEASE_MAGIC) {
+		status = -EINVAL;
+		goto out;
+	}
+	if (previous.magic == IS_REMOTE_CHUNK_LEASE_MAGIC &&
+	    previous.storage_identity !=
+		is_remote_chunk_lease_storage_identity(lease)) {
+		status = -EINVAL;
+		goto out;
+	}
+	if (previous.magic == IS_REMOTE_CHUNK_LEASE_MAGIC) {
+		status = previous.state & IS_REMOTE_CHUNK_LEASE_RELEASED ?
+			-EALREADY : -EBUSY;
+		goto out;
+	}
+	chunk = &module->chunks[logical_chunk];
+	if (chunk->state != IS_REMOTE_CHUNK_MAPPED) {
+		status = -ENXIO;
+		goto out;
+	}
+	if (request->direction == IS_REMOTE_CHUNK_IO_READ &&
+	    !is_remote_chunk_validity_test(module->valid_sectors,
+		request->sector, sector_count)) {
+		status = -ENODATA;
+		goto out;
+	}
+	if (module->next_io_lease_id == IS_REMOTE_CHUNK_ID_MAX ||
+	    module->active_io_leases == ~0U ||
+	    chunk->active_io_leases == ~0U) {
+		status = -EOVERFLOW;
+		goto out;
+	}
+
+	internal.magic = IS_REMOTE_CHUNK_LEASE_MAGIC;
+	internal.module_identity = module->identity;
+	internal.storage_identity =
+		is_remote_chunk_lease_storage_identity(lease);
+	internal.lease_id = ++module->next_io_lease_id;
+	internal.mapping_generation = chunk->mapping_generation;
+	internal.sector = request->sector;
+	internal.sector_count = sector_count;
+	internal.logical_chunk = logical_chunk;
+	internal.direction = request->direction;
+	if (request->direction == IS_REMOTE_CHUNK_IO_WRITE)
+		is_remote_chunk_validity_update(module->valid_sectors,
+			request->sector, sector_count, false);
+	chunk->active_io_leases++;
+	module->active_io_leases++;
+	remote_offset = (request->sector %
+		IS_REMOTE_CHUNK_SECTORS_PER_CHUNK) *
+		IS_REMOTE_CHUNK_SECTOR_BYTES;
+	mapping_out->provider = chunk->provider;
+	mapping_out->remote_address = chunk->remote_address + remote_offset;
+	mapping_out->remote_key = chunk->remote_key;
+	mapping_out->provider_chunk = chunk->provider_chunk;
+	mapping_out->logical_chunk = logical_chunk;
+	is_remote_chunk_lease_encode(lease, &internal);
+out:
+	is_remote_chunk_unlock(&module->lock, &flags);
+	return status;
+}
+
+int is_remote_chunk_io_lease_resolve(
+	struct is_remote_chunk_module *module,
+	struct is_remote_chunk_io_lease *lease,
+	enum is_remote_chunk_io_outcome outcome,
+	enum is_remote_chunk_io_resolve_result *result_out)
+{
+	struct is_remote_chunk_io_lease_internal internal;
+	is_remote_chunk_lock_flags_t flags = 0;
+	struct is_remote_chunk *chunk;
+	bool current;
+	int status;
+
+	if (!module || !lease || !result_out ||
+	    (outcome != IS_REMOTE_CHUNK_IO_SUCCESS &&
+	     outcome != IS_REMOTE_CHUNK_IO_FAILURE &&
+	     outcome != IS_REMOTE_CHUNK_IO_CANCELLED &&
+	     outcome != IS_REMOTE_CHUNK_IO_SUBMISSION_FAILURE))
+		return -EINVAL;
+	*result_out = IS_REMOTE_CHUNK_IO_RESOLVE_NONE;
+	is_remote_chunk_lock(&module->lock, &flags);
+	is_remote_chunk_lease_decode(lease, &internal);
+	status = is_remote_chunk_lease_validate_locked(module, lease, &internal);
+	if (status)
+		goto out;
+	if (internal.state & IS_REMOTE_CHUNK_LEASE_RESOLVED) {
+		is_remote_chunk_note_invariant_locked(module,
+			IS_REMOTE_CHUNK_INVARIANT_LEASE_DUPLICATE_RESOLVE);
+		status = -EALREADY;
+		goto out;
+	}
+
+	internal.state |= IS_REMOTE_CHUNK_LEASE_RESOLVED;
+	chunk = &module->chunks[internal.logical_chunk];
+	current = chunk->mapping_generation == internal.mapping_generation;
+	if (current && internal.direction == IS_REMOTE_CHUNK_IO_WRITE)
+		is_remote_chunk_validity_update(module->valid_sectors,
+			internal.sector, internal.sector_count,
+			outcome == IS_REMOTE_CHUNK_IO_SUCCESS);
+	*result_out = current ? IS_REMOTE_CHUNK_IO_RESOLVE_CURRENT :
+		IS_REMOTE_CHUNK_IO_RESOLVE_STALE;
+	is_remote_chunk_lease_encode(lease, &internal);
+	status = 0;
+out:
+	is_remote_chunk_unlock(&module->lock, &flags);
+	return status;
+}
+
+int is_remote_chunk_io_lease_release(
+	struct is_remote_chunk_module *module,
+	struct is_remote_chunk_io_lease *lease)
+{
+	struct is_remote_chunk_io_lease_internal internal;
+	is_remote_chunk_lock_flags_t flags = 0;
+	struct is_remote_chunk *chunk;
+	int status;
+
+	if (!module || !lease)
+		return -EINVAL;
+	is_remote_chunk_lock(&module->lock, &flags);
+	is_remote_chunk_lease_decode(lease, &internal);
+	status = is_remote_chunk_lease_validate_locked(module, lease, &internal);
+	if (status)
+		goto out;
+	if (internal.state & IS_REMOTE_CHUNK_LEASE_RELEASED) {
+		is_remote_chunk_note_invariant_locked(module,
+			IS_REMOTE_CHUNK_INVARIANT_LEASE_DUPLICATE_RELEASE);
+		status = -EALREADY;
+		goto out;
+	}
+	if (!(internal.state & IS_REMOTE_CHUNK_LEASE_RESOLVED)) {
+		is_remote_chunk_note_invariant_locked(module,
+			IS_REMOTE_CHUNK_INVARIANT_LEASE_RELEASE_BEFORE_RESOLVE);
+		status = -EPERM;
+		goto out;
+	}
+
+	chunk = &module->chunks[internal.logical_chunk];
+	if (!chunk->active_io_leases || !module->active_io_leases) {
+		status = -EINVAL;
+		goto out;
+	}
+	chunk->active_io_leases--;
+	module->active_io_leases--;
+	internal.state |= IS_REMOTE_CHUNK_LEASE_RELEASED;
+	is_remote_chunk_lease_encode(lease, &internal);
+	status = 0;
+out:
+	is_remote_chunk_unlock(&module->lock, &flags);
+	return status;
+}
+
 static unsigned int is_remote_chunk_snapshot_provider_index(
 	struct is_remote_chunk_snapshot *snapshot,
 	struct is_remote_chunk_provider_handle provider)
@@ -726,6 +1115,7 @@ int is_remote_chunk_snapshot_take(
 	is_remote_chunk_lock_flags_t flags = 0;
 	unsigned int derived_assigned = 0;
 	unsigned int derived_usable = 0;
+	unsigned int derived_active_io_leases = 0;
 	unsigned int index;
 
 	if (!module || !snapshot_out)
@@ -749,10 +1139,14 @@ int is_remote_chunk_snapshot_take(
 	snapshot->assigned_chunks = module->assigned_chunks;
 	snapshot->usable_chunks = module->usable_chunks;
 	snapshot->active_mapping_claims = module->active_mapping_claims;
+	snapshot->active_io_leases = module->active_io_leases;
+	snapshot->invariant_count = module->invariant_count;
+	snapshot->latest_invariant = module->latest_invariant;
 	snapshot->hot_policy = module->hot_policy;
 	for (index = 0; index < module->chunk_count; index++) {
 		const struct is_remote_chunk *chunk = &module->chunks[index];
 
+		derived_active_io_leases += chunk->active_io_leases;
 		if (chunk->activity >= module->hot_policy.threshold) {
 			snapshot->hot_ranges++;
 			if (chunk->state == IS_REMOTE_CHUNK_UNMAPPED)
@@ -777,7 +1171,8 @@ int is_remote_chunk_snapshot_take(
 		}
 	}
 	if (derived_assigned != module->assigned_chunks ||
-	    derived_usable != module->usable_chunks) {
+	    derived_usable != module->usable_chunks ||
+	    derived_active_io_leases != module->active_io_leases) {
 		is_remote_chunk_unlock(&module->lock, &flags);
 		is_remote_chunk_snapshot_release(snapshot);
 		return -EINVAL;

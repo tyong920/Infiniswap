@@ -10,8 +10,11 @@
 #endif
 
 #define IS_REMOTE_CHUNK_MAPPING_CLAIM_BYTES 64U
+#define IS_REMOTE_CHUNK_IO_LEASE_BYTES 64U
 #define IS_REMOTE_CHUNK_MAX_CHUNKS 128U
 #define IS_REMOTE_CHUNK_HOT_WEIGHT_MAX 1000000U
+#define IS_REMOTE_CHUNK_SECTOR_BYTES 512U
+#define IS_REMOTE_CHUNK_SECTORS_PER_CHUNK (1ULL << 21)
 
 struct is_remote_chunk_module;
 
@@ -23,6 +26,31 @@ enum is_remote_chunk_mode {
 enum is_remote_chunk_activity_kind {
 	IS_REMOTE_CHUNK_ACTIVITY_READ = 1,
 	IS_REMOTE_CHUNK_ACTIVITY_WRITE,
+};
+
+enum is_remote_chunk_io_direction {
+	IS_REMOTE_CHUNK_IO_READ = 1,
+	IS_REMOTE_CHUNK_IO_WRITE,
+};
+
+enum is_remote_chunk_io_outcome {
+	IS_REMOTE_CHUNK_IO_SUCCESS = 1,
+	IS_REMOTE_CHUNK_IO_FAILURE,
+	IS_REMOTE_CHUNK_IO_CANCELLED,
+	IS_REMOTE_CHUNK_IO_SUBMISSION_FAILURE,
+};
+
+enum is_remote_chunk_io_resolve_result {
+	IS_REMOTE_CHUNK_IO_RESOLVE_NONE = 0,
+	IS_REMOTE_CHUNK_IO_RESOLVE_CURRENT,
+	IS_REMOTE_CHUNK_IO_RESOLVE_STALE,
+};
+
+enum is_remote_chunk_invariant_event {
+	IS_REMOTE_CHUNK_INVARIANT_NONE = 0,
+	IS_REMOTE_CHUNK_INVARIANT_LEASE_RELEASE_BEFORE_RESOLVE,
+	IS_REMOTE_CHUNK_INVARIANT_LEASE_DUPLICATE_RESOLVE,
+	IS_REMOTE_CHUNK_INVARIANT_LEASE_DUPLICATE_RELEASE,
 };
 
 struct is_remote_chunk_hot_policy {
@@ -53,6 +81,35 @@ struct is_remote_chunk_mapping_claim {
 
 #define IS_REMOTE_CHUNK_MAPPING_CLAIM_INIT { .opaque = { .bytes = { 0 } } }
 
+/*
+ * Lease storage is single-use and address-bound. It must not be copied, moved,
+ * reset, or reused after acquisition.
+ */
+struct is_remote_chunk_io_lease {
+	union {
+		void *pointer_alignment;
+		unsigned long long integer_alignment;
+		unsigned char bytes[IS_REMOTE_CHUNK_IO_LEASE_BYTES];
+	} opaque;
+};
+
+#define IS_REMOTE_CHUNK_IO_LEASE_INIT { .opaque = { .bytes = { 0 } } }
+
+struct is_remote_chunk_io_request {
+	enum is_remote_chunk_io_direction direction;
+	unsigned long long sector;
+	unsigned int bytes;
+};
+
+/* Immutable transport mapping captured for the accepted lease lifetime. */
+struct is_remote_chunk_transport_mapping {
+	struct is_remote_chunk_provider_handle provider;
+	unsigned long long remote_address;
+	unsigned int remote_key;
+	unsigned int provider_chunk;
+	unsigned int logical_chunk;
+};
+
 struct is_remote_chunk_mapping_grant {
 	unsigned int logical_chunk;
 	unsigned int provider_chunk;
@@ -82,6 +139,9 @@ struct is_remote_chunk_snapshot {
 	unsigned int active_mapping_claims;
 	unsigned int hot_ranges;
 	unsigned int mapping_candidates;
+	unsigned int active_io_leases;
+	unsigned long long invariant_count;
+	enum is_remote_chunk_invariant_event latest_invariant;
 	struct is_remote_chunk_hot_policy hot_policy;
 	unsigned int provider_count;
 	struct is_remote_chunk_provider_snapshot *providers;
@@ -133,6 +193,27 @@ int is_remote_chunk_mapping_commit(
 int is_remote_chunk_mapping_abort(
 	struct is_remote_chunk_module *module,
 	const struct is_remote_chunk_mapping_claim *claim);
+
+/*
+ * Lease operations do not sleep or allocate. Acquire atomically checks one
+ * Remote Chunk and its sector validity. Invalid reads return -ENODATA;
+ * unusable mappings return -ENXIO. Write validity is cleared before success.
+ */
+int is_remote_chunk_io_lease_acquire(
+	struct is_remote_chunk_module *module,
+	const struct is_remote_chunk_io_request *request,
+	struct is_remote_chunk_io_lease *lease,
+	struct is_remote_chunk_transport_mapping *mapping_out);
+/* A stale result consumes resolve normally and is not an invariant event. */
+int is_remote_chunk_io_lease_resolve(
+	struct is_remote_chunk_module *module,
+	struct is_remote_chunk_io_lease *lease,
+	enum is_remote_chunk_io_outcome outcome,
+	enum is_remote_chunk_io_resolve_result *result_out);
+/* Release before resolve returns -EPERM without consuming the release right. */
+int is_remote_chunk_io_lease_release(
+	struct is_remote_chunk_module *module,
+	struct is_remote_chunk_io_lease *lease);
 
 int is_remote_chunk_snapshot_take(
 	struct is_remote_chunk_module *module,
