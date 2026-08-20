@@ -724,6 +724,8 @@ int is_remote_chunk_snapshot_take(
 {
 	struct is_remote_chunk_snapshot *snapshot;
 	is_remote_chunk_lock_flags_t flags = 0;
+	unsigned int derived_assigned = 0;
+	unsigned int derived_usable = 0;
 	unsigned int index;
 
 	if (!module || !snapshot_out)
@@ -770,10 +772,12 @@ int is_remote_chunk_snapshot_take(
 			placement->usable = true;
 			snapshot->providers[provider_index].assigned_chunks++;
 			snapshot->providers[provider_index].usable_chunks++;
+			derived_assigned++;
+			derived_usable++;
 		}
 	}
-	if (snapshot->assigned_chunks != module->assigned_chunks ||
-	    snapshot->usable_chunks != module->usable_chunks) {
+	if (derived_assigned != module->assigned_chunks ||
+	    derived_usable != module->usable_chunks) {
 		is_remote_chunk_unlock(&module->lock, &flags);
 		is_remote_chunk_snapshot_release(snapshot);
 		return -EINVAL;

@@ -29,13 +29,26 @@ static const struct is_remote_chunk_config remote_only_config = {
 	},
 };
 
+struct test_gate {
+	pthread_mutex_t lock;
+	pthread_cond_t changed;
+	bool open;
+};
+
 struct concurrent_commit {
 	struct is_remote_chunk_module *module;
 	const struct is_remote_chunk_mapping_claim *claim;
 	struct is_remote_chunk_provider_handle provider;
 	const struct is_remote_chunk_mapping_grant *grants;
 	unsigned int grant_count;
+	struct test_gate *start;
 	int status;
+};
+
+struct concurrent_snapshot {
+	struct is_remote_chunk_module *module;
+	struct test_gate *start;
+	int failed;
 };
 
 static struct is_remote_chunk_mapping_grant mapping_grant(
@@ -353,12 +366,80 @@ static int test_hot_range_policy_and_activity_drive_mapping(void)
 	return failed;
 }
 
+static int test_gate_init(struct test_gate *gate)
+{
+	int status = pthread_mutex_init(&gate->lock, NULL);
+
+	gate->open = false;
+	if (status)
+		return status;
+	status = pthread_cond_init(&gate->changed, NULL);
+	if (status)
+		(void)pthread_mutex_destroy(&gate->lock);
+	return status;
+}
+
+static void test_gate_wait(struct test_gate *gate)
+{
+	pthread_mutex_lock(&gate->lock);
+	while (!gate->open)
+		pthread_cond_wait(&gate->changed, &gate->lock);
+	pthread_mutex_unlock(&gate->lock);
+}
+
+static void test_gate_open(struct test_gate *gate)
+{
+	pthread_mutex_lock(&gate->lock);
+	gate->open = true;
+	pthread_cond_broadcast(&gate->changed);
+	pthread_mutex_unlock(&gate->lock);
+}
+
+static void test_gate_destroy(struct test_gate *gate)
+{
+	(void)pthread_cond_destroy(&gate->changed);
+	(void)pthread_mutex_destroy(&gate->lock);
+}
+
 static void *run_mapping_commit(void *context)
 {
 	struct concurrent_commit *commit = context;
 
+	test_gate_wait(commit->start);
 	commit->status = is_remote_chunk_mapping_commit(commit->module,
 		commit->claim, commit->provider, commit->grants, commit->grant_count);
+	return NULL;
+}
+
+static void *run_snapshots_during_commit(void *context)
+{
+	struct concurrent_snapshot *event = context;
+	unsigned int index;
+
+	test_gate_wait(event->start);
+	for (index = 0; index < 100; index++) {
+		struct is_remote_chunk_snapshot *snapshot = NULL;
+		bool before;
+		bool after;
+
+		if (is_remote_chunk_snapshot_take(event->module, &snapshot)) {
+			event->failed = 1;
+			break;
+		}
+		before = snapshot->assigned_chunks == 0 &&
+			snapshot->usable_chunks == 0 &&
+			snapshot->mapping_chunks == 2 &&
+			snapshot->active_mapping_claims == 1 &&
+			snapshot->placement_count == 0;
+		after = snapshot->assigned_chunks == 2 &&
+			snapshot->usable_chunks == 2 &&
+			snapshot->mapping_chunks == 0 &&
+			snapshot->active_mapping_claims == 0 &&
+			snapshot->placement_count == 2;
+		if (!before && !after)
+			event->failed = 1;
+		is_remote_chunk_snapshot_release(snapshot);
+	}
 	return NULL;
 }
 
@@ -374,7 +455,10 @@ static int test_concurrent_duplicate_commit_has_one_winner(void)
 		{ 1, 71, 0x201000, 171 },
 	};
 	struct concurrent_commit commits[2];
+	struct concurrent_snapshot snapshot_event;
+	struct test_gate start;
 	pthread_t threads[2];
+	pthread_t snapshot_thread;
 	unsigned int index;
 	unsigned int committed = 0;
 	unsigned int stale = 0;
@@ -383,7 +467,13 @@ static int test_concurrent_duplicate_commit_has_one_winner(void)
 	if (is_remote_chunk_module_create(&remote_only_config, &module) ||
 	    is_remote_chunk_provider_handle_create(module, &provider) ||
 	    is_remote_chunk_mapping_begin_explicit(module, provider,
-		logical_chunks, 2, &claim))
+		logical_chunks, 2, &claim) || test_gate_init(&start))
+		return 1;
+	snapshot_event.module = module;
+	snapshot_event.start = &start;
+	snapshot_event.failed = 0;
+	if (pthread_create(&snapshot_thread, NULL, run_snapshots_during_commit,
+		&snapshot_event))
 		return 1;
 	for (index = 0; index < 2; index++) {
 		commits[index].module = module;
@@ -391,17 +481,21 @@ static int test_concurrent_duplicate_commit_has_one_winner(void)
 		commits[index].provider = provider;
 		commits[index].grants = grants;
 		commits[index].grant_count = 2;
+		commits[index].start = &start;
 		commits[index].status = -999;
 		if (pthread_create(&threads[index], NULL, run_mapping_commit,
 			&commits[index]))
 			return 1;
 	}
+	test_gate_open(&start);
 	for (index = 0; index < 2; index++) {
 		(void)pthread_join(threads[index], NULL);
 		committed += commits[index].status == 0;
 		stale += commits[index].status == -ESTALE;
 	}
-	if (committed != 1 || stale != 1)
+	(void)pthread_join(snapshot_thread, NULL);
+	test_gate_destroy(&start);
+	if (committed != 1 || stale != 1 || snapshot_event.failed)
 		failed = 1;
 	failed |= expect_snapshot(module, 2, 2, 0, 0, 2,
 		"concurrent mapping commit");

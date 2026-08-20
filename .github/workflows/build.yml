@@ -8,6 +8,32 @@ permissions:
   contents: read
 
 jobs:
+  remote-chunk-host-test:
+    name: Remote Chunk host / ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Normal
+            cflags: ""
+            suffix: ""
+          - name: ThreadSanitizer
+            cflags: "-fsanitize=thread -g"
+            suffix: "-tsan"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test the public interface
+        run: |
+          cc -std=c11 -Wall -Wextra -Wpedantic -Werror -pthread \
+            ${{ matrix.cflags }} \
+            infiniswap_bd/is_remote_chunk.c \
+            infiniswap_bd/tests/remote-chunk-test.c \
+            -o "${{ runner.temp }}/remote-chunk-test${{ matrix.suffix }}"
+          "${{ runner.temp }}/remote-chunk-test${{ matrix.suffix }}"
+
   ubuntu-build:
     name: Ubuntu ${{ matrix.ubuntu }} / Linux ${{ matrix.kernel }}
     runs-on: ubuntu-${{ matrix.ubuntu }}
@@ -159,20 +185,6 @@ jobs:
           bash -n tests/vm/run tests/vm/compare tests/vm/guest.sh
           tests/vm/run --help >/dev/null
           tests/vm/compare --help >/dev/null
-
-      - name: Test Memory Consumer Remote Chunk mapping seam
-        run: |
-          cc -std=c11 -Wall -Wextra -Wpedantic -Werror -pthread \
-            infiniswap_bd/is_remote_chunk.c \
-            infiniswap_bd/tests/remote-chunk-test.c \
-            -o "${{ runner.temp }}/remote-chunk-test"
-          "${{ runner.temp }}/remote-chunk-test"
-          cc -std=c11 -Wall -Wextra -Wpedantic -Werror -pthread \
-            -fsanitize=thread -g \
-            infiniswap_bd/is_remote_chunk.c \
-            infiniswap_bd/tests/remote-chunk-test.c \
-            -o "${{ runner.temp }}/remote-chunk-test-tsan"
-          "${{ runner.temp }}/remote-chunk-test-tsan"
 
       - name: Test Memory Consumer Remote I/O Transaction ownership
         run: |
