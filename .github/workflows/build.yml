@@ -160,6 +160,20 @@ jobs:
           tests/vm/run --help >/dev/null
           tests/vm/compare --help >/dev/null
 
+      - name: Test Memory Consumer Remote Chunk mapping seam
+        run: |
+          cc -std=c11 -Wall -Wextra -Wpedantic -Werror -pthread \
+            infiniswap_bd/is_remote_chunk.c \
+            infiniswap_bd/tests/remote-chunk-test.c \
+            -o "${{ runner.temp }}/remote-chunk-test"
+          "${{ runner.temp }}/remote-chunk-test"
+          cc -std=c11 -Wall -Wextra -Wpedantic -Werror -pthread \
+            -fsanitize=thread -g \
+            infiniswap_bd/is_remote_chunk.c \
+            infiniswap_bd/tests/remote-chunk-test.c \
+            -o "${{ runner.temp }}/remote-chunk-test-tsan"
+          "${{ runner.temp }}/remote-chunk-test-tsan"
+
       - name: Test Memory Consumer Remote I/O Transaction ownership
         run: |
           cc -std=c11 -Wall -Wextra -Wpedantic -Werror -pthread \
