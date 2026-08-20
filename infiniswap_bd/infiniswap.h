@@ -133,9 +133,8 @@ struct is_device {
 	unsigned int provider_count;
 	unsigned int provider_bind_index;
 	struct is_provider_endpoint provider_endpoints[IS_MAX_PROVIDERS];
-	u64 hot_range_threshold;
-	u32 hot_range_read_weight;
-	u32 hot_range_write_weight;
+	/* Runtime Hot Range policy moves into remote_chunks at activation. */
+	struct is_remote_chunk_hot_policy remote_chunk_hot_policy_config;
 	int swap_priority;
 	int last_error;
 	u64 capacity_bytes;

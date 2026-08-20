@@ -77,9 +77,12 @@ void is_device_init(struct is_device *device, const char *name)
 	device->acknowledgement_policy = IS_ACKNOWLEDGEMENT_POLICY_STRICT;
 	device->provider_failure_deadline_ms =
 		IS_PROTOCOL_FAILURE_DEADLINE_DEFAULT_MS;
-	device->hot_range_threshold = IS_HOT_RANGE_THRESHOLD_DEFAULT;
-	device->hot_range_read_weight = IS_HOT_RANGE_READ_WEIGHT_DEFAULT;
-	device->hot_range_write_weight = IS_HOT_RANGE_WRITE_WEIGHT_DEFAULT;
+	device->remote_chunk_hot_policy_config.threshold =
+		IS_HOT_RANGE_THRESHOLD_DEFAULT;
+	device->remote_chunk_hot_policy_config.read_weight =
+		IS_HOT_RANGE_READ_WEIGHT_DEFAULT;
+	device->remote_chunk_hot_policy_config.write_weight =
+		IS_HOT_RANGE_WRITE_WEIGHT_DEFAULT;
 	device->placement_sample_size = IS_PLACEMENT_SAMPLE_DEFAULT;
 	device->placement_seed = 0;
 	device->provider_count = 0;
@@ -227,11 +230,31 @@ int is_device_set_failure_deadline(struct is_device *device, const char *buf,
 	return ret;
 }
 
+static int is_device_hot_policy_locked(
+	struct is_device *device, struct is_remote_chunk_hot_policy *policy)
+{
+	if (!device->remote_chunks) {
+		*policy = device->remote_chunk_hot_policy_config;
+		return 0;
+	}
+	return is_remote_chunk_hot_policy_snapshot(device->remote_chunks, policy);
+}
+
+static int is_device_set_hot_policy_locked(
+	struct is_device *device,
+	const struct is_remote_chunk_hot_policy *policy)
+{
+	if (device->remote_chunks)
+		return is_rdma_hot_policy_set(device, policy);
+	device->remote_chunk_hot_policy_config = *policy;
+	return 0;
+}
+
 int is_device_set_hot_range_threshold(struct is_device *device, const char *buf,
 				      size_t count)
 {
+	struct is_remote_chunk_hot_policy policy;
 	u64 threshold;
-	u64 previous;
 	int ret;
 
 	(void)count;
@@ -241,42 +264,45 @@ int is_device_set_hot_range_threshold(struct is_device *device, const char *buf,
 	if (!threshold || threshold > S64_MAX)
 		return -ERANGE;
 	mutex_lock(&device->lifecycle_lock);
-	previous = READ_ONCE(device->hot_range_threshold);
-	WRITE_ONCE(device->hot_range_threshold, threshold);
-	ret = is_rdma_mapping_parameters_changed(device);
-	if (ret)
-		WRITE_ONCE(device->hot_range_threshold, previous);
+	ret = is_device_hot_policy_locked(device, &policy);
+	if (!ret) {
+		policy.threshold = threshold;
+		ret = is_device_set_hot_policy_locked(device, &policy);
+	}
 	mutex_unlock(&device->lifecycle_lock);
 	return ret;
 }
 
-static int is_device_set_hot_range_weight(u32 *target, const char *buf)
+static int is_parse_hot_range_weight(const char *buf, u32 *weight_out)
 {
 	u32 weight;
 	int ret = kstrtou32(buf, 0, &weight);
 
 	if (ret)
 		return ret;
-	if (!weight || weight > 1000000U)
+	if (!weight || weight > IS_REMOTE_CHUNK_HOT_WEIGHT_MAX)
 		return -ERANGE;
-	WRITE_ONCE(*target, weight);
+	*weight_out = weight;
 	return 0;
 }
 
 int is_device_set_hot_range_read_weight(struct is_device *device,
 					const char *buf, size_t count)
 {
-	u32 previous;
+	struct is_remote_chunk_hot_policy policy;
+	u32 weight;
 	int ret;
 
 	(void)count;
-	mutex_lock(&device->lifecycle_lock);
-	previous = READ_ONCE(device->hot_range_read_weight);
-	ret = is_device_set_hot_range_weight(&device->hot_range_read_weight, buf);
-	if (!ret)
-		ret = is_rdma_mapping_parameters_changed(device);
+	ret = is_parse_hot_range_weight(buf, &weight);
 	if (ret)
-		WRITE_ONCE(device->hot_range_read_weight, previous);
+		return ret;
+	mutex_lock(&device->lifecycle_lock);
+	ret = is_device_hot_policy_locked(device, &policy);
+	if (!ret) {
+		policy.read_weight = weight;
+		ret = is_device_set_hot_policy_locked(device, &policy);
+	}
 	mutex_unlock(&device->lifecycle_lock);
 	return ret;
 }
@@ -284,17 +310,20 @@ int is_device_set_hot_range_read_weight(struct is_device *device,
 int is_device_set_hot_range_write_weight(struct is_device *device,
 					 const char *buf, size_t count)
 {
-	u32 previous;
+	struct is_remote_chunk_hot_policy policy;
+	u32 weight;
 	int ret;
 
 	(void)count;
-	mutex_lock(&device->lifecycle_lock);
-	previous = READ_ONCE(device->hot_range_write_weight);
-	ret = is_device_set_hot_range_weight(&device->hot_range_write_weight, buf);
-	if (!ret)
-		ret = is_rdma_mapping_parameters_changed(device);
+	ret = is_parse_hot_range_weight(buf, &weight);
 	if (ret)
-		WRITE_ONCE(device->hot_range_write_weight, previous);
+		return ret;
+	mutex_lock(&device->lifecycle_lock);
+	ret = is_device_hot_policy_locked(device, &policy);
+	if (!ret) {
+		policy.write_weight = weight;
+		ret = is_device_set_hot_policy_locked(device, &policy);
+	}
 	mutex_unlock(&device->lifecycle_lock);
 	return ret;
 }
@@ -1846,6 +1875,12 @@ static int is_release_resources(struct is_device *device)
 {
 	int ret;
 
+	if (device->remote_chunks && device->state == IS_DEVICE_DRAINED) {
+		ret = is_remote_chunk_hot_policy_snapshot(device->remote_chunks,
+			&device->remote_chunk_hot_policy_config);
+		if (ret)
+			return ret;
+	}
 	if (device->transaction_engine.initialized) {
 		ret = is_remote_io_transaction_engine_destroy(
 			&device->transaction_engine);
@@ -1988,11 +2023,7 @@ int is_device_activate(struct is_device *device)
 				IS_REMOTE_CHUNK_MODE_BACKED,
 			.chunk_count = remote_configured ?
 				(unsigned int)remote_chunk_count : 1U,
-			.hot_policy = {
-				.threshold = device->hot_range_threshold,
-				.read_weight = device->hot_range_read_weight,
-				.write_weight = device->hot_range_write_weight,
-			},
+			.hot_policy = device->remote_chunk_hot_policy_config,
 		};
 
 		ret = is_remote_chunk_module_create(&config,
@@ -2081,12 +2112,21 @@ int is_device_activate(struct is_device *device)
 		mutex_lock(&device->remote_state_lock);
 		remote_state_locked = true;
 	}
-	if (remote_only &&
-	    (atomic_read(&device->remote_lost) ||
-	     atomic_read(&device->connection_state) != IS_CONNECTION_CONNECTED ||
-	     is_rdma_remote_capacity_bytes(device) != device->capacity_bytes)) {
-		ret = -ENOTCONN;
-		goto release_resources;
+	if (remote_only) {
+		struct is_remote_chunk_snapshot *snapshot = NULL;
+		bool capacity_ready = false;
+
+		if (!is_remote_chunk_snapshot_take(device->remote_chunks, &snapshot))
+			capacity_ready = (u64)snapshot->usable_chunks *
+				IS_REMOTE_CHUNK_BYTES == device->capacity_bytes;
+		is_remote_chunk_snapshot_release(snapshot);
+		if (atomic_read(&device->remote_lost) ||
+		    atomic_read(&device->connection_state) !=
+			    IS_CONNECTION_CONNECTED ||
+		    !capacity_ready) {
+			ret = -ENOTCONN;
+			goto release_resources;
+		}
 	}
 
 	ret = is_remote_io_transaction_engine_init(&device->transaction_engine,

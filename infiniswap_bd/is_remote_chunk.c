@@ -808,6 +808,20 @@ int is_remote_chunk_provider_handle_create(
 	return 0;
 }
 
+int is_remote_chunk_hot_policy_snapshot(
+	struct is_remote_chunk_module *module,
+	struct is_remote_chunk_hot_policy *policy_out)
+{
+	is_remote_chunk_lock_flags_t flags = 0;
+
+	if (!module || !policy_out)
+		return -EINVAL;
+	is_remote_chunk_lock(&module->lock, &flags);
+	*policy_out = module->hot_policy;
+	is_remote_chunk_unlock(&module->lock, &flags);
+	return 0;
+}
+
 int is_remote_chunk_hot_policy_set(
 	struct is_remote_chunk_module *module,
 	const struct is_remote_chunk_hot_policy *policy,

@@ -407,6 +407,7 @@ static int test_hot_range_policy_and_activity_drive_mapping(void)
 		.read_weight = 3,
 		.write_weight = 7,
 	};
+	struct is_remote_chunk_hot_policy policy_snapshot = { 0 };
 	unsigned int logical_chunk = 99;
 	bool mapping_needed = true;
 	int failed = 0;
@@ -415,7 +416,11 @@ static int test_hot_range_policy_and_activity_drive_mapping(void)
 	    is_remote_chunk_provider_handle_create(module, &provider))
 		return 1;
 	if (is_remote_chunk_hot_policy_set(module, &policy, &mapping_needed) ||
-	    mapping_needed)
+	    mapping_needed ||
+	    is_remote_chunk_hot_policy_snapshot(module, &policy_snapshot) ||
+	    policy_snapshot.threshold != policy.threshold ||
+	    policy_snapshot.read_weight != policy.read_weight ||
+	    policy_snapshot.write_weight != policy.write_weight)
 		failed = 1;
 	if (is_remote_chunk_note_activity(module, 2, 1,
 		IS_REMOTE_CHUNK_ACTIVITY_READ, &mapping_needed) || mapping_needed)

@@ -66,9 +66,8 @@ struct is_rdma_fabric {
 	int reservation_error;
 	bool stopping;
 	u64 placement_rng_state;
-	unsigned int reservation_next_logical;
-	unsigned int planned_count;
 	unsigned int next_resolve_index;
+	unsigned int planned_count;
 	DECLARE_BITMAP(failed_sessions, IS_MAX_PROVIDERS);
 	struct delayed_work start_next_session_work;
 };
@@ -94,8 +93,6 @@ struct is_rdma_operation {
 	struct is_remote_chunk_io_lease lease;
 	struct is_remote_chunk_transport_mapping mapping;
 	unsigned int mapped_segments;
-	int lease_resolve_status;
-	bool lease_resolved;
 	bool listed;
 };
 
@@ -115,7 +112,7 @@ struct is_rdma_session {
 	spinlock_t operation_lock;
 	struct list_head operations;
 	wait_queue_head_t send_wait;
-	wait_queue_head_t chunk_wait;
+	wait_queue_head_t operation_wait;
 	wait_queue_head_t control_wait;
 	atomic_t send_busy;
 	atomic_t rdma_reads_inflight;
@@ -173,8 +170,6 @@ struct is_rdma_session {
 	struct is_remote_chunk_provider_handle provider_handle;
 	struct is_remote_chunk_mapping_claim mapping_claim;
 	struct is_remote_chunk_eviction_claim eviction_claim;
-	u32 pending_logical_chunk;
-	u32 pending_chunk_count;
 	u32 release_provider_ids[IS_PROTOCOL_MAX_CHUNKS_PER_FRAME];
 	u16 release_count;
 
@@ -182,7 +177,7 @@ struct is_rdma_session {
 	bool healthy;
 	bool compatible;
 	enum is_placement_exclude_reason exclude_reason;
-	u32 available_chunks;
+	u32 advertised_capacity_chunks;
 	char provider_id[IS_PROVIDER_NAME_SIZE];
 	char provider_address[IS_PROVIDER_ADDRESS_SIZE];
 	char rdma_device[IS_RDMA_DEVICE_SIZE];
@@ -266,23 +261,6 @@ static unsigned int is_snapshot_provider_assigned_chunks(
 	return 0;
 }
 
-unsigned int is_rdma_mapped_chunk_count(struct is_device *device)
-{
-	struct is_remote_chunk_snapshot *snapshot = NULL;
-	unsigned int mapped = 0;
-
-	if (device->remote_chunks &&
-	    !is_remote_chunk_snapshot_take(device->remote_chunks, &snapshot))
-		mapped = snapshot->usable_chunks;
-	is_remote_chunk_snapshot_release(snapshot);
-	return mapped;
-}
-
-u64 is_rdma_remote_capacity_bytes(struct is_device *device)
-{
-	return (u64)is_rdma_mapped_chunk_count(device) * IS_CHUNK_BYTES;
-}
-
 static void *is_session_kzalloc(struct is_rdma_session *session, size_t size,
 				gfp_t flags)
 {
@@ -314,10 +292,31 @@ static is_placement_u32 is_fabric_rand(void *ctx, is_placement_u32 limit)
 	return (is_placement_u32)(value % limit);
 }
 
+static int is_session_refresh_advertised_capacity(
+	struct is_rdma_session *session, unsigned int available_chunks)
+{
+	struct is_remote_chunk_snapshot *snapshot = NULL;
+	unsigned int assigned;
+	int ret;
+
+	ret = is_remote_chunk_snapshot_take(session->device->remote_chunks,
+		&snapshot);
+	if (ret)
+		return ret;
+	assigned = is_snapshot_provider_assigned_chunks(snapshot,
+		session->provider_handle);
+	is_remote_chunk_snapshot_release(snapshot);
+	/* Status reports free chunks; add assignments to retain a capacity ceiling. */
+	WRITE_ONCE(session->advertised_capacity_chunks,
+		(u32)min_t(u64, (u64)available_chunks + assigned, U32_MAX));
+	return 0;
+}
+
 static unsigned int is_session_available_chunks(
 	struct is_rdma_session *session,
 	const struct is_remote_chunk_snapshot *snapshot)
 {
+	unsigned int advertised;
 	unsigned int assigned;
 
 	if (!session->healthy || !session->compatible ||
@@ -325,9 +324,10 @@ static unsigned int is_session_available_chunks(
 		return 0;
 	assigned = is_snapshot_provider_assigned_chunks(snapshot,
 		session->provider_handle);
-	if (session->available_chunks <= assigned)
+	advertised = READ_ONCE(session->advertised_capacity_chunks);
+	if (advertised <= assigned)
 		return 0;
-	return session->available_chunks - assigned;
+	return advertised - assigned;
 }
 
 static void is_session_set_exclude(struct is_rdma_session *session,
@@ -579,7 +579,7 @@ static void is_mark_session_remote_lost(struct is_rdma_session *session,
 	is_device_mark_remote_lost_locked(session->device, error);
 	spin_unlock_irqrestore(&session->operation_lock, flags);
 	mutex_unlock(&session->device->remote_state_lock);
-	wake_up_all(&session->chunk_wait);
+	wake_up_all(&session->operation_wait);
 }
 
 static void is_rdma_fail(struct is_rdma_session *session, int error)
@@ -1088,7 +1088,6 @@ static void is_mark_session_ready(struct is_rdma_session *session)
 			is_mark_session_remote_lost(session,
 				READ_ONCE(session->device->last_error));
 			session->pending_request_id = 0;
-			session->pending_chunk_count = 0;
 			session->control_state = IS_RDMA_CONTROL_FAILED;
 			is_cancel_control_deadline(session);
 			is_session_status_done(session);
@@ -1096,7 +1095,6 @@ static void is_mark_session_ready(struct is_rdma_session *session)
 			return;
 		}
 		session->pending_request_id = 0;
-		session->pending_chunk_count = 0;
 		session->control_state = IS_RDMA_CONTROL_READY;
 		session->ever_connected = true;
 		is_cancel_control_deadline(session);
@@ -1109,7 +1107,6 @@ static void is_mark_session_ready(struct is_rdma_session *session)
 		return;
 	}
 	session->pending_request_id = 0;
-	session->pending_chunk_count = 0;
 	session->control_state = IS_RDMA_CONTROL_READY;
 	session->ever_connected = true;
 	is_cancel_control_deadline(session);
@@ -1178,8 +1175,6 @@ static int is_request_remote_only_reservation(
 	request->payload.chunk_request.logical_start = logical_start;
 	request->payload.chunk_request.pool = IS_PROTOCOL_POOL_COMMITTED;
 	session->pending_request_id = request->header.request_id;
-	session->pending_logical_chunk = logical_start;
-	session->pending_chunk_count = chunk_count;
 	session->control_state = IS_RDMA_CONTROL_WAIT_RESERVATION;
 	ret = is_encode_and_send(session, request);
 	if (!ret) {
@@ -1190,7 +1185,6 @@ static int is_request_remote_only_reservation(
 	(void)is_remote_chunk_mapping_abort(session->device->remote_chunks,
 		&session->mapping_claim);
 	session->pending_request_id = 0;
-	session->pending_chunk_count = 0;
 	session->control_state = IS_RDMA_CONTROL_READY;
 	return ret;
 }
@@ -1209,7 +1203,9 @@ static bool is_status_response_valid(
 static int is_handle_status(struct is_rdma_session *session,
 			    const struct is_protocol_message *status)
 {
+	unsigned int available_chunks;
 	bool healthy;
+	int ret;
 
 	if (!is_status_response_valid(session, status,
 		    session->pending_request_id))
@@ -1223,9 +1219,13 @@ static int is_handle_status(struct is_rdma_session *session,
 			is_mark_session_ready(session);
 			return 0;
 		}
-		session->available_chunks =
+		available_chunks =
 			status->payload.status.available_committed_chunks;
-		if (session->available_chunks == 0) {
+		ret = is_session_refresh_advertised_capacity(session,
+			available_chunks);
+		if (ret)
+			return ret;
+		if (available_chunks == 0) {
 			is_session_set_exclude(session,
 				IS_PLACEMENT_EXCLUDE_ZERO_CAPACITY);
 			is_session_status_done(session);
@@ -1241,26 +1241,27 @@ static int is_handle_status(struct is_rdma_session *session,
 		is_mark_session_ready(session);
 		return 0;
 	}
-		session->available_chunks =
-			status->payload.status.available_opportunistic_chunks;
-		if (session->available_chunks == 0) {
-			is_session_set_exclude(session,
-				IS_PLACEMENT_EXCLUDE_ZERO_CAPACITY);
-			session->pending_request_id = 0;
-			session->pending_chunk_count = 0;
-			session->control_state = IS_RDMA_CONTROL_READY;
-			session->ever_connected = true;
-			is_cancel_control_deadline(session);
-			is_fabric_refresh_connection_state(session->fabric);
-			is_fabric_schedule_next_session(session->fabric);
-			wake_up_all(&session->control_wait);
-			if (session->negotiated_capabilities & IS_PROTOCOL_CAP_STATUS)
-				is_schedule_heartbeat(session);
-			return 0;
-		}
-		is_mark_session_ready(session);
+	available_chunks = status->payload.status.available_opportunistic_chunks;
+	ret = is_session_refresh_advertised_capacity(session, available_chunks);
+	if (ret)
+		return ret;
+	if (available_chunks == 0) {
+		is_session_set_exclude(session,
+			IS_PLACEMENT_EXCLUDE_ZERO_CAPACITY);
+		session->pending_request_id = 0;
+		session->control_state = IS_RDMA_CONTROL_READY;
+		session->ever_connected = true;
+		is_cancel_control_deadline(session);
+		is_fabric_refresh_connection_state(session->fabric);
+		is_fabric_schedule_next_session(session->fabric);
+		wake_up_all(&session->control_wait);
+		if (session->negotiated_capabilities & IS_PROTOCOL_CAP_STATUS)
+			is_schedule_heartbeat(session);
 		return 0;
 	}
+	is_mark_session_ready(session);
+	return 0;
+}
 
 static int is_handle_heartbeat(struct is_rdma_session *session,
 			       const struct is_protocol_message *status)
@@ -1278,6 +1279,9 @@ static int is_handle_backed_heartbeat(
 	struct is_rdma_session *session,
 	const struct is_protocol_message *status)
 {
+	unsigned int available_chunks;
+	int ret;
+
 	if (!session->heartbeat_request_id ||
 	    !is_status_response_valid(session, status,
 		    session->heartbeat_request_id))
@@ -1285,9 +1289,11 @@ static int is_handle_backed_heartbeat(
 	session->heartbeat_request_id = 0;
 	if (!(status->payload.status.flags & IS_PROTOCOL_STATUS_HEALTHY))
 		return -EIO;
-	session->available_chunks =
-		status->payload.status.available_opportunistic_chunks;
-	if (session->available_chunks == 0)
+	available_chunks = status->payload.status.available_opportunistic_chunks;
+	ret = is_session_refresh_advertised_capacity(session, available_chunks);
+	if (ret)
+		return ret;
+	if (available_chunks == 0)
 		is_session_set_exclude(session,
 			IS_PLACEMENT_EXCLUDE_ZERO_CAPACITY);
 	else {
@@ -1305,29 +1311,26 @@ static int is_handle_chunk_grant(struct is_rdma_session *session,
 {
 	struct is_rdma_fabric *fabric = session->fabric;
 	struct is_remote_chunk_mapping_grant *grants;
-	unsigned int expected = session->pending_chunk_count;
+	unsigned int grant_count = grant->payload.chunk_grant.chunk_count;
 	u8 expected_pool = is_remote_only(session) ?
 		IS_PROTOCOL_POOL_COMMITTED : IS_PROTOCOL_POOL_OPPORTUNISTIC;
 	unsigned int index;
-	unsigned int other;
 	bool remote_only = is_remote_only(session);
 	int ret;
 
 	if (!is_authenticated_header_valid(session, grant) ||
 	    !(grant->header.flags & IS_PROTOCOL_FLAG_RESPONSE) ||
 	    grant->header.request_id != session->pending_request_id ||
-	    !expected || grant->payload.chunk_grant.chunk_count != expected)
+	    !grant_count || grant_count > IS_PROTOCOL_MAX_CHUNKS_PER_FRAME)
 		return -EPROTO;
-	grants = kcalloc(expected, sizeof(*grants), GFP_KERNEL);
+	grants = kcalloc(grant_count, sizeof(*grants), GFP_KERNEL);
 	if (!grants)
 		return -ENOMEM;
-	for (index = 0; index < expected; index++) {
+	for (index = 0; index < grant_count; index++) {
 		const struct is_protocol_chunk *wire_chunk =
 			&grant->payload.chunk_grant.chunks[index];
 
-		if (wire_chunk->logical_chunk_id !=
-			    session->pending_logical_chunk + index ||
-		    wire_chunk->logical_chunk_id >=
+		if (wire_chunk->logical_chunk_id >=
 			    is_device_remote_chunk_count(session->device) ||
 		    wire_chunk->provider_chunk_id >=
 			    IS_PROTOCOL_MAX_CHUNKS_PER_FRAME ||
@@ -1336,35 +1339,25 @@ static int is_handle_chunk_grant(struct is_rdma_session *session,
 			ret = -EPROTO;
 			goto out;
 		}
-		for (other = 0; other < index; other++) {
-			if (grant->payload.chunk_grant.chunks[other].provider_chunk_id ==
-			    wire_chunk->provider_chunk_id) {
-				ret = -EPROTO;
-				goto out;
-			}
-		}
 		grants[index].logical_chunk = wire_chunk->logical_chunk_id;
 		grants[index].provider_chunk = wire_chunk->provider_chunk_id;
 		grants[index].remote_address = wire_chunk->remote_address;
 		grants[index].remote_key = wire_chunk->remote_key;
 	}
 	ret = is_remote_chunk_mapping_commit(session->device->remote_chunks,
-		&session->mapping_claim, session->provider_handle, grants, expected);
+		&session->mapping_claim, session->provider_handle, grants,
+		grant_count);
 	if (ret) {
 		ret = -EPROTO;
 		goto out;
 	}
 
 	if (remote_only) {
-		fabric->reservation_next_logical =
-			session->pending_logical_chunk + expected;
 		session->pending_request_id = 0;
-		session->pending_chunk_count = 0;
 		session->control_state = IS_RDMA_CONTROL_READY;
 		queue_work(session->control_wq, &fabric->reservation_work);
 	} else {
 		session->pending_request_id = 0;
-		session->pending_chunk_count = 0;
 		queue_work(session->control_wq, &fabric->mapping_work);
 	}
 	ret = 0;
@@ -1590,6 +1583,7 @@ static void is_fabric_reservation_work(struct work_struct *work)
 		reservation_work);
 	struct is_device *device = fabric->device;
 	struct is_remote_chunk_snapshot *snapshot = NULL;
+	unsigned int next_logical;
 	unsigned int chosen_index;
 	unsigned int total_available = 0;
 	unsigned int index;
@@ -1600,26 +1594,27 @@ static void is_fabric_reservation_work(struct work_struct *work)
 	    READ_ONCE(fabric->stopping))
 		return;
 
-	if (fabric->reservation_next_logical == 0) {
-		ret = is_remote_chunk_snapshot_take(device->remote_chunks, &snapshot);
-		if (ret) {
-			is_fabric_complete_remote_only(fabric, ret);
-			return;
-		}
+	ret = is_remote_chunk_snapshot_take(device->remote_chunks, &snapshot);
+	if (ret) {
+		is_fabric_complete_remote_only(fabric, ret);
+		return;
+	}
+	next_logical = snapshot->assigned_chunks;
+	if (!next_logical) {
 		for (index = 0; index < fabric->session_count; index++)
 			total_available += is_session_available_chunks(
 				fabric->sessions[index], snapshot);
-		is_remote_chunk_snapshot_release(snapshot);
-		if (total_available < is_device_remote_chunk_count(device)) {
-			is_fabric_complete_remote_only(fabric, -ENOSPC);
-			for (index = 0; index < fabric->session_count; index++)
-				is_rdma_fail(fabric->sessions[index], -ENOSPC);
-			return;
-		}
+	}
+	is_remote_chunk_snapshot_release(snapshot);
+	if (!next_logical &&
+	    total_available < is_device_remote_chunk_count(device)) {
+		is_fabric_complete_remote_only(fabric, -ENOSPC);
+		for (index = 0; index < fabric->session_count; index++)
+			is_rdma_fail(fabric->sessions[index], -ENOSPC);
+		return;
 	}
 
-	if (fabric->reservation_next_logical >=
-	    is_device_remote_chunk_count(device)) {
+	if (next_logical >= is_device_remote_chunk_count(device)) {
 		if (!is_device_mark_remote_connected(device)) {
 			is_fabric_complete_remote_only(fabric, -EIO);
 			return;
@@ -1649,8 +1644,7 @@ static void is_fabric_reservation_work(struct work_struct *work)
 		mutex_unlock(&session->control_lock);
 		return;
 	}
-	ret = is_request_remote_only_reservation(session,
-		fabric->reservation_next_logical, 1);
+	ret = is_request_remote_only_reservation(session, next_logical, 1);
 	mutex_unlock(&session->control_lock);
 	if (ret) {
 		is_fabric_complete_remote_only(fabric, ret);
@@ -1708,14 +1702,11 @@ static void is_fabric_mapping_work(struct work_struct *work)
 	request->payload.chunk_request.logical_start = logical_index;
 	request->payload.chunk_request.pool = IS_PROTOCOL_POOL_OPPORTUNISTIC;
 	session->pending_request_id = request->header.request_id;
-	session->pending_logical_chunk = logical_index;
-	session->pending_chunk_count = 1;
 	ret = is_encode_and_send(session, request);
 	if (ret) {
 		(void)is_remote_chunk_mapping_abort(device->remote_chunks,
 			&session->mapping_claim);
 		session->pending_request_id = 0;
-		session->pending_chunk_count = 0;
 	} else {
 		is_arm_control_deadline(session);
 	}
@@ -1994,7 +1985,7 @@ static int is_session_init(struct is_rdma_fabric *fabric,
 	spin_lock_init(&session->operation_lock);
 	INIT_LIST_HEAD(&session->operations);
 	init_waitqueue_head(&session->send_wait);
-	init_waitqueue_head(&session->chunk_wait);
+	init_waitqueue_head(&session->operation_wait);
 	init_waitqueue_head(&session->control_wait);
 	atomic_set(&session->send_busy, 0);
 	atomic_set(&session->rdma_reads_inflight, 0);
@@ -2033,7 +2024,7 @@ static void is_session_destroy(struct is_rdma_session *session)
 		return;
 	WRITE_ONCE(session->stopping, true);
 	wake_up_all(&session->send_wait);
-	wake_up_all(&session->chunk_wait);
+	wake_up_all(&session->operation_wait);
 	wake_up_all(&session->control_wait);
 	mutex_lock(&session->control_lock);
 	session->control_state = IS_RDMA_CONTROL_STOPPING;
@@ -2158,7 +2149,7 @@ static void is_free_control_resources(struct is_rdma_session *session)
 	if (session->qp) {
 		if (session->qp_has_work)
 			ib_drain_qp(session->qp);
-		wait_event(session->chunk_wait,
+		wait_event(session->operation_wait,
 			!atomic_read(&session->operation_objects));
 		cancel_delayed_work_sync(&session->hello_work);
 		cancel_work_sync(&session->receive_work);
@@ -2257,15 +2248,11 @@ static int is_operation_resolve_lease(
 	enum is_remote_chunk_io_resolve_result result;
 	int ret;
 
-	if (operation->lease_resolved)
-		return operation->lease_resolve_status;
 	ret = is_remote_chunk_io_lease_resolve(
 		operation->session->device->remote_chunks, &operation->lease,
 		outcome, &result);
-	operation->lease_resolved = true;
-	operation->lease_resolve_status = ret ? ret :
+	return ret ? ret :
 		(result == IS_REMOTE_CHUNK_IO_RESOLVE_STALE ? 1 : 0);
-	return operation->lease_resolve_status;
 }
 
 static void is_operation_release_lease(struct is_rdma_operation *operation)
@@ -2297,12 +2284,9 @@ void is_rdma_operation_adapter_retire_posted(
 		operation->listed = false;
 	}
 	spin_unlock_irqrestore(&session->operation_lock, flags);
-	wake_up_all(&session->chunk_wait);
-	if (status && !late_completion) {
-		WARN_ON_ONCE(is_operation_resolve_lease(operation,
-			IS_REMOTE_CHUNK_IO_FAILURE) < 0);
+	wake_up_all(&session->operation_wait);
+	if (status && !late_completion)
 		is_rdma_fail(session, status);
-	}
 	if (late_completion)
 		atomic64_inc(&session->device->late_rdma_completions_total);
 }
@@ -2333,7 +2317,7 @@ void is_rdma_operation_adapter_abort_unposted(
 		IS_REMOTE_CHUNK_IO_SUBMISSION_FAILURE) < 0 &&
 		!READ_ONCE(session->stopping));
 	is_operation_release_lease(operation);
-	wake_up_all(&session->chunk_wait);
+	wake_up_all(&session->operation_wait);
 }
 
 void is_rdma_operation_adapter_publish_terminal(
@@ -2392,7 +2376,7 @@ void is_rdma_operation_adapter_destroy(
 	struct is_rdma_session *session = operation->session;
 
 	atomic_dec(&session->operation_objects);
-	wake_up_all(&session->chunk_wait);
+	wake_up_all(&session->operation_wait);
 	kfree(operation);
 }
 
@@ -2561,7 +2545,7 @@ int is_rdma_flush(struct is_device *device)
 
 		if (!session)
 			continue;
-		wait_event(session->chunk_wait,
+		wait_event(session->operation_wait,
 			!atomic_read(&session->operation_objects) ||
 			READ_ONCE(session->stopping) ||
 			atomic_read(&device->remote_lost));
@@ -2575,20 +2559,17 @@ int is_rdma_flush(struct is_device *device)
 	return 0;
 }
 
-int is_rdma_mapping_parameters_changed(struct is_device *device)
+int is_rdma_hot_policy_set(
+	struct is_device *device,
+	const struct is_remote_chunk_hot_policy *policy)
 {
 	struct is_rdma_fabric *fabric = is_device_fabric(device);
-	struct is_remote_chunk_hot_policy policy = {
-		.threshold = READ_ONCE(device->hot_range_threshold),
-		.read_weight = READ_ONCE(device->hot_range_read_weight),
-		.write_weight = READ_ONCE(device->hot_range_write_weight),
-	};
 	bool mapping_needed = false;
 	int ret;
 
 	if (!device->remote_chunks)
-		return 0;
-	ret = is_remote_chunk_hot_policy_set(device->remote_chunks, &policy,
+		return -ENODEV;
+	ret = is_remote_chunk_hot_policy_set(device->remote_chunks, policy,
 		&mapping_needed);
 	if (ret)
 		return ret;
@@ -2626,16 +2607,15 @@ void is_rdma_note_activity(struct is_device *device, sector_t sector,
 		queue_work(fabric->sessions[0]->control_wq, &fabric->mapping_work);
 }
 
-ssize_t is_rdma_remote_chunk_placements_show(struct is_device *device,
-					     char *page)
+ssize_t is_rdma_remote_chunk_placements_show(
+	struct is_device *device,
+	const struct is_remote_chunk_snapshot *snapshot, char *page)
 {
 	struct is_rdma_fabric *fabric = is_device_fabric(device);
-	struct is_remote_chunk_snapshot *snapshot = NULL;
 	ssize_t written = 0;
 	unsigned int index;
 
-	if (!fabric || !device->remote_chunks ||
-	    is_remote_chunk_snapshot_take(device->remote_chunks, &snapshot))
+	if (!fabric || !snapshot)
 		return sysfs_emit(page, "\n");
 	for (index = 0; index < snapshot->chunk_count; index++) {
 		const char *provider_id = "unmapped";
@@ -2672,7 +2652,6 @@ ssize_t is_rdma_remote_chunk_placements_show(struct is_device *device,
 	}
 	if (!snapshot->chunk_count)
 		written += sysfs_emit(page, "\n");
-	is_remote_chunk_snapshot_release(snapshot);
 	return written;
 }
 
@@ -2716,22 +2695,22 @@ static const char *is_session_runtime_state(struct is_rdma_session *session)
 	return "not-connected";
 }
 
-ssize_t is_rdma_provider_runtime_status_show(struct is_device *device,
-					     char *page)
+ssize_t is_rdma_provider_runtime_status_show(
+	struct is_device *device,
+	const struct is_remote_chunk_snapshot *snapshot, char *page)
 {
 	struct is_rdma_fabric *fabric = is_device_fabric(device);
-	struct is_remote_chunk_snapshot *snapshot = NULL;
 	ssize_t written = 0;
 	unsigned int index;
 
-	if (!fabric || !device->remote_chunks ||
-	    is_remote_chunk_snapshot_take(device->remote_chunks, &snapshot))
+	if (!fabric || !snapshot)
 		return sysfs_emit(page, "\n");
 	for (index = 0; index < fabric->session_count; index++) {
 		struct is_rdma_session *session = fabric->sessions[index];
 		unsigned int mapped = is_snapshot_provider_assigned_chunks(snapshot,
 			session->provider_handle);
-		unsigned int advertised = READ_ONCE(session->available_chunks);
+		unsigned int advertised =
+			READ_ONCE(session->advertised_capacity_chunks);
 		unsigned int available = advertised > mapped ?
 			advertised - mapped : 0;
 
@@ -2741,7 +2720,6 @@ ssize_t is_rdma_provider_runtime_status_show(struct is_device *device,
 			index, is_session_runtime_state(session), available, mapped,
 			READ_ONCE(session->last_error));
 	}
-	is_remote_chunk_snapshot_release(snapshot);
 	if (!written)
 		written = sysfs_emit(page, "\n");
 	return written;

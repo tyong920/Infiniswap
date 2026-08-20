@@ -142,31 +142,32 @@ static ssize_t is_device_provider_failure_deadline_ms_store(
 	return is_store_result(device, ret, count);
 }
 
-static struct is_remote_chunk_hot_policy is_device_hot_policy(
-	struct is_device *device)
+static int is_device_hot_policy(
+	struct is_device *device, struct is_remote_chunk_hot_policy *policy)
 {
-	struct is_remote_chunk_hot_policy policy;
 	struct is_remote_chunk_snapshot *snapshot = NULL;
+	int ret = 0;
 
 	mutex_lock(&device->lifecycle_lock);
-	policy.threshold = READ_ONCE(device->hot_range_threshold);
-	policy.read_weight = READ_ONCE(device->hot_range_read_weight);
-	policy.write_weight = READ_ONCE(device->hot_range_write_weight);
-	if (device->remote_chunks &&
-	    !is_remote_chunk_snapshot_take(device->remote_chunks, &snapshot))
-		policy = snapshot->hot_policy;
+	if (!device->remote_chunks) {
+		*policy = device->remote_chunk_hot_policy_config;
+	} else {
+		ret = is_remote_chunk_snapshot_take(device->remote_chunks, &snapshot);
+		if (!ret)
+			*policy = snapshot->hot_policy;
+	}
 	is_remote_chunk_snapshot_release(snapshot);
 	mutex_unlock(&device->lifecycle_lock);
-	return policy;
+	return ret;
 }
 
 static ssize_t is_device_hot_range_threshold_show(struct config_item *item,
 						   char *page)
 {
-	struct is_remote_chunk_hot_policy policy =
-		is_device_hot_policy(to_is_device(item));
+	struct is_remote_chunk_hot_policy policy;
+	int ret = is_device_hot_policy(to_is_device(item), &policy);
 
-	return sysfs_emit(page, "%llu\n", policy.threshold);
+	return ret ? ret : sysfs_emit(page, "%llu\n", policy.threshold);
 }
 
 static ssize_t is_device_hot_range_threshold_store(struct config_item *item,
@@ -182,10 +183,10 @@ static ssize_t is_device_hot_range_threshold_store(struct config_item *item,
 static ssize_t is_device_hot_range_read_weight_show(struct config_item *item,
 						     char *page)
 {
-	struct is_remote_chunk_hot_policy policy =
-		is_device_hot_policy(to_is_device(item));
+	struct is_remote_chunk_hot_policy policy;
+	int ret = is_device_hot_policy(to_is_device(item), &policy);
 
-	return sysfs_emit(page, "%u\n", policy.read_weight);
+	return ret ? ret : sysfs_emit(page, "%u\n", policy.read_weight);
 }
 
 static ssize_t is_device_hot_range_read_weight_store(struct config_item *item,
@@ -201,10 +202,10 @@ static ssize_t is_device_hot_range_read_weight_store(struct config_item *item,
 static ssize_t is_device_hot_range_write_weight_show(struct config_item *item,
 						      char *page)
 {
-	struct is_remote_chunk_hot_policy policy =
-		is_device_hot_policy(to_is_device(item));
+	struct is_remote_chunk_hot_policy policy;
+	int ret = is_device_hot_policy(to_is_device(item), &policy);
 
-	return sysfs_emit(page, "%u\n", policy.write_weight);
+	return ret ? ret : sysfs_emit(page, "%u\n", policy.write_weight);
 }
 
 static ssize_t is_device_hot_range_write_weight_store(struct config_item *item,
@@ -467,51 +468,82 @@ static ssize_t is_device_connection_state_show(struct config_item *item,
 	return sysfs_emit(page, "%s\n", name);
 }
 
+static int is_device_remote_chunk_snapshot_take_locked(
+	struct is_device *device, struct is_remote_chunk_snapshot **snapshot_out)
+{
+	*snapshot_out = NULL;
+	if (!device->remote_chunks)
+		return 0;
+	return is_remote_chunk_snapshot_take(device->remote_chunks, snapshot_out);
+}
+
 static ssize_t is_device_remote_capacity_bytes_show(struct config_item *item,
 						     char *page)
 {
 	struct is_device *device = to_is_device(item);
-	u64 capacity;
+	struct is_remote_chunk_snapshot *snapshot = NULL;
+	u64 capacity = 0;
+	int ret;
 
 	mutex_lock(&device->lifecycle_lock);
-	capacity = is_rdma_remote_capacity_bytes(device);
+	ret = is_device_remote_chunk_snapshot_take_locked(device, &snapshot);
+	if (!ret && snapshot)
+		capacity = (u64)snapshot->usable_chunks * IS_REMOTE_CHUNK_BYTES;
+	is_remote_chunk_snapshot_release(snapshot);
 	mutex_unlock(&device->lifecycle_lock);
-	return sysfs_emit(page, "%llu\n", capacity);
+	return ret ? ret : sysfs_emit(page, "%llu\n", capacity);
 }
 
 static ssize_t is_device_mapped_remote_chunks_show(struct config_item *item,
 						    char *page)
 {
 	struct is_device *device = to_is_device(item);
-	unsigned int mapped;
+	struct is_remote_chunk_snapshot *snapshot = NULL;
+	unsigned int mapped = 0;
+	int ret;
 
 	mutex_lock(&device->lifecycle_lock);
-	mapped = is_rdma_mapped_chunk_count(device);
+	ret = is_device_remote_chunk_snapshot_take_locked(device, &snapshot);
+	if (!ret && snapshot)
+		mapped = snapshot->usable_chunks;
+	is_remote_chunk_snapshot_release(snapshot);
 	mutex_unlock(&device->lifecycle_lock);
-	return sysfs_emit(page, "%u\n", mapped);
+	return ret ? ret : sysfs_emit(page, "%u\n", mapped);
 }
 
 static ssize_t is_device_mapped_hot_ranges_show(struct config_item *item,
 						 char *page)
 {
 	struct is_device *device = to_is_device(item);
+	struct is_remote_chunk_snapshot *snapshot = NULL;
 	unsigned int mapped = 0;
+	int ret;
 
 	mutex_lock(&device->lifecycle_lock);
-	if (device->mode == IS_DEVICE_MODE_BACKED)
-		mapped = is_rdma_mapped_chunk_count(device);
+	ret = is_device_remote_chunk_snapshot_take_locked(device, &snapshot);
+	if (!ret && snapshot && device->mode == IS_DEVICE_MODE_BACKED)
+		mapped = snapshot->usable_chunks;
+	is_remote_chunk_snapshot_release(snapshot);
 	mutex_unlock(&device->lifecycle_lock);
-	return sysfs_emit(page, "%u\n", mapped);
+	return ret ? ret : sysfs_emit(page, "%u\n", mapped);
 }
 
 static ssize_t is_device_remote_chunk_placements_show(struct config_item *item,
 						      char *page)
 {
 	struct is_device *device = to_is_device(item);
+	struct is_remote_chunk_snapshot *snapshot = NULL;
 	ssize_t written;
+	int ret;
 
 	mutex_lock(&device->lifecycle_lock);
-	written = is_rdma_remote_chunk_placements_show(device, page);
+	ret = is_device_remote_chunk_snapshot_take_locked(device, &snapshot);
+	if (ret)
+		written = ret;
+	else
+		written = is_rdma_remote_chunk_placements_show(device, snapshot,
+			page);
+	is_remote_chunk_snapshot_release(snapshot);
 	mutex_unlock(&device->lifecycle_lock);
 	return written;
 }
@@ -532,10 +564,18 @@ static ssize_t is_device_provider_runtime_status_show(
 	struct config_item *item, char *page)
 {
 	struct is_device *device = to_is_device(item);
+	struct is_remote_chunk_snapshot *snapshot = NULL;
 	ssize_t written;
+	int ret;
 
 	mutex_lock(&device->lifecycle_lock);
-	written = is_rdma_provider_runtime_status_show(device, page);
+	ret = is_device_remote_chunk_snapshot_take_locked(device, &snapshot);
+	if (ret)
+		written = ret;
+	else
+		written = is_rdma_provider_runtime_status_show(device, snapshot,
+			page);
+	is_remote_chunk_snapshot_release(snapshot);
 	mutex_unlock(&device->lifecycle_lock);
 	return written;
 }
