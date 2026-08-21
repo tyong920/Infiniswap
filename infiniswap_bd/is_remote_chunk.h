@@ -162,6 +162,8 @@ enum is_remote_chunk_next_mapping_result {
 	IS_REMOTE_CHUNK_NEXT_MAPPING_NO_HOT_RANGE,
 	IS_REMOTE_CHUNK_NEXT_MAPPING_PENDING_PROVIDER_FACTS,
 	IS_REMOTE_CHUNK_NEXT_MAPPING_NO_ELIGIBLE_CAPACITY,
+	IS_REMOTE_CHUNK_NEXT_MAPPING_INSUFFICIENT_CAPACITY,
+	IS_REMOTE_CHUNK_NEXT_MAPPING_COMPLETE,
 	IS_REMOTE_CHUNK_NEXT_MAPPING_CLAIM_ACTIVE,
 	IS_REMOTE_CHUNK_NEXT_MAPPING_SHUTDOWN,
 	IS_REMOTE_CHUNK_NEXT_MAPPING_INVALID_INPUT,
@@ -303,8 +305,9 @@ int is_remote_chunk_mapping_begin_explicit(
 	struct is_remote_chunk_mapping_claim *claim_out);
 
 /*
- * Backed Mode atomically selects one Hot Range and Memory Provider, reserves
- * Opportunistic Pool capacity, and returns a generation-bound claim.
+ * Atomically selects the next mode-specific logical Remote Chunk and Memory
+ * Provider, reserves pool capacity, and returns a generation-bound claim.
+ * Remote-Only completion is reported only after every required chunk is usable.
  */
 enum is_remote_chunk_next_mapping_result is_remote_chunk_next_mapping(
 	struct is_remote_chunk_module *module,
