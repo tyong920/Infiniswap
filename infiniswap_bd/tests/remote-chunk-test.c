@@ -812,26 +812,41 @@ static int test_observation_during_claim_tracks_reserved_baseline(void)
 	struct is_remote_chunk_module *module = NULL;
 	struct is_remote_chunk_provider_handle provider;
 	struct is_remote_chunk_mapping_request request = { 0 };
-	struct is_remote_chunk_provider_observation observed_reserved = {
+	struct is_remote_chunk_provider_observation observed_claim = {
 		.sequence = 2,
-		.available_chunks = 0,
-		.exclusion = IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_ZERO_CAPACITY,
-		.placement_eligible = false,
+		.available_chunks = 1,
+		.exclusion = IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_NONE,
+		.placement_eligible = true,
 	};
+	struct is_remote_chunk_mapping_grant grant;
 	int failed = 0;
 
 	if (create_single_provider_module(&backed_config, &module, &provider) ||
-	    observe_provider_available(module, provider, 1) ||
-	    make_chunk_hot(module, 0) ||
+	    observe_provider_available(module, provider, 2) ||
+	    make_chunk_hot(module, 0) || make_chunk_hot(module, 1) ||
+	    make_chunk_hot(module, 2) ||
 	    is_remote_chunk_next_mapping(module, &request) !=
 		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST)
 		return 1;
-	if (is_remote_chunk_provider_observe(module, provider,
-		&observed_reserved) != IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_APPLIED ||
+	if (is_remote_chunk_provider_observe(module, provider, &observed_claim) !=
+		IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_APPLIED ||
 	    is_remote_chunk_mapping_abort(module, &request.claim) ||
 	    is_remote_chunk_next_mapping(module, &request) !=
-		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST ||
-	    is_remote_chunk_mapping_abort(module, &request.claim))
+		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST)
+		failed = 1;
+	grant = mapping_grant(request.logical_chunk, 91);
+	if (!failed && is_remote_chunk_mapping_commit(module, &request.claim,
+		request.provider, &grant, 1))
+		failed = 1;
+	if (!failed && is_remote_chunk_next_mapping(module, &request) !=
+		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST)
+		failed = 1;
+	grant = mapping_grant(request.logical_chunk, 92);
+	if (!failed && is_remote_chunk_mapping_commit(module, &request.claim,
+		request.provider, &grant, 1))
+		failed = 1;
+	if (!failed && is_remote_chunk_next_mapping(module, &request) !=
+		IS_REMOTE_CHUNK_NEXT_MAPPING_NO_ELIGIBLE_CAPACITY)
 		failed = 1;
 	failed |= is_remote_chunk_module_destroy(module) != 0;
 	return failed;
@@ -1249,6 +1264,8 @@ static int test_concurrent_next_mapping_calls_have_one_winner(void)
 	for (index = 0; index < 2; index++) {
 		if (pthread_join(threads[index], NULL))
 			failed = 1;
+	}
+	for (index = 0; index < 2; index++) {
 		requested += events[index].result ==
 			IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST;
 		active += events[index].result ==

@@ -1009,10 +1009,8 @@ static unsigned int is_remote_chunk_provider_effective_available_locked(
 	unsigned int mapping;
 	unsigned int current_debits;
 
-	/* Retiring a debit can restore capacity after a zero-capacity report. */
 	if (provider->failed || !provider->has_observation ||
-	    (!provider->placement_eligible && provider->exclusion !=
-		IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_ZERO_CAPACITY))
+	    !provider->placement_eligible)
 		return 0;
 	is_remote_chunk_provider_debits_locked(module, provider->handle,
 		&assigned, &mapping);
