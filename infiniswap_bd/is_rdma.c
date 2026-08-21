@@ -261,6 +261,25 @@ is_snapshot_provider(const struct is_remote_chunk_snapshot *snapshot,
 	return NULL;
 }
 
+static unsigned int is_provider_snapshot_available_chunks(
+	const struct is_remote_chunk_provider_snapshot *provider)
+{
+	if (!provider || !provider->has_observation ||
+	    !provider->placement_eligible || provider->failed)
+		return 0;
+	if (provider->assigned_chunks >= provider->observation_assigned_chunks) {
+		unsigned int newly_assigned = provider->assigned_chunks -
+			provider->observation_assigned_chunks;
+
+		return provider->reported_available_chunks > newly_assigned ?
+			provider->reported_available_chunks - newly_assigned : 0;
+	}
+	return (unsigned int)min_t(u64,
+		(u64)provider->reported_available_chunks +
+		provider->observation_assigned_chunks - provider->assigned_chunks,
+		U32_MAX);
+}
+
 static void *is_session_kzalloc(struct is_rdma_session *session, size_t size,
 				gfp_t flags)
 {
@@ -292,24 +311,77 @@ static is_placement_u32 is_fabric_rand(void *ctx, is_placement_u32 limit)
 	return (is_placement_u32)(value % limit);
 }
 
-static int is_session_record_provider_available(
-	struct is_rdma_session *session, unsigned int available_chunks)
+static enum is_remote_chunk_provider_exclusion
+is_remote_chunk_exclusion(enum is_placement_exclude_reason reason)
 {
+	switch (reason) {
+	case IS_PLACEMENT_EXCLUDE_NONE:
+		return IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_NONE;
+	case IS_PLACEMENT_EXCLUDE_UNHEALTHY:
+		return IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_UNHEALTHY;
+	case IS_PLACEMENT_EXCLUDE_IDENTITY:
+		return IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_IDENTITY;
+	case IS_PLACEMENT_EXCLUDE_VERSION:
+		return IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_VERSION;
+	case IS_PLACEMENT_EXCLUDE_CAPABILITY:
+		return IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_CAPABILITY;
+	case IS_PLACEMENT_EXCLUDE_POOL:
+		return IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_POOL;
+	case IS_PLACEMENT_EXCLUDE_RAIL:
+		return IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_RAIL;
+	case IS_PLACEMENT_EXCLUDE_ZERO_CAPACITY:
+		return IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_ZERO_CAPACITY;
+	default:
+		return IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_UNHEALTHY;
+	}
+}
+
+static int is_session_record_provider_observation(
+	struct is_rdma_session *session, unsigned int available_chunks,
+	bool placement_eligible, enum is_placement_exclude_reason exclusion,
+	u64 sequence)
+{
+	const struct is_remote_chunk_provider_observation observation = {
+		.sequence = sequence,
+		.available_chunks = available_chunks,
+		.exclusion = is_remote_chunk_exclusion(exclusion),
+		.placement_eligible = placement_eligible,
+	};
 	struct is_remote_chunk_snapshot *snapshot = NULL;
 	const struct is_remote_chunk_provider_snapshot *provider;
-	unsigned int assigned;
+	enum is_remote_chunk_provider_observation_result result;
 	int ret;
+
+	result = is_remote_chunk_provider_observe(
+		session->device->remote_chunks, session->provider_handle,
+		&observation);
+	if (result == IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_STALE)
+		return 0;
+	if (result == IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_CONFLICT)
+		return -EPROTO;
+	if (result == IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_STALE_EPOCH)
+		return -ESTALE;
+	if (result == IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_SHUTDOWN)
+		return -ESHUTDOWN;
+	if (result != IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_APPLIED &&
+	    result != IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_DUPLICATE)
+		return -EINVAL;
 
 	ret = is_remote_chunk_snapshot_take(session->device->remote_chunks,
 		&snapshot);
 	if (ret)
 		return ret;
 	provider = is_snapshot_provider(snapshot, session->provider_handle);
-	assigned = provider ? provider->assigned_chunks : 0;
-	is_remote_chunk_snapshot_release(snapshot);
-	/* Pair the Provider report with the module accounting it observed. */
+	if (!provider || !provider->has_observation) {
+		is_remote_chunk_snapshot_release(snapshot);
+		return -ESTALE;
+	}
+	/* Retain the legacy Placement baseline until its later migration ticket. */
 	atomic64_set(&session->capacity_observation,
-		((u64)available_chunks << 32) | assigned);
+		((u64)(provider->placement_eligible ?
+			provider->reported_available_chunks : 0U) << 32) |
+		provider->observation_assigned_chunks);
+	is_remote_chunk_snapshot_release(snapshot);
 	return 0;
 }
 
@@ -1217,6 +1289,7 @@ static int is_handle_status(struct is_rdma_session *session,
 			    const struct is_protocol_message *status)
 {
 	unsigned int available_chunks;
+	enum is_placement_exclude_reason exclusion;
 	bool healthy;
 	int ret;
 
@@ -1224,6 +1297,17 @@ static int is_handle_status(struct is_rdma_session *session,
 		    session->pending_request_id))
 		return -EPROTO;
 	healthy = (status->payload.status.flags & IS_PROTOCOL_STATUS_HEALTHY) != 0;
+	available_chunks = is_remote_only(session) ?
+		status->payload.status.available_committed_chunks :
+		status->payload.status.available_opportunistic_chunks;
+	exclusion = !healthy ? IS_PLACEMENT_EXCLUDE_UNHEALTHY :
+		(!available_chunks ? IS_PLACEMENT_EXCLUDE_ZERO_CAPACITY :
+		 IS_PLACEMENT_EXCLUDE_NONE);
+	ret = is_session_record_provider_observation(session, available_chunks,
+		healthy && available_chunks > 0, exclusion,
+		status->header.request_id);
+	if (ret)
+		return ret;
 	if (is_remote_only(session)) {
 		if (!healthy) {
 			is_session_set_exclude(session,
@@ -1232,12 +1316,6 @@ static int is_handle_status(struct is_rdma_session *session,
 			is_mark_session_ready(session);
 			return 0;
 		}
-		available_chunks =
-			status->payload.status.available_committed_chunks;
-		ret = is_session_record_provider_available(session,
-			available_chunks);
-		if (ret)
-			return ret;
 		if (available_chunks == 0) {
 			is_session_set_exclude(session,
 				IS_PLACEMENT_EXCLUDE_ZERO_CAPACITY);
@@ -1254,10 +1332,6 @@ static int is_handle_status(struct is_rdma_session *session,
 		is_mark_session_ready(session);
 		return 0;
 	}
-	available_chunks = status->payload.status.available_opportunistic_chunks;
-	ret = is_session_record_provider_available(session, available_chunks);
-	if (ret)
-		return ret;
 	if (available_chunks == 0) {
 		is_session_set_exclude(session,
 			IS_PLACEMENT_EXCLUDE_ZERO_CAPACITY);
@@ -1279,10 +1353,23 @@ static int is_handle_status(struct is_rdma_session *session,
 static int is_handle_heartbeat(struct is_rdma_session *session,
 			       const struct is_protocol_message *status)
 {
+	unsigned int available_chunks;
+	bool healthy;
+	int ret;
+
 	if (!is_status_response_valid(session, status,
 		    session->pending_request_id))
 		return -EPROTO;
-	if (!(status->payload.status.flags & IS_PROTOCOL_STATUS_HEALTHY))
+	healthy = (status->payload.status.flags & IS_PROTOCOL_STATUS_HEALTHY) != 0;
+	available_chunks = status->payload.status.available_committed_chunks;
+	ret = is_session_record_provider_observation(session, available_chunks,
+		healthy && available_chunks > 0,
+		!healthy ? IS_PLACEMENT_EXCLUDE_UNHEALTHY :
+		(!available_chunks ? IS_PLACEMENT_EXCLUDE_ZERO_CAPACITY :
+		 IS_PLACEMENT_EXCLUDE_NONE), status->header.request_id);
+	if (ret)
+		return ret;
+	if (!healthy)
 		return -EIO;
 	is_mark_session_ready(session);
 	return 0;
@@ -1293,6 +1380,7 @@ static int is_handle_backed_heartbeat(
 	const struct is_protocol_message *status)
 {
 	unsigned int available_chunks;
+	bool healthy;
 	int ret;
 
 	if (!session->heartbeat_request_id ||
@@ -1300,12 +1388,17 @@ static int is_handle_backed_heartbeat(
 		    session->heartbeat_request_id))
 		return -EPROTO;
 	session->heartbeat_request_id = 0;
-	if (!(status->payload.status.flags & IS_PROTOCOL_STATUS_HEALTHY))
-		return -EIO;
+	healthy = (status->payload.status.flags & IS_PROTOCOL_STATUS_HEALTHY) != 0;
 	available_chunks = status->payload.status.available_opportunistic_chunks;
-	ret = is_session_record_provider_available(session, available_chunks);
+	ret = is_session_record_provider_observation(session, available_chunks,
+		healthy && available_chunks > 0,
+		!healthy ? IS_PLACEMENT_EXCLUDE_UNHEALTHY :
+		(!available_chunks ? IS_PLACEMENT_EXCLUDE_ZERO_CAPACITY :
+		 IS_PLACEMENT_EXCLUDE_NONE), status->header.request_id);
 	if (ret)
 		return ret;
+	if (!healthy)
+		return -EIO;
 	if (available_chunks == 0)
 		is_session_set_exclude(session,
 			IS_PLACEMENT_EXCLUDE_ZERO_CAPACITY);
@@ -1974,8 +2067,8 @@ static int is_session_init(struct is_rdma_fabric *fabric,
 			   struct is_rdma_session *session,
 			   unsigned int provider_index, bool remote_only)
 {
-	int ret;
-
+	if (provider_index >= fabric->device->remote_chunk_provider_count)
+		return -ESTALE;
 	session->fabric = fabric;
 	session->provider_index = provider_index;
 	session->device = fabric->device;
@@ -1989,10 +2082,8 @@ static int is_session_init(struct is_rdma_fabric *fabric,
 	session->healthy = false;
 	session->compatible = true;
 	session->exclude_reason = IS_PLACEMENT_EXCLUDE_NONE;
-	ret = is_remote_chunk_provider_handle_create(
-		fabric->device->remote_chunks, &session->provider_handle);
-	if (ret)
-		return ret;
+	session->provider_handle =
+		fabric->device->remote_chunk_provider_handles[provider_index];
 	init_completion(&session->disconnect_complete);
 	mutex_init(&session->control_lock);
 	spin_lock_init(&session->operation_lock);
@@ -2625,11 +2716,10 @@ ssize_t is_rdma_remote_chunk_placements_show(
 	struct is_device *device,
 	const struct is_remote_chunk_snapshot *snapshot, char *page)
 {
-	struct is_rdma_fabric *fabric = is_device_fabric(device);
 	ssize_t written = 0;
 	unsigned int index;
 
-	if (!fabric || !snapshot)
+	if (!is_device_fabric(device) || !snapshot)
 		return sysfs_emit(page, "\n");
 	for (index = 0; index < snapshot->chunk_count; index++) {
 		const char *provider_id = "unmapped";
@@ -2640,24 +2730,14 @@ ssize_t is_rdma_remote_chunk_placements_show(
 		     placement_index++) {
 			const struct is_remote_chunk_placement_snapshot *placement =
 				&snapshot->placements[placement_index];
-			unsigned int session_index;
+			const struct is_remote_chunk_provider_snapshot *provider;
 
 			if (placement->logical_chunk != index)
 				continue;
-			for (session_index = 0;
-			     session_index < fabric->session_count;
-			     session_index++) {
-				struct is_rdma_session *session =
-					fabric->sessions[session_index];
-
-				if (session &&
-				    is_remote_chunk_provider_handle_equal(
-					session->provider_handle,
-					placement->provider)) {
-					provider_id = session->provider_id;
-					break;
-				}
-			}
+			provider = is_snapshot_provider(snapshot,
+				placement->provider);
+			if (provider)
+				provider_id = provider->identifier;
 			break;
 		}
 		written += sysfs_emit_at(page, written, "%u:%s%s", index,
@@ -2669,26 +2749,82 @@ ssize_t is_rdma_remote_chunk_placements_show(
 	return written;
 }
 
-ssize_t is_rdma_provider_exclusions_show(struct is_device *device, char *page)
+static const char *is_remote_chunk_exclusion_name(
+	enum is_remote_chunk_provider_exclusion exclusion)
 {
-	struct is_rdma_fabric *fabric = is_device_fabric(device);
-	ssize_t written = 0;
-	unsigned int index;
-	unsigned int emitted = 0;
+	switch (exclusion) {
+	case IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_NONE:
+		return "none";
+	case IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_UNHEALTHY:
+		return "unhealthy";
+	case IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_IDENTITY:
+		return "identity";
+	case IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_VERSION:
+		return "version";
+	case IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_CAPABILITY:
+		return "capability";
+	case IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_POOL:
+		return "pool";
+	case IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_RAIL:
+		return "rail";
+	case IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_ZERO_CAPACITY:
+		return "zero-capacity";
+	default:
+		return "unknown";
+	}
+}
 
-	if (!fabric)
-		return sysfs_emit(page, "\n");
+static struct is_rdma_session *is_fabric_session_for_provider(
+	struct is_rdma_fabric *fabric,
+	struct is_remote_chunk_provider_handle provider)
+{
+	unsigned int index;
+
 	for (index = 0; index < fabric->session_count; index++) {
 		struct is_rdma_session *session = fabric->sessions[index];
 
-		if (session->exclude_reason == IS_PLACEMENT_EXCLUDE_NONE)
+		if (session && is_remote_chunk_provider_handle_equal(
+			session->provider_handle, provider))
+			return session;
+	}
+	return NULL;
+}
+
+ssize_t is_rdma_provider_exclusions_show(struct is_device *device, char *page)
+{
+	struct is_rdma_fabric *fabric = is_device_fabric(device);
+	struct is_remote_chunk_snapshot *snapshot = NULL;
+	ssize_t written = 0;
+	unsigned int index;
+	unsigned int emitted = 0;
+	int ret;
+
+	if (!fabric || !device->remote_chunks)
+		return sysfs_emit(page, "\n");
+	ret = is_remote_chunk_snapshot_take(device->remote_chunks, &snapshot);
+	if (ret)
+		return ret;
+	for (index = 0; index < snapshot->provider_count; index++) {
+		const struct is_remote_chunk_provider_snapshot *provider =
+			&snapshot->providers[index];
+		struct is_rdma_session *session = is_fabric_session_for_provider(
+			fabric, provider->provider);
+		const char *reason = NULL;
+
+		if (provider->has_observation && !provider->failed &&
+		    provider->exclusion != IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_NONE)
+			reason = is_remote_chunk_exclusion_name(provider->exclusion);
+		else if (session && session->exclude_reason !=
+				IS_PLACEMENT_EXCLUDE_NONE)
+			reason = is_placement_exclude_reason_name(
+				session->exclude_reason);
+		if (!reason)
 			continue;
 		written += sysfs_emit_at(page, written, "%s%s:%s",
-			emitted ? " " : "", session->provider_id,
-			is_placement_exclude_reason_name(
-				session->exclude_reason));
+			emitted ? " " : "", provider->identifier, reason);
 		emitted++;
 	}
+	is_remote_chunk_snapshot_release(snapshot);
 	if (!emitted)
 		written += sysfs_emit(page, "\n");
 	return written;
@@ -2724,8 +2860,8 @@ ssize_t is_rdma_provider_runtime_status_show(
 		const struct is_remote_chunk_provider_snapshot *provider =
 			is_snapshot_provider(snapshot, session->provider_handle);
 		unsigned int mapped = provider ? provider->usable_chunks : 0;
-		unsigned int available = is_session_observed_available_chunks(session,
-			snapshot);
+		unsigned int available =
+			is_provider_snapshot_available_chunks(provider);
 
 		if (written >= PAGE_SIZE - 128)
 			break;

@@ -1907,6 +1907,9 @@ static int is_release_resources(struct is_device *device)
 		if (ret)
 			return ret;
 		device->remote_chunks = NULL;
+		device->remote_chunk_provider_count = 0;
+		memset(device->remote_chunk_provider_handles, 0,
+			sizeof(device->remote_chunk_provider_handles));
 	}
 	if (device->disk && device->disk_added) {
 		del_gendisk(device->disk);
@@ -1960,6 +1963,60 @@ static int is_validate_open_backing_store(struct is_device *device)
 	return 0;
 }
 
+static int is_create_remote_chunk_module(struct is_device *device,
+	bool remote_only, bool remote_configured)
+{
+	struct is_remote_chunk_provider_config *providers = NULL;
+	u64 remote_chunk_count = device->capacity_bytes /
+		IS_REMOTE_CHUNK_BYTES +
+		!!(device->capacity_bytes % IS_REMOTE_CHUNK_BYTES);
+	unsigned int provider_count = device->provider_count;
+	unsigned int index;
+	struct is_remote_chunk_config config;
+	int ret;
+
+	if (!provider_count && remote_configured)
+		provider_count = 1;
+	if (provider_count) {
+		providers = kcalloc(provider_count, sizeof(*providers), GFP_KERNEL);
+		if (!providers)
+			return -ENOMEM;
+		if (device->provider_count) {
+			for (index = 0; index < provider_count; index++) {
+				strscpy(providers[index].identifier,
+					device->provider_endpoints[index].name,
+					sizeof(providers[index].identifier));
+				providers[index].placement_weight =
+					device->provider_endpoints[index].placement_weight;
+			}
+		} else {
+			strscpy(providers[0].identifier, "legacy",
+				sizeof(providers[0].identifier));
+			providers[0].placement_weight =
+				IS_PLACEMENT_WEIGHT_DEFAULT;
+		}
+	}
+	config = (struct is_remote_chunk_config) {
+		.mode = remote_only ? IS_REMOTE_CHUNK_MODE_REMOTE_ONLY :
+			IS_REMOTE_CHUNK_MODE_BACKED,
+		.chunk_count = remote_configured ?
+			(unsigned int)remote_chunk_count : 1U,
+		.hot_policy = device->remote_chunk_hot_policy_config,
+		.providers = providers,
+		.provider_count = provider_count,
+		.placement_sample_size = provider_count == 1 ? 1U :
+			device->placement_sample_size,
+		.placement_seed = device->placement_seed,
+	};
+	ret = is_remote_chunk_module_create(&config,
+		device->remote_chunk_provider_handles, provider_count,
+		&device->remote_chunks);
+	if (!ret)
+		device->remote_chunk_provider_count = provider_count;
+	kfree(providers);
+	return ret;
+}
+
 int is_device_activate(struct is_device *device)
 {
 	enum is_device_state previous_state;
@@ -2009,7 +2066,7 @@ int is_device_activate(struct is_device *device)
 	}
 	if ((device->mode != IS_DEVICE_MODE_BACKED && !remote_only) ||
 	    !device->capacity_sectors || !device->consumer_id[0] ||
-	    !device->providers[0] || device->swap_priority < 0) {
+	    device->swap_priority < 0) {
 		ret = -EINVAL;
 		goto out;
 	}
@@ -2028,23 +2085,10 @@ int is_device_activate(struct is_device *device)
 	}
 	previous_state = device->state;
 
-	{
-		u64 remote_chunk_count = device->capacity_bytes /
-			IS_REMOTE_CHUNK_BYTES +
-			!!(device->capacity_bytes % IS_REMOTE_CHUNK_BYTES);
-		const struct is_remote_chunk_config config = {
-			.mode = remote_only ? IS_REMOTE_CHUNK_MODE_REMOTE_ONLY :
-				IS_REMOTE_CHUNK_MODE_BACKED,
-			.chunk_count = remote_configured ?
-				(unsigned int)remote_chunk_count : 1U,
-			.hot_policy = device->remote_chunk_hot_policy_config,
-		};
-
-		ret = is_remote_chunk_module_create(&config,
-			&device->remote_chunks);
-		if (ret)
-			goto out;
-	}
+	ret = is_create_remote_chunk_module(device, remote_only,
+		remote_configured);
+	if (ret)
+		goto out;
 
 	if (!remote_only) {
 		ret = is_open_backing_store(device);

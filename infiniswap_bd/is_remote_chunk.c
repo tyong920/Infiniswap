@@ -180,6 +180,19 @@ struct is_remote_chunk {
 	unsigned int active_io_leases;
 };
 
+struct is_remote_chunk_provider {
+	struct is_remote_chunk_provider_handle handle;
+	char identifier[IS_REMOTE_CHUNK_PROVIDER_ID_MAX + 1U];
+	unsigned int placement_weight;
+	unsigned int reported_available_chunks;
+	unsigned int observation_assigned_chunks;
+	unsigned long long observation_sequence;
+	enum is_remote_chunk_provider_exclusion exclusion;
+	unsigned char placement_eligible;
+	unsigned char has_observation;
+	unsigned char failed;
+};
+
 struct is_remote_chunk_module {
 	is_remote_chunk_lock_t lock;
 #ifdef __KERNEL__
@@ -188,12 +201,17 @@ struct is_remote_chunk_module {
 	pthread_cond_t lease_changed;
 #endif
 	struct is_remote_chunk *chunks;
+	struct is_remote_chunk_provider *providers;
+	unsigned int *placement_candidates;
+	unsigned int *placement_sample;
 	unsigned long *valid_sectors;
 	enum is_remote_chunk_mode mode;
 	unsigned int chunk_count;
+	unsigned int provider_count;
+	unsigned int placement_sample_size;
+	unsigned long long placement_seed;
 	struct is_remote_chunk_hot_policy hot_policy;
 	unsigned long long identity;
-	unsigned long long next_provider_serial;
 	unsigned long long next_mapping_claim_id;
 	unsigned long long next_eviction_claim_id;
 	unsigned long long next_transition_generation;
@@ -302,6 +320,74 @@ static bool is_remote_chunk_hot_policy_valid(
 		policy->write_weight <= IS_REMOTE_CHUNK_HOT_WEIGHT_MAX;
 }
 
+static bool is_remote_chunk_identifier_character_valid(unsigned char character,
+	bool first)
+{
+	bool alpha_numeric = (character >= 'a' && character <= 'z') ||
+		(character >= 'A' && character <= 'Z') ||
+		(character >= '0' && character <= '9');
+
+	return alpha_numeric || (!first &&
+		(character == '.' || character == '_' || character == '-'));
+}
+
+static bool is_remote_chunk_provider_identifier_valid(const char *identifier)
+{
+	unsigned int index;
+
+	if (!identifier || !identifier[0])
+		return false;
+	for (index = 0; index <= IS_REMOTE_CHUNK_PROVIDER_ID_MAX; index++) {
+		unsigned char character = (unsigned char)identifier[index];
+
+		if (!character)
+			return true;
+		if (!is_remote_chunk_identifier_character_valid(character,
+			index == 0))
+			return false;
+	}
+	return false;
+}
+
+static int is_remote_chunk_roster_validate(
+	const struct is_remote_chunk_config *config)
+{
+	unsigned int index;
+
+	if (config->provider_count > IS_REMOTE_CHUNK_MAX_PROVIDERS ||
+	    (config->provider_count && !config->providers))
+		return -EINVAL;
+	if (!config->placement_sample_size ||
+	    config->placement_sample_size > IS_REMOTE_CHUNK_MAX_PROVIDERS)
+		return -ERANGE;
+	if (!config->provider_count) {
+		if (config->mode == IS_REMOTE_CHUNK_MODE_REMOTE_ONLY)
+			return -EINVAL;
+		return 0;
+	}
+	if (config->placement_sample_size > config->provider_count)
+		return -ERANGE;
+	for (index = 0; index < config->provider_count; index++) {
+		const struct is_remote_chunk_provider_config *provider =
+			&config->providers[index];
+		unsigned int previous;
+
+		if (!is_remote_chunk_provider_identifier_valid(provider->identifier))
+			return -EINVAL;
+		if (provider->placement_weight <
+				IS_REMOTE_CHUNK_PLACEMENT_WEIGHT_MIN ||
+		    provider->placement_weight >
+				IS_REMOTE_CHUNK_PLACEMENT_WEIGHT_MAX)
+			return -ERANGE;
+		for (previous = 0; previous < index; previous++) {
+			if (!strcmp(config->providers[previous].identifier,
+				provider->identifier))
+				return -EINVAL;
+		}
+	}
+	return 0;
+}
+
 bool is_remote_chunk_provider_handle_equal(
 	struct is_remote_chunk_provider_handle left,
 	struct is_remote_chunk_provider_handle right)
@@ -310,12 +396,35 @@ bool is_remote_chunk_provider_handle_equal(
 		left.opaque[1] == right.opaque[1];
 }
 
+static int is_remote_chunk_provider_index_locked(
+	const struct is_remote_chunk_module *module,
+	struct is_remote_chunk_provider_handle provider,
+	unsigned int *provider_index_out)
+{
+	unsigned int index;
+
+	for (index = 0; index < module->provider_count; index++) {
+		const struct is_remote_chunk_provider *candidate =
+			&module->providers[index];
+
+		if (!is_remote_chunk_provider_handle_equal(candidate->handle,
+			provider))
+			continue;
+		if (candidate->failed)
+			return -ESTALE;
+		if (provider_index_out)
+			*provider_index_out = index;
+		return 0;
+	}
+	return -ESTALE;
+}
+
 static bool is_remote_chunk_provider_valid_locked(
 	const struct is_remote_chunk_module *module,
 	struct is_remote_chunk_provider_handle provider)
 {
-	return provider.opaque[0] == module->identity && provider.opaque[1] &&
-		provider.opaque[1] <= module->next_provider_serial;
+	return is_remote_chunk_provider_index_locked(module, provider,
+		NULL) == 0;
 }
 
 static unsigned long long is_remote_chunk_batch_digest(
@@ -678,9 +787,12 @@ static int is_remote_chunk_mapping_begin_locked(
 
 int is_remote_chunk_module_create(
 	const struct is_remote_chunk_config *config,
+	struct is_remote_chunk_provider_handle *provider_handles_out,
+	unsigned int provider_handle_capacity,
 	struct is_remote_chunk_module **module_out)
 {
 	struct is_remote_chunk_module *module;
+	unsigned int index;
 	int status;
 
 	if (!module_out)
@@ -692,6 +804,13 @@ int is_remote_chunk_module_create(
 		return -EINVAL;
 	if (!is_remote_chunk_hot_policy_valid(&config->hot_policy))
 		return -ERANGE;
+	status = is_remote_chunk_roster_validate(config);
+	if (status)
+		return status;
+	if (config->provider_count &&
+	    (!provider_handles_out ||
+	     provider_handle_capacity < config->provider_count))
+		return -ENOSPC;
 
 	module = is_remote_chunk_allocate(sizeof(*module));
 	if (!module)
@@ -699,47 +818,80 @@ int is_remote_chunk_module_create(
 	module->chunks = is_remote_chunk_allocate_array(config->chunk_count,
 		sizeof(*module->chunks));
 	if (!module->chunks) {
-		is_remote_chunk_free(module);
-		return -ENOMEM;
+		status = -ENOMEM;
+		goto free_module;
+	}
+	if (config->provider_count) {
+		module->providers = is_remote_chunk_allocate_array(
+			config->provider_count, sizeof(*module->providers));
+		module->placement_candidates = is_remote_chunk_allocate_array(
+			config->provider_count,
+			sizeof(*module->placement_candidates));
+		module->placement_sample = is_remote_chunk_allocate_array(
+			config->provider_count, sizeof(*module->placement_sample));
+		if (!module->providers || !module->placement_candidates ||
+		    !module->placement_sample) {
+			status = -ENOMEM;
+			goto free_provider_storage;
+		}
 	}
 	module->valid_sectors = is_remote_chunk_validity_allocate(
 		(size_t)config->chunk_count * IS_REMOTE_CHUNK_SECTORS_PER_CHUNK /
 		IS_REMOTE_CHUNK_BITS_PER_WORD);
 	if (!module->valid_sectors) {
-		is_remote_chunk_free(module->chunks);
-		is_remote_chunk_free(module);
-		return -ENOMEM;
+		status = -ENOMEM;
+		goto free_provider_storage;
 	}
 	status = is_remote_chunk_lock_init(&module->lock);
 	if (status) {
-		is_remote_chunk_validity_free(module->valid_sectors);
-		is_remote_chunk_free(module->chunks);
-		is_remote_chunk_free(module);
-		return status < 0 ? status : -status;
+		status = status < 0 ? status : -status;
+		goto free_validity;
 	}
 	status = is_remote_chunk_wait_init(module);
-	if (status) {
-		is_remote_chunk_lock_destroy(&module->lock);
-		is_remote_chunk_validity_free(module->valid_sectors);
-		is_remote_chunk_free(module->chunks);
-		is_remote_chunk_free(module);
-		return status;
-	}
+	if (status)
+		goto destroy_lock;
 	module->identity = is_remote_chunk_allocate_module_identity();
-	if (!module->identity ||
-	    module->identity == IS_REMOTE_CHUNK_ID_MAX) {
-		is_remote_chunk_wait_destroy(module);
-		is_remote_chunk_lock_destroy(&module->lock);
-		is_remote_chunk_validity_free(module->valid_sectors);
-		is_remote_chunk_free(module->chunks);
-		is_remote_chunk_free(module);
-		return -EOVERFLOW;
+	if (!module->identity || module->identity == IS_REMOTE_CHUNK_ID_MAX) {
+		status = -EOVERFLOW;
+		goto destroy_wait;
 	}
 	module->mode = config->mode;
 	module->chunk_count = config->chunk_count;
+	module->provider_count = config->provider_count;
+	module->placement_sample_size = config->placement_sample_size;
+	module->placement_seed = config->placement_seed;
 	module->hot_policy = config->hot_policy;
+	for (index = 0; index < config->provider_count; index++) {
+		struct is_remote_chunk_provider *provider =
+			&module->providers[index];
+
+		provider->handle.opaque[0] = module->identity;
+		provider->handle.opaque[1] = (unsigned long long)index + 1ULL;
+		strcpy(provider->identifier, config->providers[index].identifier);
+		provider->placement_weight =
+			config->providers[index].placement_weight;
+	}
+
+	/* Caller-visible state is the final step of the all-or-nothing create. */
+	for (index = 0; index < config->provider_count; index++)
+		provider_handles_out[index] = module->providers[index].handle;
 	*module_out = module;
 	return 0;
+
+destroy_wait:
+	is_remote_chunk_wait_destroy(module);
+destroy_lock:
+	is_remote_chunk_lock_destroy(&module->lock);
+free_validity:
+	is_remote_chunk_validity_free(module->valid_sectors);
+free_provider_storage:
+	is_remote_chunk_free(module->placement_sample);
+	is_remote_chunk_free(module->placement_candidates);
+	is_remote_chunk_free(module->providers);
+	is_remote_chunk_free(module->chunks);
+free_module:
+	is_remote_chunk_free(module);
+	return status;
 }
 
 int is_remote_chunk_module_quiesce(struct is_remote_chunk_module *module)
@@ -780,32 +932,104 @@ int is_remote_chunk_module_destroy(struct is_remote_chunk_module *module)
 	is_remote_chunk_wait_destroy(module);
 	is_remote_chunk_lock_destroy(&module->lock);
 	is_remote_chunk_validity_free(module->valid_sectors);
+	is_remote_chunk_free(module->placement_sample);
+	is_remote_chunk_free(module->placement_candidates);
+	is_remote_chunk_free(module->providers);
 	is_remote_chunk_free(module->chunks);
 	is_remote_chunk_free(module);
 	return 0;
 }
 
-int is_remote_chunk_provider_handle_create(
+static bool is_remote_chunk_provider_observation_valid(
+	const struct is_remote_chunk_provider_observation *observation)
+{
+	if (!observation ||
+	    observation->exclusion < IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_NONE ||
+	    observation->exclusion >
+		IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_ZERO_CAPACITY)
+		return false;
+	if (observation->placement_eligible)
+		return observation->available_chunks > 0 &&
+			observation->exclusion ==
+				IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_NONE;
+	if (observation->exclusion == IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_NONE)
+		return false;
+	if (observation->exclusion ==
+		IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_ZERO_CAPACITY)
+		return observation->available_chunks == 0;
+	return true;
+}
+
+static bool is_remote_chunk_provider_observation_equal(
+	const struct is_remote_chunk_provider *provider,
+	const struct is_remote_chunk_provider_observation *observation)
+{
+	return provider->observation_sequence == observation->sequence &&
+		provider->reported_available_chunks ==
+			observation->available_chunks &&
+		provider->exclusion == observation->exclusion &&
+		(provider->placement_eligible != 0) ==
+			observation->placement_eligible;
+}
+
+enum is_remote_chunk_provider_observation_result
+is_remote_chunk_provider_observe(
 	struct is_remote_chunk_module *module,
-	struct is_remote_chunk_provider_handle *provider_out)
+	struct is_remote_chunk_provider_handle provider_handle,
+	const struct is_remote_chunk_provider_observation *observation)
 {
 	is_remote_chunk_lock_flags_t flags = 0;
+	struct is_remote_chunk_provider *provider;
+	unsigned int provider_index;
+	unsigned int assigned_chunks = 0;
+	unsigned int index;
+	enum is_remote_chunk_provider_observation_result result;
 
-	if (!module || !provider_out)
-		return -EINVAL;
+	if (!module || !is_remote_chunk_provider_observation_valid(observation))
+		return IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_INVALID;
 	is_remote_chunk_lock(&module->lock, &flags);
 	if (module->quiescing) {
-		is_remote_chunk_unlock(&module->lock, &flags);
-		return -ESHUTDOWN;
+		result = IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_SHUTDOWN;
+		goto out;
 	}
-	if (module->next_provider_serial == IS_REMOTE_CHUNK_ID_MAX) {
-		is_remote_chunk_unlock(&module->lock, &flags);
-		return -EOVERFLOW;
+	if (is_remote_chunk_provider_index_locked(module, provider_handle,
+		&provider_index)) {
+		result = IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_STALE_EPOCH;
+		goto out;
 	}
-	provider_out->opaque[0] = module->identity;
-	provider_out->opaque[1] = ++module->next_provider_serial;
+	provider = &module->providers[provider_index];
+	if (provider->has_observation &&
+	    observation->sequence < provider->observation_sequence) {
+		result = IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_STALE;
+		goto out;
+	}
+	if (provider->has_observation &&
+	    observation->sequence == provider->observation_sequence) {
+		result = is_remote_chunk_provider_observation_equal(provider,
+			observation) ?
+			IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_DUPLICATE :
+			IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_CONFLICT;
+		goto out;
+	}
+	for (index = 0; index < module->chunk_count; index++) {
+		const struct is_remote_chunk *chunk = &module->chunks[index];
+
+		if ((chunk->state == IS_REMOTE_CHUNK_MAPPED ||
+		     chunk->state == IS_REMOTE_CHUNK_EVICTING) &&
+		    is_remote_chunk_provider_handle_equal(chunk->provider,
+			provider_handle))
+			assigned_chunks++;
+	}
+	provider->reported_available_chunks = observation->available_chunks;
+	provider->observation_assigned_chunks = assigned_chunks;
+	provider->observation_sequence = observation->sequence;
+	provider->exclusion = observation->exclusion;
+	provider->placement_eligible = observation->placement_eligible;
+	provider->has_observation = 1;
+	result = IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_APPLIED;
+out:
 	is_remote_chunk_unlock(&module->lock, &flags);
-	return 0;
+	return result;
 }
 
 int is_remote_chunk_hot_policy_snapshot(
@@ -1463,13 +1687,15 @@ int is_remote_chunk_provider_failed(
 	is_remote_chunk_lock_flags_t flags = 0;
 	unsigned int mapping_claims = 0;
 	unsigned int eviction_claims = 0;
+	unsigned int provider_index;
 	unsigned int index;
 	int status = 0;
 
 	if (!module || !facts_out)
 		return -EINVAL;
 	is_remote_chunk_lock(&module->lock, &flags);
-	if (!is_remote_chunk_provider_valid_locked(module, provider)) {
+	if (is_remote_chunk_provider_index_locked(module, provider,
+		&provider_index)) {
 		status = -ESTALE;
 		goto out;
 	}
@@ -1526,6 +1752,10 @@ int is_remote_chunk_provider_failed(
 	module->usable_chunks -= facts.usable_chunks;
 	module->active_mapping_claims -= mapping_claims;
 	module->active_eviction_claims -= eviction_claims;
+	module->providers[provider_index].failed = 1;
+	module->providers[provider_index].placement_eligible = 0;
+	module->providers[provider_index].exclusion =
+		IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_UNHEALTHY;
 	is_remote_chunk_wake_lease_waiters_locked(module);
 	*facts_out = facts;
 out:
@@ -1738,8 +1968,7 @@ static unsigned int is_remote_chunk_snapshot_provider_index(
 			snapshot->providers[index].provider, provider))
 			return index;
 	}
-	snapshot->providers[snapshot->provider_count].provider = provider;
-	return snapshot->provider_count++;
+	return snapshot->provider_count;
 }
 
 int is_remote_chunk_snapshot_take(
@@ -1759,11 +1988,12 @@ int is_remote_chunk_snapshot_take(
 	snapshot = is_remote_chunk_allocate(sizeof(*snapshot));
 	if (!snapshot)
 		return -ENOMEM;
-	snapshot->providers = is_remote_chunk_allocate_array(module->chunk_count,
+	snapshot->providers = is_remote_chunk_allocate_array(module->provider_count,
 		sizeof(*snapshot->providers));
 	snapshot->placements = is_remote_chunk_allocate_array(module->chunk_count,
 		sizeof(*snapshot->placements));
-	if (!snapshot->providers || !snapshot->placements) {
+	if ((module->provider_count && !snapshot->providers) ||
+	    !snapshot->placements) {
 		is_remote_chunk_snapshot_release(snapshot);
 		return -ENOMEM;
 	}
@@ -1780,6 +2010,30 @@ int is_remote_chunk_snapshot_take(
 	snapshot->latest_invariant = module->latest_invariant;
 	snapshot->quiescing = module->quiescing != 0;
 	snapshot->hot_policy = module->hot_policy;
+	snapshot->placement_sample_size = module->placement_sample_size;
+	snapshot->placement_seed = module->placement_seed;
+	snapshot->provider_count = module->provider_count;
+	for (index = 0; index < module->provider_count; index++) {
+		const struct is_remote_chunk_provider *provider =
+			&module->providers[index];
+		struct is_remote_chunk_provider_snapshot *provider_snapshot =
+			&snapshot->providers[index];
+
+		provider_snapshot->provider = provider->handle;
+		strcpy(provider_snapshot->identifier, provider->identifier);
+		provider_snapshot->placement_weight = provider->placement_weight;
+		provider_snapshot->reported_available_chunks =
+			provider->reported_available_chunks;
+		provider_snapshot->observation_assigned_chunks =
+			provider->observation_assigned_chunks;
+		provider_snapshot->observation_sequence =
+			provider->observation_sequence;
+		provider_snapshot->exclusion = provider->exclusion;
+		provider_snapshot->placement_eligible =
+			provider->placement_eligible != 0;
+		provider_snapshot->has_observation = provider->has_observation != 0;
+		provider_snapshot->failed = provider->failed != 0;
+	}
 	for (index = 0; index < module->chunk_count; index++) {
 		const struct is_remote_chunk *chunk = &module->chunks[index];
 
@@ -1800,6 +2054,11 @@ int is_remote_chunk_snapshot_take(
 					chunk->provider);
 			bool usable = chunk->state == IS_REMOTE_CHUNK_MAPPED;
 
+			if (provider_index >= snapshot->provider_count) {
+				is_remote_chunk_unlock(&module->lock, &flags);
+				is_remote_chunk_snapshot_release(snapshot);
+				return -EINVAL;
+			}
 			placement->provider = chunk->provider;
 			placement->logical_chunk = index;
 			placement->usable = usable;

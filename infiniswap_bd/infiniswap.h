@@ -172,6 +172,9 @@ struct is_device {
 	struct blk_mq_tag_set tag_set;
 	struct gendisk *disk;
 	struct is_remote_chunk_module *remote_chunks;
+	unsigned int remote_chunk_provider_count;
+	struct is_remote_chunk_provider_handle
+		remote_chunk_provider_handles[IS_MAX_PROVIDERS];
 	struct is_remote_io_transaction_engine transaction_engine;
 	struct is_rdma_fabric *rdma;
 };

@@ -13,6 +13,10 @@
 #define IS_REMOTE_CHUNK_EVICTION_CLAIM_BYTES 64U
 #define IS_REMOTE_CHUNK_IO_LEASE_BYTES 64U
 #define IS_REMOTE_CHUNK_MAX_CHUNKS 128U
+#define IS_REMOTE_CHUNK_MAX_PROVIDERS 64U
+#define IS_REMOTE_CHUNK_PROVIDER_ID_MAX 63U
+#define IS_REMOTE_CHUNK_PLACEMENT_WEIGHT_MIN 1U
+#define IS_REMOTE_CHUNK_PLACEMENT_WEIGHT_MAX 1000U
 #define IS_REMOTE_CHUNK_HOT_WEIGHT_MAX 1000000U
 #define IS_REMOTE_CHUNK_SECTOR_BYTES 512U
 #define IS_REMOTE_CHUNK_SECTORS_PER_CHUNK (1ULL << 21)
@@ -63,10 +67,19 @@ struct is_remote_chunk_hot_policy {
 	unsigned int write_weight;
 };
 
+struct is_remote_chunk_provider_config {
+	char identifier[IS_REMOTE_CHUNK_PROVIDER_ID_MAX + 1U];
+	unsigned int placement_weight;
+};
+
 struct is_remote_chunk_config {
 	enum is_remote_chunk_mode mode;
 	unsigned int chunk_count;
 	struct is_remote_chunk_hot_policy hot_policy;
+	const struct is_remote_chunk_provider_config *providers;
+	unsigned int provider_count;
+	unsigned int placement_sample_size;
+	unsigned long long placement_seed;
 };
 
 /* Stable, copyable identity for one Memory Provider connection epoch. */
@@ -137,6 +150,38 @@ struct is_remote_chunk_provider_activity {
 	unsigned long long activity;
 };
 
+enum is_remote_chunk_provider_exclusion {
+	IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_NONE = 0,
+	IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_UNHEALTHY,
+	IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_IDENTITY,
+	IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_VERSION,
+	IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_CAPABILITY,
+	IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_POOL,
+	IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_RAIL,
+	IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_ZERO_CAPACITY,
+};
+
+/*
+ * Availability is for the module mode's only relevant pool: Opportunistic in
+ * Backed Mode and Committed in Remote-Only Mode.
+ */
+struct is_remote_chunk_provider_observation {
+	unsigned long long sequence;
+	unsigned int available_chunks;
+	enum is_remote_chunk_provider_exclusion exclusion;
+	bool placement_eligible;
+};
+
+enum is_remote_chunk_provider_observation_result {
+	IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_APPLIED = 0,
+	IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_STALE,
+	IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_DUPLICATE,
+	IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_CONFLICT,
+	IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_INVALID,
+	IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_STALE_EPOCH,
+	IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_SHUTDOWN,
+};
+
 struct is_remote_chunk_provider_failure_facts {
 	unsigned int affected_chunks;
 	unsigned int assigned_chunks;
@@ -148,8 +193,17 @@ struct is_remote_chunk_provider_failure_facts {
 
 struct is_remote_chunk_provider_snapshot {
 	struct is_remote_chunk_provider_handle provider;
+	char identifier[IS_REMOTE_CHUNK_PROVIDER_ID_MAX + 1U];
+	unsigned int placement_weight;
 	unsigned int assigned_chunks;
 	unsigned int usable_chunks;
+	unsigned int reported_available_chunks;
+	unsigned int observation_assigned_chunks;
+	unsigned long long observation_sequence;
+	enum is_remote_chunk_provider_exclusion exclusion;
+	bool placement_eligible;
+	bool has_observation;
+	bool failed;
 };
 
 struct is_remote_chunk_placement_snapshot {
@@ -175,25 +229,37 @@ struct is_remote_chunk_snapshot {
 	enum is_remote_chunk_invariant_event latest_invariant;
 	bool quiescing;
 	struct is_remote_chunk_hot_policy hot_policy;
+	unsigned int placement_sample_size;
+	unsigned long long placement_seed;
 	unsigned int provider_count;
 	struct is_remote_chunk_provider_snapshot *providers;
 	unsigned int placement_count;
 	struct is_remote_chunk_placement_snapshot *placements;
 };
 
+/*
+ * Creation copies the complete immutable roster and publishes all initial
+ * epoch handles only after the module is ready. The handle output is optional
+ * only for an empty roster.
+ */
 int is_remote_chunk_module_create(
 	const struct is_remote_chunk_config *config,
+	struct is_remote_chunk_provider_handle *provider_handles_out,
+	unsigned int provider_handle_capacity,
 	struct is_remote_chunk_module **module_out);
 /* Destroy enters quiesce before refusing any active claims, waits, or leases. */
 int is_remote_chunk_module_quiesce(struct is_remote_chunk_module *module);
 int is_remote_chunk_module_destroy(struct is_remote_chunk_module *module);
 
-int is_remote_chunk_provider_handle_create(
-	struct is_remote_chunk_module *module,
-	struct is_remote_chunk_provider_handle *provider_out);
 bool is_remote_chunk_provider_handle_equal(
 	struct is_remote_chunk_provider_handle left,
 	struct is_remote_chunk_provider_handle right);
+
+enum is_remote_chunk_provider_observation_result
+is_remote_chunk_provider_observe(
+	struct is_remote_chunk_module *module,
+	struct is_remote_chunk_provider_handle provider,
+	const struct is_remote_chunk_provider_observation *observation);
 
 int is_remote_chunk_hot_policy_snapshot(
 	struct is_remote_chunk_module *module,
