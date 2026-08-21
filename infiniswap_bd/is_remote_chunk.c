@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-only OR BSD-3-Clause */
 #include "is_remote_chunk.h"
 
+#define IS_REMOTE_CHUNK_ID_MAX (~0ULL)
+
 #ifdef __KERNEL__
 #include <linux/atomic.h>
 #include <linux/build_bug.h>
@@ -69,8 +71,22 @@ static void is_remote_chunk_validity_free(unsigned long *validity)
 
 static unsigned long long is_remote_chunk_allocate_module_identity(void)
 {
-	return (unsigned long long)atomic64_inc_return(
-		&is_remote_chunk_next_module_identity);
+	s64 current = atomic64_read(&is_remote_chunk_next_module_identity);
+
+	for (;;) {
+		unsigned long long current_value = (unsigned long long)current;
+		unsigned long long next_value;
+		s64 observed;
+
+		if (current_value >= IS_REMOTE_CHUNK_ID_MAX - 1ULL)
+			return 0;
+		next_value = current_value + 1ULL;
+		observed = atomic64_cmpxchg(&is_remote_chunk_next_module_identity,
+			current, (s64)next_value);
+		if (observed == current)
+			return next_value;
+		current = observed;
+	}
 }
 #else
 #include <errno.h>
@@ -142,8 +158,20 @@ static void is_remote_chunk_validity_free(unsigned long *validity)
 
 static unsigned long long is_remote_chunk_allocate_module_identity(void)
 {
-	return atomic_fetch_add_explicit(&is_remote_chunk_next_module_identity, 1,
-		memory_order_relaxed) + 1;
+	unsigned long long current = atomic_load_explicit(
+		&is_remote_chunk_next_module_identity, memory_order_relaxed);
+
+	for (;;) {
+		unsigned long long next;
+
+		if (current >= IS_REMOTE_CHUNK_ID_MAX - 1ULL)
+			return 0;
+		next = current + 1ULL;
+		if (atomic_compare_exchange_weak_explicit(
+			&is_remote_chunk_next_module_identity, &current, next,
+			memory_order_relaxed, memory_order_relaxed))
+			return next;
+	}
 }
 #endif
 
@@ -151,7 +179,6 @@ static unsigned long long is_remote_chunk_allocate_module_identity(void)
 #define IS_REMOTE_CHUNK_EVICTION_MAGIC 0x4953434845564943ULL
 #define IS_REMOTE_CHUNK_LEASE_MAGIC 0x495343484c454153ULL
 #define IS_REMOTE_CHUNK_ACTIVITY_MAX (~0ULL >> 1)
-#define IS_REMOTE_CHUNK_ID_MAX (~0ULL)
 #define IS_REMOTE_CHUNK_DIGEST_OFFSET 1469598103934665603ULL
 #define IS_REMOTE_CHUNK_DIGEST_PRIME 1099511628211ULL
 #define IS_REMOTE_CHUNK_BITS_PER_WORD (sizeof(unsigned long) * 8U)

@@ -2855,19 +2855,23 @@ ssize_t is_rdma_provider_runtime_status_show(
 
 	if (!fabric || !snapshot)
 		return sysfs_emit(page, "\n");
-	for (index = 0; index < fabric->session_count; index++) {
-		struct is_rdma_session *session = fabric->sessions[index];
+	for (index = 0; index < snapshot->provider_count; index++) {
 		const struct is_remote_chunk_provider_snapshot *provider =
-			is_snapshot_provider(snapshot, session->provider_handle);
-		unsigned int mapped = provider ? provider->usable_chunks : 0;
+			&snapshot->providers[index];
+		struct is_rdma_session *session = is_fabric_session_for_provider(
+			fabric, provider->provider);
+		const char *state = session ? is_session_runtime_state(session) :
+			(atomic_read(&device->remote_lost) ? "remote-lost" :
+			 "not-connected");
+		unsigned int mapped = provider->usable_chunks;
 		unsigned int available =
 			is_provider_snapshot_available_chunks(provider);
+		int last_error = session ? READ_ONCE(session->last_error) : 0;
 
 		if (written >= PAGE_SIZE - 128)
 			break;
 		written += sysfs_emit_at(page, written, "%u %s %u %u %d\n",
-			index, is_session_runtime_state(session), available, mapped,
-			READ_ONCE(session->last_error));
+			index, state, available, mapped, last_error);
 	}
 	if (!written)
 		written = sysfs_emit(page, "\n");
