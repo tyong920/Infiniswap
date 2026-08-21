@@ -161,14 +161,15 @@ struct concurrent_next_mapping {
 	enum is_remote_chunk_next_mapping_result result;
 };
 
-struct concurrent_commit {
+struct concurrent_mapping_finish {
 	struct is_remote_chunk_module *module;
 	const struct is_remote_chunk_mapping_claim *claim;
+	enum is_remote_chunk_mapping_finish_action action;
 	struct is_remote_chunk_provider_handle provider;
 	const struct is_remote_chunk_mapping_grant *grants;
 	unsigned int grant_count;
 	struct test_gate *start;
-	int status;
+	enum is_remote_chunk_mapping_finish_result result;
 };
 
 struct concurrent_snapshot {
@@ -209,6 +210,44 @@ static struct is_remote_chunk_mapping_grant mapping_grant(
 	return grant;
 }
 
+static int finish_mapping_commit(struct is_remote_chunk_module *module,
+	const struct is_remote_chunk_mapping_claim *claim,
+	struct is_remote_chunk_provider_handle provider,
+	const struct is_remote_chunk_mapping_grant *grants,
+	unsigned int grant_count)
+{
+	enum is_remote_chunk_mapping_finish_result result =
+		is_remote_chunk_mapping_finish(module, claim,
+			IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT, provider, grants,
+			grant_count);
+
+	switch (result) {
+	case IS_REMOTE_CHUNK_MAPPING_FINISH_COMMITTED:
+		return 0;
+	case IS_REMOTE_CHUNK_MAPPING_FINISH_STALE:
+	case IS_REMOTE_CHUNK_MAPPING_FINISH_DUPLICATE:
+	case IS_REMOTE_CHUNK_MAPPING_FINISH_CONFLICT:
+		return -ESTALE;
+	case IS_REMOTE_CHUNK_MAPPING_FINISH_SHUTDOWN:
+		return -ESHUTDOWN;
+	case IS_REMOTE_CHUNK_MAPPING_FINISH_EXHAUSTED:
+		return -EOVERFLOW;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int finish_mapping_abort(struct is_remote_chunk_module *module,
+	const struct is_remote_chunk_mapping_claim *claim,
+	struct is_remote_chunk_provider_handle provider)
+{
+	enum is_remote_chunk_mapping_finish_result result =
+		is_remote_chunk_mapping_finish(module, claim,
+			IS_REMOTE_CHUNK_MAPPING_FINISH_ABORT, provider, NULL, 0);
+
+	return result == IS_REMOTE_CHUNK_MAPPING_FINISH_ABORTED ? 0 : -ESTALE;
+}
+
 static int commit_mapping_request(struct is_remote_chunk_module *module,
 	const struct is_remote_chunk_mapping_request *request,
 	unsigned int provider_chunk)
@@ -216,7 +255,7 @@ static int commit_mapping_request(struct is_remote_chunk_module *module,
 	struct is_remote_chunk_mapping_grant grant =
 		mapping_grant(request->logical_chunk, provider_chunk);
 
-	return is_remote_chunk_mapping_commit(module, &request->claim,
+	return finish_mapping_commit(module, &request->claim,
 		request->provider, &grant, 1);
 }
 
@@ -270,7 +309,7 @@ static int begin_backed_mapping(
 		return -ENOENT;
 	if (!is_remote_chunk_provider_handle_equal(request.provider,
 		expected_provider)) {
-		(void)is_remote_chunk_mapping_abort(module, &request.claim);
+		(void)finish_mapping_abort(module, &request.claim, request.provider);
 		return -ESTALE;
 	}
 	*claim_out = request.claim;
@@ -310,10 +349,10 @@ static int map_backed_chunk(struct is_remote_chunk_module *module,
 	if (!status)
 		request.provider = provider;
 	if (!status)
-		status = is_remote_chunk_mapping_commit(module, &request.claim,
+		status = finish_mapping_commit(module, &request.claim,
 			request.provider, &grant, 1);
 	if (status)
-		(void)is_remote_chunk_mapping_abort(module, &request.claim);
+		(void)finish_mapping_abort(module, &request.claim, provider);
 	return status;
 }
 
@@ -330,10 +369,10 @@ static int map_remote_only_chunk(struct is_remote_chunk_module *module,
 
 	if (status)
 		return status;
-	status = is_remote_chunk_mapping_commit(module, &claim, provider,
+	status = finish_mapping_commit(module, &claim, provider,
 		&grant, 1);
 	if (status)
-		(void)is_remote_chunk_mapping_abort(module, &claim);
+		(void)finish_mapping_abort(module, &claim, provider);
 	return status;
 }
 
@@ -631,11 +670,11 @@ static int test_next_mapping_reports_idle_capacity_and_active_claim(void)
 	    request.logical_chunk != 2 ||
 	    is_remote_chunk_next_mapping(module, &blocked) !=
 		IS_REMOTE_CHUNK_NEXT_MAPPING_CLAIM_ACTIVE ||
-	    is_remote_chunk_mapping_abort(module, &request.claim) ||
+	    finish_mapping_abort(module, &request.claim, request.provider) ||
 	    is_remote_chunk_next_mapping(module, &request) !=
 		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST ||
 	    request.logical_chunk != 2 ||
-	    is_remote_chunk_mapping_abort(module, &request.claim))
+	    finish_mapping_abort(module, &request.claim, request.provider))
 		failed = 1;
 	failed |= is_remote_chunk_module_destroy(module) != 0;
 	return failed;
@@ -671,7 +710,7 @@ static int test_deterministic_placement_prefers_sampled_capacity(void)
 		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST ||
 	    !is_remote_chunk_provider_handle_equal(request.provider,
 		providers[2]) || request.logical_chunk != 0 ||
-	    is_remote_chunk_mapping_abort(module, &request.claim))
+	    finish_mapping_abort(module, &request.claim, request.provider))
 		failed = 1;
 	failed |= is_remote_chunk_module_destroy(module) != 0;
 	return failed;
@@ -711,7 +750,7 @@ static int test_weights_bias_sampling_with_d_equals_one(void)
 			second_wins++;
 		else
 			return 1;
-		if (is_remote_chunk_mapping_abort(module, &request.claim) ||
+		if (finish_mapping_abort(module, &request.claim, request.provider) ||
 		    is_remote_chunk_module_destroy(module))
 			return 1;
 	}
@@ -760,7 +799,7 @@ static int test_exclusions_clamping_and_stable_ties(void)
 		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST ||
 	    !is_remote_chunk_provider_handle_equal(request.provider,
 		providers[1]) ||
-	    is_remote_chunk_mapping_abort(module, &request.claim))
+	    finish_mapping_abort(module, &request.claim, request.provider))
 		failed = 1;
 	failed |= is_remote_chunk_module_destroy(module) != 0;
 	return failed;
@@ -786,26 +825,26 @@ static int test_effective_capacity_tracks_assignments_and_abort(void)
 	    !is_remote_chunk_provider_handle_equal(request.provider, first))
 		return 1;
 	grant = mapping_grant(request.logical_chunk, 80);
-	if (is_remote_chunk_mapping_commit(module, &request.claim,
+	if (finish_mapping_commit(module, &request.claim,
 		request.provider, &grant, 1))
 		return 1;
 	if (is_remote_chunk_next_mapping(module, &request) !=
 		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST ||
 	    !is_remote_chunk_provider_handle_equal(request.provider, second) ||
-	    is_remote_chunk_mapping_abort(module, &request.claim))
+	    finish_mapping_abort(module, &request.claim, request.provider))
 		failed = 1;
 	if (is_remote_chunk_next_mapping(module, &request) !=
 		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST ||
 	    !is_remote_chunk_provider_handle_equal(request.provider, second))
 		failed = 1;
 	grant = mapping_grant(request.logical_chunk, 81);
-	if (is_remote_chunk_mapping_commit(module, &request.claim,
+	if (finish_mapping_commit(module, &request.claim,
 		request.provider, &grant, 1))
 		failed = 1;
 	if (is_remote_chunk_next_mapping(module, &request) !=
 		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST ||
 	    !is_remote_chunk_provider_handle_equal(request.provider, first) ||
-	    is_remote_chunk_mapping_abort(module, &request.claim))
+	    finish_mapping_abort(module, &request.claim, request.provider))
 		failed = 1;
 	failed |= is_remote_chunk_module_destroy(module) != 0;
 	return failed;
@@ -834,19 +873,19 @@ static int test_observation_during_claim_tracks_reserved_baseline(void)
 		return 1;
 	if (is_remote_chunk_provider_observe(module, provider, &observed_claim) !=
 		IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_APPLIED ||
-	    is_remote_chunk_mapping_abort(module, &request.claim) ||
+	    finish_mapping_abort(module, &request.claim, request.provider) ||
 	    is_remote_chunk_next_mapping(module, &request) !=
 		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST)
 		failed = 1;
 	grant = mapping_grant(request.logical_chunk, 91);
-	if (!failed && is_remote_chunk_mapping_commit(module, &request.claim,
+	if (!failed && finish_mapping_commit(module, &request.claim,
 		request.provider, &grant, 1))
 		failed = 1;
 	if (!failed && is_remote_chunk_next_mapping(module, &request) !=
 		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST)
 		failed = 1;
 	grant = mapping_grant(request.logical_chunk, 92);
-	if (!failed && is_remote_chunk_mapping_commit(module, &request.claim,
+	if (!failed && finish_mapping_commit(module, &request.claim,
 		request.provider, &grant, 1))
 		failed = 1;
 	if (!failed && is_remote_chunk_next_mapping(module, &request) !=
@@ -877,7 +916,7 @@ static int test_remote_only_waits_for_complete_provider_facts(void)
 	    request.pool != IS_REMOTE_CHUNK_MAPPING_POOL_COMMITTED ||
 	    request.logical_chunk != 0 ||
 	    !is_remote_chunk_provider_handle_equal(request.provider, first) ||
-	    is_remote_chunk_mapping_abort(module, &request.claim))
+	    finish_mapping_abort(module, &request.claim, request.provider))
 		failed = 1;
 	failed |= is_remote_chunk_module_destroy(module) != 0;
 	return failed;
@@ -922,7 +961,7 @@ static int test_remote_only_progresses_in_order_after_abort(void)
 	    request.logical_chunk != 0 ||
 	    is_remote_chunk_next_mapping(module, &blocked) !=
 		IS_REMOTE_CHUNK_NEXT_MAPPING_CLAIM_ACTIVE ||
-	    is_remote_chunk_mapping_abort(module, &request.claim) ||
+	    finish_mapping_abort(module, &request.claim, request.provider) ||
 	    is_remote_chunk_next_mapping(module, &request) !=
 		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST ||
 	    request.logical_chunk != 0)
@@ -987,7 +1026,7 @@ static int test_remote_only_uses_deterministic_multi_provider_selection(void)
 	    !is_remote_chunk_provider_handle_equal(request.provider, second) ||
 	    request.logical_chunk != 0 ||
 	    request.pool != IS_REMOTE_CHUNK_MAPPING_POOL_COMMITTED ||
-	    is_remote_chunk_mapping_abort(module, &request.claim))
+	    finish_mapping_abort(module, &request.claim, request.provider))
 		failed = 1;
 	failed |= is_remote_chunk_module_destroy(module) != 0;
 	return failed;
@@ -1015,6 +1054,7 @@ static int test_placement_lifecycle_does_not_allocate(void)
 	struct is_remote_chunk_mapping_request request = { 0 };
 	struct is_remote_chunk_mapping_request remote_request = { 0 };
 	struct is_remote_chunk_mapping_grant grant;
+	struct is_remote_chunk_provider_failure_facts failure_facts;
 	int failed = 0;
 
 	if (create_single_provider_module(&backed_config, &module, &provider) ||
@@ -1027,7 +1067,7 @@ static int test_placement_lifecycle_does_not_allocate(void)
 		IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_APPLIED ||
 	    is_remote_chunk_next_mapping(module, &request) !=
 		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST ||
-	    is_remote_chunk_mapping_abort(module, &request.claim) ||
+	    finish_mapping_abort(module, &request.claim, request.provider) ||
 	    is_remote_chunk_next_mapping(module, &request) !=
 		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST ||
 	    is_remote_chunk_provider_observe(remote_module, remote_provider,
@@ -1035,17 +1075,22 @@ static int test_placement_lifecycle_does_not_allocate(void)
 		IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_APPLIED ||
 	    is_remote_chunk_next_mapping(remote_module, &remote_request) !=
 		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST ||
-	    is_remote_chunk_mapping_abort(remote_module, &remote_request.claim) ||
+	    finish_mapping_abort(remote_module, &remote_request.claim,
+		remote_request.provider) ||
 	    is_remote_chunk_next_mapping(remote_module, &remote_request) !=
 		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST)
 		failed = 1;
 	grant = mapping_grant(request.logical_chunk, 90);
-	if (!failed && is_remote_chunk_mapping_commit(module, &request.claim,
+	if (!failed && finish_mapping_commit(module, &request.claim,
 		request.provider, &grant, 1))
 		failed = 1;
 	grant = mapping_grant(remote_request.logical_chunk, 91);
-	if (!failed && is_remote_chunk_mapping_commit(remote_module,
+	if (!failed && finish_mapping_commit(remote_module,
 		&remote_request.claim, remote_request.provider, &grant, 1))
+		failed = 1;
+	if (!failed && is_remote_chunk_provider_failed(remote_module,
+		remote_provider, &failure_facts) !=
+		IS_REMOTE_CHUNK_PROVIDER_FAILURE_APPLIED)
 		failed = 1;
 	track_allocations = false;
 	if (tracked_allocations)
@@ -1079,7 +1124,7 @@ static int test_explicit_mapping_commit_is_atomic(void)
 		logical_chunks, 2, &claim))
 		return 1;
 	failed |= expect_snapshot(module, 0, 0, 2, 1, 0, "mapping begin");
-	if (is_remote_chunk_mapping_commit(module, &claim, provider, grants, 2))
+	if (finish_mapping_commit(module, &claim, provider, grants, 2))
 		failed = 1;
 	failed |= expect_snapshot(module, 2, 2, 0, 0, 2, "mapping commit");
 	{
@@ -1118,7 +1163,7 @@ static int test_mapping_claim_is_module_wide(void)
 		return 1;
 	if (is_remote_chunk_mapping_begin_explicit(module, provider, &second_chunk,
 		1, &second) != -EBUSY ||
-	    is_remote_chunk_mapping_abort(module, &first))
+	    finish_mapping_abort(module, &first, provider))
 		failed = 1;
 	failed |= expect_snapshot(module, 0, 0, 0, 0, 0,
 		"module-wide mapping claim");
@@ -1131,6 +1176,8 @@ static int test_malformed_commit_does_not_partially_map(void)
 	struct is_remote_chunk_module *module = NULL;
 	struct is_remote_chunk_provider_handle provider;
 	struct is_remote_chunk_mapping_claim claim =
+		IS_REMOTE_CHUNK_MAPPING_CLAIM_INIT;
+	struct is_remote_chunk_mapping_claim malformed_claim =
 		IS_REMOTE_CHUNK_MAPPING_CLAIM_INIT;
 	const unsigned int logical_chunks[] = { 0, 1 };
 	struct is_remote_chunk_mapping_grant grants[] = {
@@ -1145,8 +1192,14 @@ static int test_malformed_commit_does_not_partially_map(void)
 		mapping_grant(0, 33),
 		mapping_grant(1, 34),
 	};
+	struct is_remote_chunk_mapping_grant incomplete_grants[] = {
+		mapping_grant(0, 35),
+		mapping_grant(1, 36),
+	};
+	const struct is_remote_chunk_provider_handle malformed_provider = { 0 };
 	int failed = 0;
 
+	incomplete_grants[1].remote_key = 0;
 	overflow_grants[1].remote_address = ~0ULL -
 		(IS_REMOTE_CHUNK_SECTORS_PER_CHUNK *
 		 IS_REMOTE_CHUNK_SECTOR_BYTES - 2ULL);
@@ -1155,27 +1208,51 @@ static int test_malformed_commit_does_not_partially_map(void)
 	    is_remote_chunk_mapping_begin_explicit(module, provider,
 		logical_chunks, 2, &claim))
 		return 1;
-	if (is_remote_chunk_mapping_commit(module, &claim, provider, grants, 1) !=
-	    -EINVAL)
+	if (is_remote_chunk_mapping_finish(module, &malformed_claim,
+		IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT, provider, grants, 2) !=
+		IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID)
+		failed = 1;
+	failed |= expect_snapshot(module, 0, 0, 2, 1, 0,
+		"malformed mapping claim");
+	if (is_remote_chunk_mapping_finish(module, &claim,
+		IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT, malformed_provider, grants,
+		2) != IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID)
+		failed = 1;
+	failed |= expect_snapshot(module, 0, 0, 2, 1, 0,
+		"malformed Provider handle");
+	if (is_remote_chunk_mapping_finish(module, &claim,
+		IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT, provider,
+		incomplete_grants, 2) !=
+		IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID_GRANT)
+		failed = 1;
+	failed |= expect_snapshot(module, 0, 0, 2, 1, 0,
+		"incomplete mapping grant");
+	if (is_remote_chunk_mapping_finish(module, &claim,
+		IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT, provider, grants, 1) !=
+		IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID_GRANT)
 		failed = 1;
 	failed |= expect_snapshot(module, 0, 0, 2, 1, 0,
 		"partial mapping commit");
-	if (is_remote_chunk_mapping_commit(module, &claim, provider, grants, 2) !=
-	    -EINVAL)
+	if (is_remote_chunk_mapping_finish(module, &claim,
+		IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT, provider, grants, 2) !=
+		IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID_GRANT)
 		failed = 1;
 	failed |= expect_snapshot(module, 0, 0, 2, 1, 0,
 		"malformed mapping commit");
-	if (is_remote_chunk_mapping_commit(module, &claim, provider,
-		duplicate_provider_grants, 2) != -EINVAL)
+	if (is_remote_chunk_mapping_finish(module, &claim,
+		IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT, provider,
+		duplicate_provider_grants, 2) !=
+		IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID_GRANT)
 		failed = 1;
 	failed |= expect_snapshot(module, 0, 0, 2, 1, 0,
 		"duplicate Provider chunk commit");
-	if (is_remote_chunk_mapping_commit(module, &claim, provider,
-		overflow_grants, 2) != -EINVAL)
+	if (is_remote_chunk_mapping_finish(module, &claim,
+		IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT, provider, overflow_grants,
+		2) != IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID_GRANT)
 		failed = 1;
 	failed |= expect_snapshot(module, 0, 0, 2, 1, 0,
 		"overflowing remote address commit");
-	failed |= is_remote_chunk_mapping_abort(module, &claim) != 0;
+	failed |= finish_mapping_abort(module, &claim, provider) != 0;
 	failed |= expect_snapshot(module, 0, 0, 0, 0, 0, "mapping abort");
 	failed |= is_remote_chunk_module_destroy(module) != 0;
 	return failed;
@@ -1197,16 +1274,21 @@ static int test_duplicate_and_wrong_provider_commits_are_rejected(void)
 	    is_remote_chunk_mapping_begin_explicit(module, first_provider,
 		&logical_chunk, 1, &claim))
 		return 1;
-	if (is_remote_chunk_mapping_commit(module, &claim, second_provider,
-		&grant, 1) != -ESTALE)
+	if (is_remote_chunk_mapping_finish(module, &claim,
+		IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT, second_provider, &grant, 1) !=
+		IS_REMOTE_CHUNK_MAPPING_FINISH_CONFLICT)
 		failed = 1;
-	if (is_remote_chunk_mapping_commit(module, &claim, first_provider,
-		&grant, 1))
+	if (is_remote_chunk_mapping_finish(module, &claim,
+		IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT, first_provider, &grant, 1) !=
+		IS_REMOTE_CHUNK_MAPPING_FINISH_COMMITTED)
 		failed = 1;
-	if (is_remote_chunk_mapping_commit(module, &claim, first_provider,
-		&grant, 1) != -ESTALE)
+	if (is_remote_chunk_mapping_finish(module, &claim,
+		IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT, first_provider, &grant, 1) !=
+		IS_REMOTE_CHUNK_MAPPING_FINISH_DUPLICATE)
 		failed = 1;
-	if (is_remote_chunk_mapping_abort(module, &claim) != -ESTALE)
+	if (is_remote_chunk_mapping_finish(module, &claim,
+		IS_REMOTE_CHUNK_MAPPING_FINISH_ABORT, first_provider, NULL, 0) !=
+		IS_REMOTE_CHUNK_MAPPING_FINISH_CONFLICT)
 		failed = 1;
 	failed |= expect_snapshot(module, 1, 1, 0, 0, 1,
 		"stale mapping claim");
@@ -1230,16 +1312,16 @@ static int test_delayed_claim_cannot_commit_after_abort_and_remap(void)
 	if (create_single_provider_module(&remote_only_config, &module, &provider) ||
 	    is_remote_chunk_mapping_begin_explicit(module, provider,
 		&logical_chunk, 1, &old_claim) ||
-	    is_remote_chunk_mapping_abort(module, &old_claim) ||
+	    finish_mapping_abort(module, &old_claim, provider) ||
 	    is_remote_chunk_mapping_begin_explicit(module, provider,
 		&logical_chunk, 1, &current_claim))
 		return 1;
-	if (is_remote_chunk_mapping_commit(module, &old_claim, provider,
+	if (finish_mapping_commit(module, &old_claim, provider,
 		&old_grant, 1) != -ESTALE)
 		failed = 1;
 	failed |= expect_snapshot(module, 0, 0, 1, 1, 0,
 		"delayed mapping claim");
-	if (is_remote_chunk_mapping_commit(module, &current_claim, provider,
+	if (finish_mapping_commit(module, &current_claim, provider,
 		&current_grant, 1))
 		failed = 1;
 	failed |= expect_snapshot(module, 1, 1, 0, 0, 1,
@@ -1256,6 +1338,8 @@ static int test_provider_handles_are_epoch_stable_and_module_scoped(void)
 	struct is_remote_chunk_provider_handle first_copy;
 	struct is_remote_chunk_provider_handle next_epoch;
 	struct is_remote_chunk_provider_handle other_module;
+	const struct is_remote_chunk_provider_handle malformed = { 0 };
+	struct is_remote_chunk_provider_failure_facts facts;
 	struct is_remote_chunk_provider_observation observation = {
 		.sequence = 1,
 		.available_chunks = 1,
@@ -1276,6 +1360,11 @@ static int test_provider_handles_are_epoch_stable_and_module_scoped(void)
 	if (!is_remote_chunk_provider_handle_equal(first, first_copy) ||
 	    is_remote_chunk_provider_handle_equal(first, next_epoch) ||
 	    is_remote_chunk_provider_handle_equal(first, other_module))
+		failed = 1;
+	if (is_remote_chunk_provider_observe(first_module, malformed,
+		&observation) != IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_INVALID ||
+	    is_remote_chunk_provider_failed(first_module, malformed, &facts) !=
+		IS_REMOTE_CHUNK_PROVIDER_FAILURE_INVALID)
 		failed = 1;
 	if (is_remote_chunk_provider_observe(first_module, other_module,
 		&observation) != IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_STALE_EPOCH)
@@ -1360,7 +1449,7 @@ static int test_hot_range_policy_and_activity_drive_mapping(void)
 	    logical_chunk != 2)
 		failed = 1;
 	grant = mapping_grant(logical_chunk, 50);
-	if (is_remote_chunk_mapping_commit(module, &claim, provider, &grant, 1))
+	if (finish_mapping_commit(module, &claim, provider, &grant, 1))
 		failed = 1;
 	failed |= expect_snapshot(module, 1, 1, 0, 0, 1, "Hot Range commit");
 
@@ -1372,7 +1461,7 @@ static int test_hot_range_policy_and_activity_drive_mapping(void)
 	    !mapping_needed)
 		failed = 1;
 	if (begin_backed_mapping(module, provider, &claim, &logical_chunk) ||
-	    logical_chunk != 1 || is_remote_chunk_mapping_abort(module, &claim))
+	    logical_chunk != 1 || finish_mapping_abort(module, &claim, provider))
 		failed = 1;
 	if (is_remote_chunk_note_activity(module, 3, 2,
 		IS_REMOTE_CHUNK_ACTIVITY_WRITE, &mapping_needed) != -ERANGE)
@@ -1461,7 +1550,7 @@ static int test_concurrent_next_mapping_calls_have_one_winner(void)
 		active += events[index].result ==
 			IS_REMOTE_CHUNK_NEXT_MAPPING_CLAIM_ACTIVE;
 		if (events[index].result == IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST &&
-		    is_remote_chunk_mapping_abort(module, &events[index].request.claim))
+		    finish_mapping_abort(module, &events[index].request.claim, events[index].request.provider))
 			failed = 1;
 	}
 	test_gate_destroy(&start);
@@ -1585,13 +1674,14 @@ static int test_concurrent_provider_observations_are_atomic(void)
 	return failed;
 }
 
-static void *run_mapping_commit(void *context)
+static void *run_mapping_finish(void *context)
 {
-	struct concurrent_commit *commit = context;
+	struct concurrent_mapping_finish *finish = context;
 
-	test_gate_wait(commit->start);
-	commit->status = is_remote_chunk_mapping_commit(commit->module,
-		commit->claim, commit->provider, commit->grants, commit->grant_count);
+	test_gate_wait(finish->start);
+	finish->result = is_remote_chunk_mapping_finish(finish->module,
+		finish->claim, finish->action, finish->provider, finish->grants,
+		finish->grant_count);
 	return NULL;
 }
 
@@ -1627,6 +1717,198 @@ static void *run_snapshots_during_commit(void *context)
 	return NULL;
 }
 
+static int test_mapping_finish_reports_terminal_outcomes(void)
+{
+	struct is_remote_chunk_module *module = NULL;
+	struct is_remote_chunk_provider_handle provider;
+	struct is_remote_chunk_mapping_request request = { 0 };
+	struct is_remote_chunk_mapping_request retry = { 0 };
+	struct is_remote_chunk_mapping_grant grant;
+	enum is_remote_chunk_mapping_finish_result result;
+	int failed = 0;
+
+	if (create_single_provider_module(&remote_only_config, &module, &provider) ||
+	    observe_provider_available(module, provider, 4) ||
+	    is_remote_chunk_next_mapping(module, &request) !=
+		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST)
+		return 1;
+	grant = mapping_grant(request.logical_chunk, 69);
+	result = is_remote_chunk_mapping_finish(module, &request.claim,
+		IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT, request.provider, &grant, 1);
+	if (result != IS_REMOTE_CHUNK_MAPPING_FINISH_COMMITTED)
+		failed = 1;
+	result = is_remote_chunk_mapping_finish(module, &request.claim,
+		IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT, request.provider, &grant, 1);
+	if (result != IS_REMOTE_CHUNK_MAPPING_FINISH_DUPLICATE)
+		failed = 1;
+	result = is_remote_chunk_mapping_finish(module, &request.claim,
+		IS_REMOTE_CHUNK_MAPPING_FINISH_ABORT, request.provider, NULL, 0);
+	if (result != IS_REMOTE_CHUNK_MAPPING_FINISH_CONFLICT ||
+	    is_remote_chunk_next_mapping(module, &retry) !=
+		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST)
+		failed = 1;
+	if (!failed && is_remote_chunk_mapping_finish(module, &retry.claim,
+		IS_REMOTE_CHUNK_MAPPING_FINISH_ABORT, retry.provider, NULL, 0) !=
+		IS_REMOTE_CHUNK_MAPPING_FINISH_ABORTED)
+		failed = 1;
+	if (!failed && is_remote_chunk_mapping_finish(module, &retry.claim,
+		IS_REMOTE_CHUNK_MAPPING_FINISH_ABORT, retry.provider, NULL, 0) !=
+		IS_REMOTE_CHUNK_MAPPING_FINISH_DUPLICATE)
+		failed = 1;
+	if (!failed && is_remote_chunk_next_mapping(module, &retry) !=
+		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST)
+		failed = 1;
+	if (!failed && is_remote_chunk_mapping_finish(module, &request.claim,
+		IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT, request.provider, &grant, 1) !=
+		IS_REMOTE_CHUNK_MAPPING_FINISH_STALE)
+		failed = 1;
+	if (!failed && finish_mapping_abort(module, &retry.claim, retry.provider))
+		failed = 1;
+	failed |= is_remote_chunk_module_destroy(module) != 0;
+	return failed;
+}
+
+static int test_concurrent_commit_and_abort_have_one_winner(void)
+{
+	struct is_remote_chunk_module *module = NULL;
+	struct is_remote_chunk_provider_handle provider;
+	struct is_remote_chunk_mapping_request request = { 0 };
+	struct is_remote_chunk_mapping_grant grant;
+	struct concurrent_mapping_finish commit;
+	struct concurrent_mapping_finish abort;
+	struct test_gate start;
+	pthread_t commit_thread;
+	pthread_t abort_thread;
+	unsigned int applied;
+	unsigned int conflicts;
+	int failed = 0;
+
+	if (create_single_provider_module(&remote_only_config, &module, &provider) ||
+	    observe_provider_available(module, provider, 4) ||
+	    is_remote_chunk_next_mapping(module, &request) !=
+		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST || test_gate_init(&start))
+		return 1;
+	grant = mapping_grant(request.logical_chunk, 68);
+	commit = (struct concurrent_mapping_finish) {
+		.module = module,
+		.claim = &request.claim,
+		.action = IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT,
+		.provider = provider,
+		.grants = &grant,
+		.grant_count = 1,
+		.start = &start,
+		.result = IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID,
+	};
+	abort = (struct concurrent_mapping_finish) {
+		.module = module,
+		.claim = &request.claim,
+		.action = IS_REMOTE_CHUNK_MAPPING_FINISH_ABORT,
+		.provider = provider,
+		.start = &start,
+		.result = IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID,
+	};
+	if (pthread_create(&commit_thread, NULL, run_mapping_finish, &commit) ||
+	    pthread_create(&abort_thread, NULL, run_mapping_finish, &abort))
+		return 1;
+	test_gate_open(&start);
+	(void)pthread_join(commit_thread, NULL);
+	(void)pthread_join(abort_thread, NULL);
+	test_gate_destroy(&start);
+	applied = (commit.result == IS_REMOTE_CHUNK_MAPPING_FINISH_COMMITTED) +
+		(abort.result == IS_REMOTE_CHUNK_MAPPING_FINISH_ABORTED);
+	conflicts =
+		(commit.result == IS_REMOTE_CHUNK_MAPPING_FINISH_CONFLICT) +
+		(abort.result == IS_REMOTE_CHUNK_MAPPING_FINISH_CONFLICT);
+	if (applied != 1 || conflicts != 1)
+		failed = 1;
+	if (commit.result == IS_REMOTE_CHUNK_MAPPING_FINISH_COMMITTED)
+		failed |= expect_snapshot(module, 1, 1, 0, 0, 1,
+			"commit wins abort race");
+	else
+		failed |= expect_snapshot(module, 0, 0, 0, 0, 0,
+			"abort wins commit race");
+	failed |= is_remote_chunk_module_destroy(module) != 0;
+	return failed;
+}
+
+static int test_concurrent_invalid_and_stale_mapping_finishes(void)
+{
+	struct is_remote_chunk_module *module = NULL;
+	struct is_remote_chunk_provider_handle provider;
+	struct is_remote_chunk_mapping_request old_request = { 0 };
+	struct is_remote_chunk_mapping_request current_request = { 0 };
+	struct is_remote_chunk_mapping_grant invalid_grant;
+	struct concurrent_mapping_finish invalid[2];
+	struct concurrent_mapping_finish stale[2];
+	struct test_gate start;
+	pthread_t threads[2];
+	unsigned int index;
+	int failed = 0;
+
+	if (create_single_provider_module(&remote_only_config, &module, &provider) ||
+	    observe_provider_available(module, provider, 4) ||
+	    is_remote_chunk_next_mapping(module, &old_request) !=
+		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST || test_gate_init(&start))
+		return 1;
+	invalid_grant = mapping_grant(old_request.logical_chunk, 66);
+	invalid_grant.remote_key = 0;
+	for (index = 0; index < 2; index++) {
+		invalid[index] = (struct concurrent_mapping_finish) {
+			.module = module,
+			.claim = &old_request.claim,
+			.action = IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT,
+			.provider = provider,
+			.grants = &invalid_grant,
+			.grant_count = 1,
+			.start = &start,
+			.result = IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID,
+		};
+		if (pthread_create(&threads[index], NULL, run_mapping_finish,
+			&invalid[index]))
+			return 1;
+	}
+	test_gate_open(&start);
+	for (index = 0; index < 2; index++) {
+		(void)pthread_join(threads[index], NULL);
+		if (invalid[index].result !=
+		    IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID_GRANT)
+			failed = 1;
+	}
+	test_gate_destroy(&start);
+	failed |= expect_snapshot(module, 0, 0, 1, 1, 0,
+		"concurrent invalid grants");
+	if (finish_mapping_abort(module, &old_request.claim, provider) ||
+	    is_remote_chunk_next_mapping(module, &current_request) !=
+		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST || test_gate_init(&start))
+		return 1;
+	for (index = 0; index < 2; index++) {
+		stale[index] = (struct concurrent_mapping_finish) {
+			.module = module,
+			.claim = &old_request.claim,
+			.action = IS_REMOTE_CHUNK_MAPPING_FINISH_ABORT,
+			.provider = provider,
+			.start = &start,
+			.result = IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID,
+		};
+		if (pthread_create(&threads[index], NULL, run_mapping_finish,
+			&stale[index]))
+			return 1;
+	}
+	test_gate_open(&start);
+	for (index = 0; index < 2; index++) {
+		(void)pthread_join(threads[index], NULL);
+		if (stale[index].result != IS_REMOTE_CHUNK_MAPPING_FINISH_STALE)
+			failed = 1;
+	}
+	test_gate_destroy(&start);
+	failed |= expect_snapshot(module, 0, 0, 1, 1, 0,
+		"concurrent stale terminal events");
+	failed |= finish_mapping_abort(module, &current_request.claim, provider) !=
+		0;
+	failed |= is_remote_chunk_module_destroy(module) != 0;
+	return failed;
+}
+
 static int test_concurrent_duplicate_commit_has_one_winner(void)
 {
 	struct is_remote_chunk_module *module = NULL;
@@ -1638,14 +1920,14 @@ static int test_concurrent_duplicate_commit_has_one_winner(void)
 		{ 0, 70, 0x200000, 170 },
 		{ 1, 71, 0x201000, 171 },
 	};
-	struct concurrent_commit commits[2];
+	struct concurrent_mapping_finish commits[2];
 	struct concurrent_snapshot snapshot_event;
 	struct test_gate start;
 	pthread_t threads[2];
 	pthread_t snapshot_thread;
 	unsigned int index;
 	unsigned int committed = 0;
-	unsigned int stale = 0;
+	unsigned int duplicate = 0;
 	int failed = 0;
 
 	if (create_single_provider_module(&remote_only_config, &module, &provider) ||
@@ -1661,24 +1943,27 @@ static int test_concurrent_duplicate_commit_has_one_winner(void)
 	for (index = 0; index < 2; index++) {
 		commits[index].module = module;
 		commits[index].claim = &claim;
+		commits[index].action = IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT;
 		commits[index].provider = provider;
 		commits[index].grants = grants;
 		commits[index].grant_count = 2;
 		commits[index].start = &start;
-		commits[index].status = -999;
-		if (pthread_create(&threads[index], NULL, run_mapping_commit,
+		commits[index].result = IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID;
+		if (pthread_create(&threads[index], NULL, run_mapping_finish,
 			&commits[index]))
 			return 1;
 	}
 	test_gate_open(&start);
 	for (index = 0; index < 2; index++) {
 		(void)pthread_join(threads[index], NULL);
-		committed += commits[index].status == 0;
-		stale += commits[index].status == -ESTALE;
+		committed += commits[index].result ==
+			IS_REMOTE_CHUNK_MAPPING_FINISH_COMMITTED;
+		duplicate += commits[index].result ==
+			IS_REMOTE_CHUNK_MAPPING_FINISH_DUPLICATE;
 	}
 	(void)pthread_join(snapshot_thread, NULL);
 	test_gate_destroy(&start);
-	if (committed != 1 || stale != 1 || snapshot_event.failed)
+	if (committed != 1 || duplicate != 1 || snapshot_event.failed)
 		failed = 1;
 	failed |= expect_snapshot(module, 2, 2, 0, 0, 2,
 		"concurrent mapping commit");
@@ -1701,7 +1986,7 @@ static int test_destroy_rejects_active_claim(void)
 		return 1;
 	if (is_remote_chunk_module_destroy(module) != -EBUSY)
 		failed = 1;
-	if (is_remote_chunk_mapping_abort(module, &claim))
+	if (finish_mapping_abort(module, &claim, provider))
 		failed = 1;
 	failed |= is_remote_chunk_module_destroy(module) != 0;
 	return failed;
@@ -2309,6 +2594,233 @@ static void *run_provider_failure(void *context)
 	return NULL;
 }
 
+static int test_mapping_finish_races_provider_failure(void)
+{
+	static const enum is_remote_chunk_mapping_finish_action actions[] = {
+		IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT,
+		IS_REMOTE_CHUNK_MAPPING_FINISH_ABORT,
+	};
+	unsigned int action_index;
+	int failed = 0;
+
+	for (action_index = 0;
+	     action_index < sizeof(actions) / sizeof(actions[0]);
+	     action_index++) {
+		struct is_remote_chunk_module *module = NULL;
+		struct is_remote_chunk_provider_handle provider;
+		struct is_remote_chunk_mapping_request request = { 0 };
+		struct is_remote_chunk_mapping_grant grant;
+		struct concurrent_mapping_finish finish;
+		struct concurrent_provider_failure failure;
+		struct is_remote_chunk_provider_failure_facts duplicate_facts;
+		struct is_remote_chunk_provider_observation delayed = {
+			.sequence = 2,
+			.available_chunks = 3,
+			.exclusion = IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_NONE,
+			.placement_eligible = true,
+		};
+		struct test_gate start;
+		pthread_t finish_thread;
+		pthread_t failure_thread;
+		enum is_remote_chunk_mapping_finish_result repeated;
+
+		if (create_single_provider_module(&remote_only_config, &module,
+			&provider) || observe_provider_available(module, provider, 4) ||
+		    is_remote_chunk_next_mapping(module, &request) !=
+			IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST ||
+		    test_gate_init(&start))
+			return 1;
+		grant = mapping_grant(request.logical_chunk, 67 + action_index);
+		finish = (struct concurrent_mapping_finish) {
+			.module = module,
+			.claim = &request.claim,
+			.action = actions[action_index],
+			.provider = provider,
+			.grants = actions[action_index] ==
+				IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT ? &grant : NULL,
+			.grant_count = actions[action_index] ==
+				IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT ? 1 : 0,
+			.start = &start,
+			.result = IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID,
+		};
+		failure = (struct concurrent_provider_failure) {
+			.module = module,
+			.provider = provider,
+			.start = &start,
+			.status = -999,
+		};
+		if (pthread_create(&finish_thread, NULL, run_mapping_finish,
+			&finish) ||
+		    pthread_create(&failure_thread, NULL, run_provider_failure,
+			&failure))
+			return 1;
+		test_gate_open(&start);
+		(void)pthread_join(finish_thread, NULL);
+		(void)pthread_join(failure_thread, NULL);
+		test_gate_destroy(&start);
+
+		if (failure.status != IS_REMOTE_CHUNK_PROVIDER_FAILURE_APPLIED)
+			failed = 1;
+		if (actions[action_index] == IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT) {
+			if ((finish.result ==
+			     IS_REMOTE_CHUNK_MAPPING_FINISH_COMMITTED &&
+			     (failure.facts.affected_chunks != 1 ||
+			      failure.facts.assigned_chunks != 1 ||
+			      failure.facts.usable_chunks != 1 ||
+			      failure.facts.mapping_chunks != 0)) ||
+			    (finish.result == IS_REMOTE_CHUNK_MAPPING_FINISH_STALE &&
+			     (failure.facts.affected_chunks != 1 ||
+			      failure.facts.assigned_chunks != 0 ||
+			      failure.facts.usable_chunks != 0 ||
+			      failure.facts.mapping_chunks != 1)) ||
+			    (finish.result !=
+				IS_REMOTE_CHUNK_MAPPING_FINISH_COMMITTED &&
+			     finish.result != IS_REMOTE_CHUNK_MAPPING_FINISH_STALE))
+				failed = 1;
+		} else if ((finish.result ==
+			    IS_REMOTE_CHUNK_MAPPING_FINISH_ABORTED &&
+			    failure.facts.affected_chunks != 0) ||
+			   (finish.result == IS_REMOTE_CHUNK_MAPPING_FINISH_STALE &&
+			    (failure.facts.affected_chunks != 1 ||
+			     failure.facts.mapping_chunks != 1)) ||
+			   (finish.result != IS_REMOTE_CHUNK_MAPPING_FINISH_ABORTED &&
+			    finish.result != IS_REMOTE_CHUNK_MAPPING_FINISH_STALE)) {
+			failed = 1;
+		}
+		repeated = is_remote_chunk_mapping_finish(module, &request.claim,
+			actions[action_index], provider, finish.grants,
+			finish.grant_count);
+		if (repeated != IS_REMOTE_CHUNK_MAPPING_FINISH_STALE ||
+		    is_remote_chunk_provider_failed(module, provider,
+			&duplicate_facts) !=
+			IS_REMOTE_CHUNK_PROVIDER_FAILURE_DUPLICATE ||
+		    memcmp(&duplicate_facts, &failure.facts,
+			sizeof(duplicate_facts)) ||
+		    is_remote_chunk_provider_observe(module, provider, &delayed) !=
+			IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_STALE_EPOCH)
+			failed = 1;
+		failed |= expect_snapshot(module, 0, 0, 0, 0, 0,
+			"mapping finish versus Provider failure");
+		failed |= is_remote_chunk_module_destroy(module) != 0;
+	}
+	return failed;
+}
+
+static int test_delayed_observation_races_provider_failure(void)
+{
+	struct is_remote_chunk_module *module = NULL;
+	struct is_remote_chunk_provider_handle failed_provider;
+	struct is_remote_chunk_provider_handle current_provider;
+	struct is_remote_chunk_mapping_request old_request = { 0 };
+	struct is_remote_chunk_mapping_request current_request = { 0 };
+	struct is_remote_chunk_mapping_grant old_grant;
+	struct is_remote_chunk_mapping_grant current_grant;
+	struct concurrent_observation observation = { 0 };
+	struct concurrent_mapping_finish old_finish;
+	struct concurrent_mapping_finish current_finish;
+	struct concurrent_provider_failure failure;
+	struct test_gate start;
+	pthread_t observation_thread;
+	pthread_t old_finish_thread;
+	pthread_t current_finish_thread;
+	pthread_t failure_thread;
+	int failed = 0;
+
+	if (create_two_provider_module(&backed_two_provider_config, &module,
+		&failed_provider, &current_provider) ||
+	    observe_provider_available(module, failed_provider, 2) ||
+	    observe_provider_available(module, current_provider, 1) ||
+	    make_chunk_hot(module, 0) ||
+	    is_remote_chunk_next_mapping(module, &old_request) !=
+		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST ||
+	    !is_remote_chunk_provider_handle_equal(old_request.provider,
+		failed_provider) || test_gate_init(&start))
+		return 1;
+	old_grant = mapping_grant(old_request.logical_chunk, 65);
+	observation = (struct concurrent_observation) {
+		.module = module,
+		.provider = failed_provider,
+		.observation = {
+			.sequence = 2,
+			.available_chunks = 1,
+			.exclusion = IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_NONE,
+			.placement_eligible = true,
+		},
+		.start = &start,
+		.result = IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_INVALID,
+	};
+	failure = (struct concurrent_provider_failure) {
+		.module = module,
+		.provider = failed_provider,
+		.start = &start,
+		.status = -999,
+	};
+	if (pthread_create(&observation_thread, NULL, run_provider_observation,
+		&observation) ||
+	    pthread_create(&failure_thread, NULL, run_provider_failure, &failure))
+		return 1;
+	test_gate_open(&start);
+	(void)pthread_join(observation_thread, NULL);
+	(void)pthread_join(failure_thread, NULL);
+	test_gate_destroy(&start);
+	if (failure.status != IS_REMOTE_CHUNK_PROVIDER_FAILURE_APPLIED ||
+	    (observation.result != IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_APPLIED &&
+	     observation.result !=
+		IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_STALE_EPOCH) ||
+	    is_remote_chunk_next_mapping(module, &current_request) !=
+		IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST ||
+	    !is_remote_chunk_provider_handle_equal(current_request.provider,
+		current_provider))
+		failed = 1;
+
+	if (failed || test_gate_init(&start))
+		return 1;
+	current_grant = mapping_grant(current_request.logical_chunk, 66);
+	observation.start = &start;
+	observation.result = IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_INVALID;
+	old_finish = (struct concurrent_mapping_finish) {
+		.module = module,
+		.claim = &old_request.claim,
+		.action = IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT,
+		.provider = failed_provider,
+		.grants = &old_grant,
+		.grant_count = 1,
+		.start = &start,
+		.result = IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID,
+	};
+	current_finish = (struct concurrent_mapping_finish) {
+		.module = module,
+		.claim = &current_request.claim,
+		.action = IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT,
+		.provider = current_provider,
+		.grants = &current_grant,
+		.grant_count = 1,
+		.start = &start,
+		.result = IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID,
+	};
+	if (pthread_create(&observation_thread, NULL, run_provider_observation,
+		&observation) ||
+	    pthread_create(&old_finish_thread, NULL, run_mapping_finish,
+		&old_finish) ||
+	    pthread_create(&current_finish_thread, NULL, run_mapping_finish,
+		&current_finish))
+		return 1;
+	test_gate_open(&start);
+	(void)pthread_join(observation_thread, NULL);
+	(void)pthread_join(old_finish_thread, NULL);
+	(void)pthread_join(current_finish_thread, NULL);
+	test_gate_destroy(&start);
+	if (observation.result !=
+		IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_STALE_EPOCH ||
+	    old_finish.result != IS_REMOTE_CHUNK_MAPPING_FINISH_STALE ||
+	    current_finish.result != IS_REMOTE_CHUNK_MAPPING_FINISH_COMMITTED)
+		failed = 1;
+	failed |= expect_snapshot(module, 1, 1, 0, 0, 1,
+		"delayed events for failed Provider epoch");
+	failed |= is_remote_chunk_module_destroy(module) != 0;
+	return failed;
+}
+
 static void *run_eviction_begin(void *context)
 {
 	struct concurrent_eviction_begin *event = context;
@@ -2375,13 +2887,13 @@ static int test_provider_failure_invalidates_atomically_and_preserves_activity(v
 	    snapshot->mapping_candidates != 3)
 		failed = 1;
 	is_remote_chunk_snapshot_release(snapshot);
-	if (is_remote_chunk_mapping_abort(module, &mapping_claim) != -ESTALE ||
+	if (finish_mapping_abort(module, &mapping_claim, failed_provider) != -ESTALE ||
 	    is_remote_chunk_eviction_finish(module, &eviction_claim) != -ESTALE)
 		failed = 1;
 	logical_chunk = ~0U;
 	if (begin_backed_mapping(module, replacement_provider,
 		&replacement_claim, &logical_chunk) || logical_chunk != 0 ||
-	    is_remote_chunk_mapping_commit(module, &replacement_claim,
+	    finish_mapping_commit(module, &replacement_claim,
 		replacement_provider, &replacement_grant, 1))
 		failed = 1;
 	if (is_remote_chunk_io_lease_resolve(module, &lease,
@@ -2390,6 +2902,63 @@ static int test_provider_failure_invalidates_atomically_and_preserves_activity(v
 	    is_remote_chunk_io_lease_release(module, &lease))
 		failed = 1;
 	failed |= expect_read_admission(module, 8, 4096, -ENODATA);
+	failed |= is_remote_chunk_module_destroy(module) != 0;
+	return failed;
+}
+
+static int test_provider_failure_aborts_multi_chunk_eviction_once(void)
+{
+	struct is_remote_chunk_module *module = NULL;
+	struct is_remote_chunk_provider_handle provider;
+	struct is_remote_chunk_eviction_claim claim =
+		IS_REMOTE_CHUNK_EVICTION_CLAIM_INIT;
+	struct is_remote_chunk_provider_failure_facts facts;
+	const unsigned int provider_chunks[] = { 20, 21 };
+	int failed = 0;
+
+	if (create_single_provider_module(&backed_config, &module, &provider) ||
+	    map_backed_chunk(module, provider, 0, provider_chunks[0]) ||
+	    map_backed_chunk(module, provider, 1, provider_chunks[1]) ||
+	    is_remote_chunk_eviction_begin(module, provider, provider_chunks, 2,
+		&claim))
+		return 1;
+	if (is_remote_chunk_provider_failed(module, provider, &facts) !=
+		IS_REMOTE_CHUNK_PROVIDER_FAILURE_APPLIED ||
+	    facts.affected_chunks != 2 || facts.assigned_chunks != 2 ||
+	    facts.evicting_chunks != 2 || facts.usable_chunks ||
+	    facts.mapping_chunks ||
+	    is_remote_chunk_eviction_finish(module, &claim) != -ESTALE)
+		failed = 1;
+	failed |= expect_snapshot(module, 0, 0, 0, 0, 0,
+		"Provider failure aborts one multi-chunk eviction");
+	failed |= is_remote_chunk_module_destroy(module) != 0;
+	return failed;
+}
+
+static int test_provider_failure_aborts_multi_chunk_claim_once(void)
+{
+	struct is_remote_chunk_module *module = NULL;
+	struct is_remote_chunk_provider_handle provider;
+	struct is_remote_chunk_mapping_claim claim =
+		IS_REMOTE_CHUNK_MAPPING_CLAIM_INIT;
+	struct is_remote_chunk_provider_failure_facts facts;
+	const unsigned int logical_chunks[] = { 0, 1 };
+	int failed = 0;
+
+	if (create_single_provider_module(&remote_only_config, &module, &provider) ||
+	    is_remote_chunk_mapping_begin_explicit(module, provider,
+		logical_chunks, 2, &claim))
+		return 1;
+	if (is_remote_chunk_provider_failed(module, provider, &facts) !=
+		IS_REMOTE_CHUNK_PROVIDER_FAILURE_APPLIED ||
+	    facts.affected_chunks != 2 || facts.mapping_chunks != 2 ||
+	    facts.assigned_chunks || facts.usable_chunks ||
+	    is_remote_chunk_mapping_finish(module, &claim,
+		IS_REMOTE_CHUNK_MAPPING_FINISH_ABORT, provider, NULL, 0) !=
+		IS_REMOTE_CHUNK_MAPPING_FINISH_STALE)
+		failed = 1;
+	failed |= expect_snapshot(module, 0, 0, 0, 0, 0,
+		"Provider failure aborts one multi-chunk claim");
 	failed |= is_remote_chunk_module_destroy(module) != 0;
 	return failed;
 }
@@ -2489,6 +3058,66 @@ static void *run_eviction_wait(void *context)
 	event->status = is_remote_chunk_eviction_wait(event->module, event->claim,
 		monotonic_deadline_after_ms(1000));
 	return NULL;
+}
+
+static int test_provider_failure_wakes_eviction_wait(void)
+{
+	struct is_remote_chunk_module *module = NULL;
+	struct is_remote_chunk_provider_handle provider;
+	struct is_remote_chunk_eviction_claim claim =
+		IS_REMOTE_CHUNK_EVICTION_CLAIM_INIT;
+	struct is_remote_chunk_io_lease lease = IS_REMOTE_CHUNK_IO_LEASE_INIT;
+	struct is_remote_chunk_io_request request = {
+		.direction = IS_REMOTE_CHUNK_IO_WRITE,
+		.sector = 8,
+		.bytes = 4096,
+	};
+	struct is_remote_chunk_transport_mapping mapping;
+	enum is_remote_chunk_io_resolve_result result;
+	struct concurrent_eviction_wait wait_event;
+	struct concurrent_provider_failure failure;
+	struct test_gate start;
+	pthread_t wait_thread;
+	pthread_t failure_thread;
+	const unsigned int provider_chunk = 20;
+	int failed = 0;
+
+	if (create_single_provider_module(&backed_config, &module, &provider) ||
+	    map_backed_chunk(module, provider, 0, provider_chunk) ||
+	    is_remote_chunk_io_lease_acquire(module, &request, &lease, &mapping) ||
+	    is_remote_chunk_eviction_begin(module, provider, &provider_chunk, 1,
+		&claim) || test_gate_init(&start))
+		return 1;
+	wait_event = (struct concurrent_eviction_wait) {
+		.module = module,
+		.claim = &claim,
+		.start = &start,
+		.status = -999,
+	};
+	failure = (struct concurrent_provider_failure) {
+		.module = module,
+		.provider = provider,
+		.start = &start,
+		.status = -999,
+	};
+	if (pthread_create(&wait_thread, NULL, run_eviction_wait, &wait_event) ||
+	    pthread_create(&failure_thread, NULL, run_provider_failure, &failure))
+		return 1;
+	test_gate_open(&start);
+	(void)pthread_join(wait_thread, NULL);
+	(void)pthread_join(failure_thread, NULL);
+	test_gate_destroy(&start);
+	if (wait_event.status != -ESTALE ||
+	    failure.status != IS_REMOTE_CHUNK_PROVIDER_FAILURE_APPLIED ||
+	    failure.facts.evicting_chunks != 1 ||
+	    failure.facts.active_io_leases != 1 ||
+	    is_remote_chunk_io_lease_resolve(module, &lease,
+		IS_REMOTE_CHUNK_IO_SUCCESS, &result) ||
+	    result != IS_REMOTE_CHUNK_IO_RESOLVE_STALE ||
+	    is_remote_chunk_io_lease_release(module, &lease))
+		failed = 1;
+	failed |= is_remote_chunk_module_destroy(module) != 0;
+	return failed;
 }
 
 static int test_concurrent_lease_release_wakes_eviction_wait(void)
@@ -2673,12 +3302,12 @@ static int test_quiesce_rejects_new_ownership_while_accepted_work_retires(void)
 		struct is_remote_chunk_mapping_grant grant =
 			mapping_grant(1, 21);
 
-		if (is_remote_chunk_mapping_commit(module, &mapping_claim, provider,
+		if (finish_mapping_commit(module, &mapping_claim, provider,
 			&grant, 1) != -ESHUTDOWN)
 			failed = 1;
 	}
 	if (is_remote_chunk_module_destroy(module) != -EBUSY ||
-	    is_remote_chunk_mapping_abort(module, &mapping_claim) ||
+	    finish_mapping_abort(module, &mapping_claim, provider) ||
 	    is_remote_chunk_io_lease_resolve(module, &lease,
 		IS_REMOTE_CHUNK_IO_SUCCESS, &result) ||
 	    is_remote_chunk_io_lease_release(module, &lease) ||
@@ -2752,6 +3381,9 @@ int main(int argc, char **argv)
 		test_provider_handles_are_epoch_stable_and_module_scoped() |
 		test_begin_validates_full_batch_before_transition() |
 		test_hot_range_policy_and_activity_drive_mapping() |
+		test_mapping_finish_reports_terminal_outcomes() |
+		test_concurrent_commit_and_abort_have_one_winner() |
+		test_concurrent_invalid_and_stale_mapping_finishes() |
 		test_concurrent_duplicate_commit_has_one_winner() |
 		test_destroy_rejects_active_claim() |
 		test_io_admission_is_atomic_and_returns_mapping() |
@@ -2763,8 +3395,13 @@ int main(int argc, char **argv)
 		test_eviction_wait_times_out_without_choosing_policy() |
 		test_remote_only_rejects_provider_eviction() |
 		test_provider_failure_invalidates_atomically_and_preserves_activity() |
+		test_provider_failure_aborts_multi_chunk_eviction_once() |
+		test_provider_failure_aborts_multi_chunk_claim_once() |
 		test_remote_only_provider_failure_returns_policy_neutral_facts() |
+		test_mapping_finish_races_provider_failure() |
+		test_delayed_observation_races_provider_failure() |
 		test_concurrent_provider_failure_and_eviction_are_atomic() |
+		test_provider_failure_wakes_eviction_wait() |
 		test_concurrent_lease_release_wakes_eviction_wait() |
 		test_concurrent_completion_and_provider_failure_are_generation_safe() |
 		test_quiesce_rejects_new_ownership_while_accepted_work_retires();

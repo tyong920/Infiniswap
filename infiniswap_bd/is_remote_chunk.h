@@ -169,6 +169,23 @@ enum is_remote_chunk_next_mapping_result {
 	IS_REMOTE_CHUNK_NEXT_MAPPING_INVALID_INPUT,
 };
 
+enum is_remote_chunk_mapping_finish_action {
+	IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT = 1,
+	IS_REMOTE_CHUNK_MAPPING_FINISH_ABORT,
+};
+
+enum is_remote_chunk_mapping_finish_result {
+	IS_REMOTE_CHUNK_MAPPING_FINISH_COMMITTED = 0,
+	IS_REMOTE_CHUNK_MAPPING_FINISH_ABORTED,
+	IS_REMOTE_CHUNK_MAPPING_FINISH_DUPLICATE,
+	IS_REMOTE_CHUNK_MAPPING_FINISH_STALE,
+	IS_REMOTE_CHUNK_MAPPING_FINISH_CONFLICT,
+	IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID,
+	IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID_GRANT,
+	IS_REMOTE_CHUNK_MAPPING_FINISH_EXHAUSTED,
+	IS_REMOTE_CHUNK_MAPPING_FINISH_SHUTDOWN,
+};
+
 struct is_remote_chunk_provider_activity {
 	unsigned int provider_chunk;
 	unsigned long long activity;
@@ -204,6 +221,14 @@ enum is_remote_chunk_provider_observation_result {
 	IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_INVALID,
 	IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_STALE_EPOCH,
 	IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_SHUTDOWN,
+};
+
+enum is_remote_chunk_provider_failure_result {
+	IS_REMOTE_CHUNK_PROVIDER_FAILURE_APPLIED = 0,
+	IS_REMOTE_CHUNK_PROVIDER_FAILURE_DUPLICATE,
+	IS_REMOTE_CHUNK_PROVIDER_FAILURE_STALE_EPOCH,
+	IS_REMOTE_CHUNK_PROVIDER_FAILURE_INVALID,
+	IS_REMOTE_CHUNK_PROVIDER_FAILURE_EXHAUSTED,
 };
 
 struct is_remote_chunk_provider_failure_facts {
@@ -313,15 +338,17 @@ enum is_remote_chunk_next_mapping_result is_remote_chunk_next_mapping(
 	struct is_remote_chunk_module *module,
 	struct is_remote_chunk_mapping_request *request_out);
 
-int is_remote_chunk_mapping_commit(
+/*
+ * Commit and abort share one terminal transition. Invalid grants preserve the
+ * active claim so RDMA can explicitly abort it or fail the Provider epoch.
+ */
+enum is_remote_chunk_mapping_finish_result is_remote_chunk_mapping_finish(
 	struct is_remote_chunk_module *module,
 	const struct is_remote_chunk_mapping_claim *claim,
+	enum is_remote_chunk_mapping_finish_action action,
 	struct is_remote_chunk_provider_handle provider,
 	const struct is_remote_chunk_mapping_grant *grants,
 	unsigned int grant_count);
-int is_remote_chunk_mapping_abort(
-	struct is_remote_chunk_module *module,
-	const struct is_remote_chunk_mapping_claim *claim);
 
 /* Query validates the complete Provider chunk batch before changing output. */
 int is_remote_chunk_provider_activity_query(
@@ -349,7 +376,7 @@ int is_remote_chunk_eviction_finish(
 	const struct is_remote_chunk_eviction_claim *claim);
 
 /* Invalidates one Provider epoch atomically without choosing mode policy. */
-int is_remote_chunk_provider_failed(
+enum is_remote_chunk_provider_failure_result is_remote_chunk_provider_failed(
 	struct is_remote_chunk_module *module,
 	struct is_remote_chunk_provider_handle provider,
 	struct is_remote_chunk_provider_failure_facts *facts_out);

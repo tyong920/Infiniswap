@@ -327,6 +327,47 @@ static int is_provider_observation_result_error(
 	}
 }
 
+static int is_provider_failure_result_error(
+	enum is_remote_chunk_provider_failure_result result)
+{
+	switch (result) {
+	case IS_REMOTE_CHUNK_PROVIDER_FAILURE_APPLIED:
+	case IS_REMOTE_CHUNK_PROVIDER_FAILURE_DUPLICATE:
+		return 0;
+	case IS_REMOTE_CHUNK_PROVIDER_FAILURE_STALE_EPOCH:
+		return -ESTALE;
+	case IS_REMOTE_CHUNK_PROVIDER_FAILURE_EXHAUSTED:
+		return -EOVERFLOW;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int is_abort_mapping_claim(
+	struct is_remote_chunk_module *module,
+	const struct is_remote_chunk_mapping_claim *claim,
+	struct is_remote_chunk_provider_handle provider)
+{
+	enum is_remote_chunk_mapping_finish_result result =
+		is_remote_chunk_mapping_finish(module, claim,
+			IS_REMOTE_CHUNK_MAPPING_FINISH_ABORT, provider, NULL, 0);
+
+	switch (result) {
+	case IS_REMOTE_CHUNK_MAPPING_FINISH_ABORTED:
+	case IS_REMOTE_CHUNK_MAPPING_FINISH_DUPLICATE:
+	case IS_REMOTE_CHUNK_MAPPING_FINISH_STALE:
+		return 0;
+	case IS_REMOTE_CHUNK_MAPPING_FINISH_CONFLICT:
+		return -EPROTO;
+	case IS_REMOTE_CHUNK_MAPPING_FINISH_EXHAUSTED:
+		return -EOVERFLOW;
+	case IS_REMOTE_CHUNK_MAPPING_FINISH_SHUTDOWN:
+		return -ESHUTDOWN;
+	default:
+		return -EINVAL;
+	}
+}
+
 static int is_session_record_provider_observation(
 	struct is_rdma_session *session, unsigned int available_chunks,
 	bool placement_eligible, enum is_placement_exclude_reason exclusion,
@@ -405,8 +446,9 @@ static int is_fail_session_chunks(struct is_rdma_session *session,
 {
 	if (!session->device->remote_chunks)
 		return -ESHUTDOWN;
-	return is_remote_chunk_provider_failed(session->device->remote_chunks,
-		session->provider_handle, facts_out);
+	return is_provider_failure_result_error(is_remote_chunk_provider_failed(
+		session->device->remote_chunks, session->provider_handle,
+		facts_out));
 }
 
 static bool is_remote_only(const struct is_rdma_session *session)
@@ -1188,8 +1230,14 @@ static int is_request_remote_only_reservation(
 		return 0;
 	}
 
-	(void)is_remote_chunk_mapping_abort(session->device->remote_chunks,
-		&session->mapping_claim);
+	{
+		int abort_ret = is_abort_mapping_claim(
+			session->device->remote_chunks, &session->mapping_claim,
+			session->provider_handle);
+
+		if (abort_ret)
+			ret = abort_ret;
+	}
 	session->pending_request_id = 0;
 	session->control_state = IS_RDMA_CONTROL_READY;
 	return ret;
@@ -1338,6 +1386,7 @@ static int is_handle_chunk_grant(struct is_rdma_session *session,
 {
 	struct is_rdma_fabric *fabric = session->fabric;
 	struct is_remote_chunk_mapping_grant *grants;
+	enum is_remote_chunk_mapping_finish_result finish_result;
 	unsigned int grant_count = grant->payload.chunk_grant.chunk_count;
 	u8 expected_pool = is_remote_only(session) ?
 		IS_PROTOCOL_POOL_COMMITTED : IS_PROTOCOL_POOL_OPPORTUNISTIC;
@@ -1371,10 +1420,25 @@ static int is_handle_chunk_grant(struct is_rdma_session *session,
 		grants[index].remote_address = wire_chunk->remote_address;
 		grants[index].remote_key = wire_chunk->remote_key;
 	}
-	ret = is_remote_chunk_mapping_commit(session->device->remote_chunks,
-		&session->mapping_claim, session->provider_handle, grants,
-		grant_count);
-	if (ret) {
+	finish_result = is_remote_chunk_mapping_finish(
+		session->device->remote_chunks, &session->mapping_claim,
+		IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT, session->provider_handle,
+		grants, grant_count);
+	switch (finish_result) {
+	case IS_REMOTE_CHUNK_MAPPING_FINISH_COMMITTED:
+	case IS_REMOTE_CHUNK_MAPPING_FINISH_DUPLICATE:
+		break;
+	case IS_REMOTE_CHUNK_MAPPING_FINISH_STALE:
+		/* The Provider granted capacity for a claim we no longer own. */
+		ret = -EPROTO;
+		goto out;
+	case IS_REMOTE_CHUNK_MAPPING_FINISH_EXHAUSTED:
+		ret = -EOVERFLOW;
+		goto out;
+	case IS_REMOTE_CHUNK_MAPPING_FINISH_SHUTDOWN:
+		ret = -ESHUTDOWN;
+		goto out;
+	default:
 		ret = -EPROTO;
 		goto out;
 	}
@@ -1655,9 +1719,10 @@ static void is_fabric_reservation_work(struct work_struct *work)
 
 	session = is_fabric_session_for_provider(fabric, mapping.provider);
 	if (!session) {
-		(void)is_remote_chunk_mapping_abort(device->remote_chunks,
-			&mapping.claim);
-		ret = -ESTALE;
+		ret = is_abort_mapping_claim(device->remote_chunks, &mapping.claim,
+			mapping.provider);
+		if (!ret)
+			ret = -ESTALE;
 		goto fail_reservation;
 	}
 
@@ -1666,15 +1731,20 @@ static void is_fabric_reservation_work(struct work_struct *work)
 	    session->failure_started ||
 	    session->control_state != IS_RDMA_CONTROL_READY ||
 	    session->pending_request_id) {
-		(void)is_remote_chunk_mapping_abort(device->remote_chunks,
-			&mapping.claim);
-		if (is_session_transport_unavailable_locked(session))
+		ret = is_abort_mapping_claim(device->remote_chunks, &mapping.claim,
+			mapping.provider);
+		if (!ret && is_session_transport_unavailable_locked(session))
 			ret = is_session_record_unavailable_observation(session);
-		else
+		else if (!ret)
 			ret = is_session_repeat_provider_observation(session);
 		mutex_unlock(&session->control_lock);
 		if (ret == -ESTALE || ret == -ESHUTDOWN)
 			ret = 0;
+		if (ret == -EPROTO) {
+			is_rdma_fail(session, ret);
+			queue_work(system_wq, &fabric->reservation_work);
+			return;
+		}
 		if (ret)
 			goto fail_reservation;
 		queue_work(system_wq, &fabric->reservation_work);
@@ -1684,6 +1754,11 @@ static void is_fabric_reservation_work(struct work_struct *work)
 	mutex_unlock(&session->control_lock);
 	if (!ret)
 		return;
+	if (ret == -EPROTO) {
+		is_rdma_fail(session, ret);
+		queue_work(system_wq, &fabric->reservation_work);
+		return;
+	}
 
 fail_reservation:
 	is_fabric_complete_remote_only(fabric, ret);
@@ -1703,6 +1778,7 @@ static void is_fabric_mapping_work(struct work_struct *work)
 	struct is_protocol_message *request;
 	enum is_remote_chunk_next_mapping_result result;
 	unsigned int index;
+	int abort_ret;
 	int ret = 0;
 
 	if (is_remote_only_device(device) || READ_ONCE(fabric->stopping) ||
@@ -1719,14 +1795,20 @@ static void is_fabric_mapping_work(struct work_struct *work)
 	if (result != IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST)
 		return;
 	if (mapping.pool != IS_REMOTE_CHUNK_MAPPING_POOL_OPPORTUNISTIC) {
-		(void)is_remote_chunk_mapping_abort(device->remote_chunks,
-			&mapping.claim);
+		ret = is_abort_mapping_claim(device->remote_chunks, &mapping.claim,
+			mapping.provider);
+		if (ret) {
+			session = is_fabric_session_for_provider(fabric,
+				mapping.provider);
+			if (session)
+				is_rdma_fail(session, ret);
+		}
 		return;
 	}
 	session = is_fabric_session_for_provider(fabric, mapping.provider);
 	if (!session) {
-		(void)is_remote_chunk_mapping_abort(device->remote_chunks,
-			&mapping.claim);
+		(void)is_abort_mapping_claim(device->remote_chunks, &mapping.claim,
+			mapping.provider);
 		return;
 	}
 
@@ -1737,11 +1819,11 @@ static void is_fabric_mapping_work(struct work_struct *work)
 	    session->control_state != IS_RDMA_CONTROL_READY ||
 	    session->pending_request_id || session->heartbeat_request_id ||
 	    session->release_count) {
-		(void)is_remote_chunk_mapping_abort(device->remote_chunks,
-			&session->mapping_claim);
-		if (is_session_transport_unavailable_locked(session))
+		ret = is_abort_mapping_claim(device->remote_chunks,
+			&session->mapping_claim, session->provider_handle);
+		if (!ret && is_session_transport_unavailable_locked(session))
 			ret = is_session_record_unavailable_observation(session);
-		else
+		else if (!ret)
 			ret = is_session_repeat_provider_observation(session);
 		if (ret == -ESTALE || ret == -ESHUTDOWN)
 			ret = 0;
@@ -1757,10 +1839,13 @@ static void is_fabric_mapping_work(struct work_struct *work)
 	session->pending_request_id = request->header.request_id;
 	ret = is_encode_and_send(session, request);
 	if (ret) {
-		(void)is_remote_chunk_mapping_abort(device->remote_chunks,
-			&session->mapping_claim);
+		abort_ret = is_abort_mapping_claim(device->remote_chunks,
+			&session->mapping_claim, session->provider_handle);
+		if (abort_ret)
+			ret = abort_ret;
 		session->pending_request_id = 0;
-		(void)is_session_record_unavailable_observation(session);
+		if (ret != -EPROTO)
+			(void)is_session_record_unavailable_observation(session);
 	} else {
 		is_arm_control_deadline(session);
 	}

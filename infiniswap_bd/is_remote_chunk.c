@@ -211,6 +211,7 @@ struct is_remote_chunk {
 
 struct is_remote_chunk_provider {
 	struct is_remote_chunk_provider_handle handle;
+	struct is_remote_chunk_provider_failure_facts failure_facts;
 	char identifier[IS_REMOTE_CHUNK_PROVIDER_ID_MAX + 1U];
 	unsigned int placement_weight;
 	unsigned int reported_available_chunks;
@@ -221,6 +222,24 @@ struct is_remote_chunk_provider {
 	unsigned char placement_eligible;
 	unsigned char has_observation;
 	unsigned char failed;
+};
+
+struct is_remote_chunk_mapping_claim_internal {
+	unsigned long long magic;
+	unsigned long long module_identity;
+	struct is_remote_chunk_provider_handle provider;
+	unsigned long long claim_id;
+	unsigned long long transition_generation;
+	unsigned long long batch_digest;
+	unsigned int chunk_count;
+	unsigned int capacity_debit;
+};
+
+enum is_remote_chunk_mapping_terminal_action {
+	IS_REMOTE_CHUNK_MAPPING_TERMINAL_NONE = 0,
+	IS_REMOTE_CHUNK_MAPPING_TERMINAL_COMMIT,
+	IS_REMOTE_CHUNK_MAPPING_TERMINAL_ABORT,
+	IS_REMOTE_CHUNK_MAPPING_TERMINAL_PROVIDER_FAILURE,
 };
 
 struct is_remote_chunk_module {
@@ -249,6 +268,9 @@ struct is_remote_chunk_module {
 	unsigned long long next_mapping_generation;
 	unsigned long long next_io_lease_id;
 	unsigned long long invariant_count;
+	struct is_remote_chunk_mapping_claim_internal active_mapping_claim;
+	struct is_remote_chunk_mapping_claim_internal last_mapping_terminal_claim;
+	enum is_remote_chunk_mapping_terminal_action last_mapping_terminal_action;
 	enum is_remote_chunk_invariant_event latest_invariant;
 	unsigned int active_mapping_claims;
 	unsigned int active_eviction_claims;
@@ -257,17 +279,6 @@ struct is_remote_chunk_module {
 	unsigned int assigned_chunks;
 	unsigned int usable_chunks;
 	unsigned char quiescing;
-};
-
-struct is_remote_chunk_mapping_claim_internal {
-	unsigned long long magic;
-	unsigned long long module_identity;
-	struct is_remote_chunk_provider_handle provider;
-	unsigned long long claim_id;
-	unsigned long long transition_generation;
-	unsigned long long batch_digest;
-	unsigned int chunk_count;
-	unsigned int reserved;
 };
 
 struct is_remote_chunk_eviction_claim_internal {
@@ -427,7 +438,13 @@ bool is_remote_chunk_provider_handle_equal(
 		left.opaque[1] == right.opaque[1];
 }
 
-static int is_remote_chunk_provider_index_locked(
+static bool is_remote_chunk_provider_handle_well_formed(
+	struct is_remote_chunk_provider_handle provider)
+{
+	return provider.opaque[0] && provider.opaque[1];
+}
+
+static int is_remote_chunk_provider_roster_index_locked(
 	const struct is_remote_chunk_module *module,
 	struct is_remote_chunk_provider_handle provider,
 	unsigned int *provider_index_out)
@@ -435,19 +452,32 @@ static int is_remote_chunk_provider_index_locked(
 	unsigned int index;
 
 	for (index = 0; index < module->provider_count; index++) {
-		const struct is_remote_chunk_provider *candidate =
-			&module->providers[index];
-
-		if (!is_remote_chunk_provider_handle_equal(candidate->handle,
-			provider))
+		if (!is_remote_chunk_provider_handle_equal(
+			module->providers[index].handle, provider))
 			continue;
-		if (candidate->failed)
-			return -ESTALE;
 		if (provider_index_out)
 			*provider_index_out = index;
 		return 0;
 	}
 	return -ESTALE;
+}
+
+static int is_remote_chunk_provider_index_locked(
+	const struct is_remote_chunk_module *module,
+	struct is_remote_chunk_provider_handle provider,
+	unsigned int *provider_index_out)
+{
+	unsigned int index;
+	int status = is_remote_chunk_provider_roster_index_locked(module, provider,
+		&index);
+
+	if (status)
+		return status;
+	if (module->providers[index].failed)
+		return -ESTALE;
+	if (provider_index_out)
+		*provider_index_out = index;
+	return 0;
 }
 
 static bool is_remote_chunk_provider_valid_locked(
@@ -663,7 +693,33 @@ static void is_remote_chunk_note_invariant_locked(
 	module->latest_invariant = event;
 }
 
-static int is_remote_chunk_claim_validate_locked(
+static bool is_remote_chunk_mapping_claim_well_formed(
+	const struct is_remote_chunk_mapping_claim_internal *claim)
+{
+	return claim->magic == IS_REMOTE_CHUNK_CLAIM_MAGIC &&
+		claim->module_identity &&
+		is_remote_chunk_provider_handle_well_formed(claim->provider) &&
+		claim->claim_id && claim->transition_generation &&
+		claim->chunk_count &&
+		claim->capacity_debit == claim->chunk_count;
+}
+
+static bool is_remote_chunk_mapping_claim_equal(
+	const struct is_remote_chunk_mapping_claim_internal *left,
+	const struct is_remote_chunk_mapping_claim_internal *right)
+{
+	return left->magic == right->magic &&
+		left->module_identity == right->module_identity &&
+		is_remote_chunk_provider_handle_equal(left->provider,
+			right->provider) &&
+		left->claim_id == right->claim_id &&
+		left->transition_generation == right->transition_generation &&
+		left->batch_digest == right->batch_digest &&
+		left->chunk_count == right->chunk_count &&
+		left->capacity_debit == right->capacity_debit;
+}
+
+static bool is_remote_chunk_mapping_claim_active_locked(
 	const struct is_remote_chunk_module *module,
 	const struct is_remote_chunk_mapping_claim_internal *claim)
 {
@@ -671,16 +727,11 @@ static int is_remote_chunk_claim_validate_locked(
 	unsigned int member_count = 0;
 	unsigned int index;
 
-	if (claim->magic != IS_REMOTE_CHUNK_CLAIM_MAGIC || !claim->claim_id ||
-	    !claim->transition_generation || !claim->chunk_count)
-		return -EINVAL;
-	if (claim->module_identity != module->identity)
-		return -ESTALE;
-	if (!is_remote_chunk_provider_valid_locked(module, claim->provider))
-		return -ESTALE;
-	if (claim->chunk_count > module->chunk_count)
-		return -EINVAL;
-
+	if (!is_remote_chunk_mapping_claim_equal(claim,
+		&module->active_mapping_claim) ||
+	    !is_remote_chunk_provider_valid_locked(module, claim->provider) ||
+	    claim->chunk_count > module->chunk_count)
+		return false;
 	for (index = 0; index < module->chunk_count; index++) {
 		const struct is_remote_chunk *chunk = &module->chunks[index];
 
@@ -690,15 +741,13 @@ static int is_remote_chunk_claim_validate_locked(
 		    chunk->transition_generation != claim->transition_generation ||
 		    !is_remote_chunk_provider_handle_equal(chunk->provider,
 			claim->provider))
-			return -ESTALE;
+			return false;
 		selected[index] = true;
 		member_count++;
 	}
-	if (member_count != claim->chunk_count ||
-	    is_remote_chunk_batch_digest(selected, module->chunk_count) !=
-		claim->batch_digest)
-		return -ESTALE;
-	return 0;
+	return member_count == claim->chunk_count &&
+		is_remote_chunk_batch_digest(selected, module->chunk_count) ==
+			claim->batch_digest;
 }
 
 static int is_remote_chunk_eviction_claim_validate_locked(
@@ -750,6 +799,26 @@ static bool is_remote_chunk_eviction_claim_active_locked(
 		&internal) == 0;
 }
 
+static void is_remote_chunk_mapping_terminal_supersede_locked(
+	struct is_remote_chunk_module *module)
+{
+	memset(&module->last_mapping_terminal_claim, 0,
+		sizeof(module->last_mapping_terminal_claim));
+	module->last_mapping_terminal_action =
+		IS_REMOTE_CHUNK_MAPPING_TERMINAL_NONE;
+}
+
+static void is_remote_chunk_mapping_terminal_record_locked(
+	struct is_remote_chunk_module *module,
+	const struct is_remote_chunk_mapping_claim_internal *claim,
+	enum is_remote_chunk_mapping_terminal_action action)
+{
+	module->last_mapping_terminal_claim = *claim;
+	module->last_mapping_terminal_action = action;
+	memset(&module->active_mapping_claim, 0,
+		sizeof(module->active_mapping_claim));
+}
+
 static int is_remote_chunk_mapping_begin_locked(
 	struct is_remote_chunk_module *module,
 	struct is_remote_chunk_provider_handle provider,
@@ -790,6 +859,9 @@ static int is_remote_chunk_mapping_begin_locked(
 	claim.batch_digest = is_remote_chunk_batch_digest(selected,
 		module->chunk_count);
 	claim.chunk_count = chunk_count;
+	claim.capacity_debit = chunk_count;
+	is_remote_chunk_mapping_terminal_supersede_locked(module);
+	module->active_mapping_claim = claim;
 	for (index = 0; index < module->chunk_count; index++) {
 		struct is_remote_chunk *chunk;
 
@@ -1139,7 +1211,9 @@ is_remote_chunk_provider_observe(
 	unsigned int mapping_chunks = 0;
 	enum is_remote_chunk_provider_observation_result result;
 
-	if (!module || !is_remote_chunk_provider_observation_valid(observation))
+	if (!module || !is_remote_chunk_provider_handle_well_formed(
+		provider_handle) ||
+	    !is_remote_chunk_provider_observation_valid(observation))
 		return IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_INVALID;
 	is_remote_chunk_lock(&module->lock, &flags);
 	if (module->quiescing) {
@@ -1412,7 +1486,7 @@ enum is_remote_chunk_next_mapping_result is_remote_chunk_next_mapping(
 	return IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST;
 }
 
-static int is_remote_chunk_mapping_grants_validate_locked(
+static bool is_remote_chunk_mapping_grants_shape_valid(
 	const struct is_remote_chunk_module *module,
 	const struct is_remote_chunk_mapping_claim_internal *claim,
 	const struct is_remote_chunk_mapping_grant *grants,
@@ -1421,90 +1495,213 @@ static int is_remote_chunk_mapping_grants_validate_locked(
 	bool selected[IS_REMOTE_CHUNK_MAX_CHUNKS] = { false };
 	unsigned int index;
 
+	if (!grants || grant_count != claim->chunk_count ||
+	    grant_count != claim->capacity_debit)
+		return false;
 	for (index = 0; index < grant_count; index++) {
 		const struct is_remote_chunk_mapping_grant *grant = &grants[index];
-		const struct is_remote_chunk *chunk;
 		unsigned int other;
 
 		if (grant->logical_chunk >= module->chunk_count ||
 		    !grant->remote_address || !grant->remote_key ||
 		    grant->remote_address > IS_REMOTE_CHUNK_ID_MAX -
 			(IS_REMOTE_CHUNK_SECTORS_PER_CHUNK *
-			 IS_REMOTE_CHUNK_SECTOR_BYTES - 1ULL))
-			return -EINVAL;
-		if (selected[grant->logical_chunk])
-			return -EINVAL;
+			 IS_REMOTE_CHUNK_SECTOR_BYTES - 1ULL) ||
+		    selected[grant->logical_chunk])
+			return false;
 		selected[grant->logical_chunk] = true;
-		chunk = &module->chunks[grant->logical_chunk];
+		for (other = 0; other < index; other++) {
+			if (grants[other].provider_chunk == grant->provider_chunk)
+				return false;
+		}
+	}
+	return is_remote_chunk_batch_digest(selected, module->chunk_count) ==
+		claim->batch_digest;
+}
+
+static bool is_remote_chunk_mapping_grants_available_locked(
+	const struct is_remote_chunk_module *module,
+	const struct is_remote_chunk_mapping_claim_internal *claim,
+	const struct is_remote_chunk_mapping_grant *grants,
+	unsigned int grant_count)
+{
+	unsigned int index;
+
+	for (index = 0; index < grant_count; index++) {
+		const struct is_remote_chunk_mapping_grant *grant = &grants[index];
+		const struct is_remote_chunk *chunk =
+			&module->chunks[grant->logical_chunk];
+		unsigned int other;
+
 		if (chunk->state != IS_REMOTE_CHUNK_MAPPING ||
 		    chunk->mapping_claim_id != claim->claim_id ||
 		    chunk->transition_generation != claim->transition_generation ||
 		    !is_remote_chunk_provider_handle_equal(chunk->provider,
 			claim->provider))
-			return -EINVAL;
-		for (other = 0; other < index; other++) {
-			if (grants[other].provider_chunk == grant->provider_chunk)
-				return -EINVAL;
-		}
+			return false;
 		for (other = 0; other < module->chunk_count; other++) {
-			const struct is_remote_chunk *mapped =
+			const struct is_remote_chunk *assigned =
 				&module->chunks[other];
 
-			if (mapped->state == IS_REMOTE_CHUNK_MAPPED &&
-			    mapped->provider_chunk == grant->provider_chunk &&
-			    is_remote_chunk_provider_handle_equal(mapped->provider,
+			if ((assigned->state == IS_REMOTE_CHUNK_MAPPED ||
+			     assigned->state == IS_REMOTE_CHUNK_EVICTING) &&
+			    assigned->provider_chunk == grant->provider_chunk &&
+			    is_remote_chunk_provider_handle_equal(assigned->provider,
 				claim->provider))
-				return -EINVAL;
+				return false;
 		}
 	}
-	if (is_remote_chunk_batch_digest(selected, module->chunk_count) !=
-	    claim->batch_digest)
-		return -EINVAL;
-	return 0;
+	return true;
 }
 
-int is_remote_chunk_mapping_commit(
+static bool is_remote_chunk_mapping_grants_match_terminal_locked(
+	const struct is_remote_chunk_module *module,
+	const struct is_remote_chunk_mapping_claim_internal *claim,
+	const struct is_remote_chunk_mapping_grant *grants,
+	unsigned int grant_count)
+{
+	unsigned int index;
+
+	for (index = 0; index < grant_count; index++) {
+		const struct is_remote_chunk_mapping_grant *grant = &grants[index];
+		const struct is_remote_chunk *chunk =
+			&module->chunks[grant->logical_chunk];
+
+		if (chunk->state != IS_REMOTE_CHUNK_MAPPED ||
+		    !is_remote_chunk_provider_handle_equal(chunk->provider,
+			claim->provider) ||
+		    chunk->provider_chunk != grant->provider_chunk ||
+		    chunk->remote_address != grant->remote_address ||
+		    chunk->remote_key != grant->remote_key)
+			return false;
+	}
+	return true;
+}
+
+enum is_remote_chunk_mapping_finish_result is_remote_chunk_mapping_finish(
 	struct is_remote_chunk_module *module,
 	const struct is_remote_chunk_mapping_claim *claim_storage,
+	enum is_remote_chunk_mapping_finish_action action,
 	struct is_remote_chunk_provider_handle provider,
 	const struct is_remote_chunk_mapping_grant *grants,
 	unsigned int grant_count)
 {
 	struct is_remote_chunk_mapping_claim_internal claim;
 	is_remote_chunk_lock_flags_t flags = 0;
+	enum is_remote_chunk_mapping_terminal_action terminal_action;
+	enum is_remote_chunk_mapping_finish_result result;
+	unsigned int provider_index;
 	unsigned int index;
-	int status;
 
-	if (!module || !claim_storage || !grants || !grant_count ||
-	    grant_count > module->chunk_count)
-		return -EINVAL;
+	if (!module || !claim_storage ||
+	    !is_remote_chunk_provider_handle_well_formed(provider))
+		return IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID;
 	is_remote_chunk_claim_decode(claim_storage, &claim);
+	if (!is_remote_chunk_mapping_claim_well_formed(&claim) ||
+	    claim.chunk_count > module->chunk_count)
+		return IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID;
+	if (action == IS_REMOTE_CHUNK_MAPPING_FINISH_ABORT &&
+	    (grants || grant_count))
+		return IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID;
+	if (action != IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT &&
+	    action != IS_REMOTE_CHUNK_MAPPING_FINISH_ABORT)
+		return IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID;
+
 	is_remote_chunk_lock(&module->lock, &flags);
-	status = is_remote_chunk_claim_validate_locked(module, &claim);
-	if (status)
+	if (claim.module_identity != module->identity ||
+	    is_remote_chunk_provider_roster_index_locked(module, claim.provider,
+		&provider_index) || module->providers[provider_index].failed) {
+		result = IS_REMOTE_CHUNK_MAPPING_FINISH_STALE;
 		goto out;
-	if (module->quiescing) {
-		status = -ESHUTDOWN;
+	}
+	if (is_remote_chunk_mapping_claim_equal(&claim,
+		&module->last_mapping_terminal_claim)) {
+		if (!is_remote_chunk_provider_handle_equal(provider,
+			claim.provider)) {
+			result = is_remote_chunk_provider_index_locked(module, provider,
+				NULL) ? IS_REMOTE_CHUNK_MAPPING_FINISH_STALE :
+				IS_REMOTE_CHUNK_MAPPING_FINISH_CONFLICT;
+			goto out;
+		}
+		if (action == IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT &&
+		    !is_remote_chunk_mapping_grants_shape_valid(module, &claim,
+			grants, grant_count)) {
+			result = IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID_GRANT;
+			goto out;
+		}
+		terminal_action = action == IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT ?
+			IS_REMOTE_CHUNK_MAPPING_TERMINAL_COMMIT :
+			IS_REMOTE_CHUNK_MAPPING_TERMINAL_ABORT;
+		if (terminal_action != module->last_mapping_terminal_action ||
+		    (terminal_action == IS_REMOTE_CHUNK_MAPPING_TERMINAL_COMMIT &&
+		     !is_remote_chunk_mapping_grants_match_terminal_locked(module,
+			&claim, grants, grant_count)))
+			result = IS_REMOTE_CHUNK_MAPPING_FINISH_CONFLICT;
+		else
+			result = IS_REMOTE_CHUNK_MAPPING_FINISH_DUPLICATE;
+		goto out;
+	}
+	if (claim.claim_id > module->next_mapping_claim_id ||
+	    claim.transition_generation > module->next_transition_generation) {
+		result = IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID;
+		goto out;
+	}
+	if (!is_remote_chunk_mapping_claim_active_locked(module, &claim)) {
+		result = IS_REMOTE_CHUNK_MAPPING_FINISH_STALE;
 		goto out;
 	}
 	if (!is_remote_chunk_provider_handle_equal(provider, claim.provider)) {
-		status = -ESTALE;
+		result = is_remote_chunk_provider_index_locked(module, provider, NULL) ?
+			IS_REMOTE_CHUNK_MAPPING_FINISH_STALE :
+			IS_REMOTE_CHUNK_MAPPING_FINISH_CONFLICT;
 		goto out;
 	}
-	if (grant_count != claim.chunk_count) {
-		status = -EINVAL;
+	if (action == IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT &&
+	    !is_remote_chunk_mapping_grants_shape_valid(module, &claim, grants,
+		grant_count)) {
+		result = IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID_GRANT;
 		goto out;
 	}
-	status = is_remote_chunk_mapping_grants_validate_locked(module, &claim,
-		grants, grant_count);
-	if (status)
-		goto out;
-	if (module->next_mapping_generation >
-	    IS_REMOTE_CHUNK_ID_MAX - grant_count) {
-		status = -EOVERFLOW;
+	if (action == IS_REMOTE_CHUNK_MAPPING_FINISH_COMMIT &&
+	    module->quiescing) {
+		result = IS_REMOTE_CHUNK_MAPPING_FINISH_SHUTDOWN;
 		goto out;
 	}
+	if (!module->active_mapping_claims) {
+		result = IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID;
+		goto out;
+	}
+	if (action == IS_REMOTE_CHUNK_MAPPING_FINISH_ABORT) {
+		for (index = 0; index < module->chunk_count; index++) {
+			struct is_remote_chunk *chunk = &module->chunks[index];
 
+			if (chunk->mapping_claim_id != claim.claim_id)
+				continue;
+			memset(&chunk->provider, 0, sizeof(chunk->provider));
+			chunk->mapping_claim_id = 0;
+			chunk->transition_generation = 0;
+			chunk->state = IS_REMOTE_CHUNK_UNMAPPED;
+		}
+		module->active_mapping_claims--;
+		is_remote_chunk_mapping_terminal_record_locked(module, &claim,
+			IS_REMOTE_CHUNK_MAPPING_TERMINAL_ABORT);
+		result = IS_REMOTE_CHUNK_MAPPING_FINISH_ABORTED;
+		goto out;
+	}
+	if (!is_remote_chunk_mapping_grants_available_locked(module, &claim,
+		grants, grant_count)) {
+		result = IS_REMOTE_CHUNK_MAPPING_FINISH_INVALID_GRANT;
+		goto out;
+	}
+	if (module->next_mapping_generation >
+		IS_REMOTE_CHUNK_ID_MAX - grant_count ||
+	    module->assigned_chunks > IS_REMOTE_CHUNK_U32_MAX -
+		claim.capacity_debit ||
+	    module->usable_chunks > IS_REMOTE_CHUNK_U32_MAX -
+		claim.capacity_debit) {
+		result = IS_REMOTE_CHUNK_MAPPING_FINISH_EXHAUSTED;
+		goto out;
+	}
 	for (index = 0; index < grant_count; index++) {
 		const struct is_remote_chunk_mapping_grant *grant = &grants[index];
 		struct is_remote_chunk *chunk =
@@ -1522,46 +1719,15 @@ int is_remote_chunk_mapping_commit(
 		chunk->transition_generation = 0;
 		chunk->state = IS_REMOTE_CHUNK_MAPPED;
 	}
-	module->assigned_chunks += grant_count;
-	module->usable_chunks += grant_count;
+	module->assigned_chunks += claim.capacity_debit;
+	module->usable_chunks += claim.capacity_debit;
 	module->active_mapping_claims--;
-	status = 0;
+	is_remote_chunk_mapping_terminal_record_locked(module, &claim,
+		IS_REMOTE_CHUNK_MAPPING_TERMINAL_COMMIT);
+	result = IS_REMOTE_CHUNK_MAPPING_FINISH_COMMITTED;
 out:
 	is_remote_chunk_unlock(&module->lock, &flags);
-	return status;
-}
-
-int is_remote_chunk_mapping_abort(
-	struct is_remote_chunk_module *module,
-	const struct is_remote_chunk_mapping_claim *claim_storage)
-{
-	struct is_remote_chunk_mapping_claim_internal claim;
-	is_remote_chunk_lock_flags_t flags = 0;
-	unsigned int index;
-	int status;
-
-	if (!module || !claim_storage)
-		return -EINVAL;
-	is_remote_chunk_claim_decode(claim_storage, &claim);
-	is_remote_chunk_lock(&module->lock, &flags);
-	status = is_remote_chunk_claim_validate_locked(module, &claim);
-	if (status)
-		goto out;
-	for (index = 0; index < module->chunk_count; index++) {
-		struct is_remote_chunk *chunk = &module->chunks[index];
-
-		if (chunk->mapping_claim_id != claim.claim_id)
-			continue;
-		memset(&chunk->provider, 0, sizeof(chunk->provider));
-		chunk->mapping_claim_id = 0;
-		chunk->transition_generation = 0;
-		chunk->state = IS_REMOTE_CHUNK_UNMAPPED;
-	}
-	module->active_mapping_claims--;
-	status = 0;
-out:
-	is_remote_chunk_unlock(&module->lock, &flags);
-	return status;
+	return result;
 }
 
 static int is_remote_chunk_find_provider_chunk_locked(
@@ -1698,6 +1864,7 @@ int is_remote_chunk_eviction_begin(
 	claim.batch_digest = is_remote_chunk_batch_digest(selected,
 		module->chunk_count);
 	claim.chunk_count = chunk_count;
+	is_remote_chunk_mapping_terminal_supersede_locked(module);
 	for (index = 0; index < module->chunk_count; index++) {
 		struct is_remote_chunk *chunk;
 
@@ -1900,25 +2067,32 @@ out:
 	return status;
 }
 
-int is_remote_chunk_provider_failed(
+enum is_remote_chunk_provider_failure_result is_remote_chunk_provider_failed(
 	struct is_remote_chunk_module *module,
 	struct is_remote_chunk_provider_handle provider,
 	struct is_remote_chunk_provider_failure_facts *facts_out)
 {
 	struct is_remote_chunk_provider_failure_facts facts = { 0 };
 	is_remote_chunk_lock_flags_t flags = 0;
+	enum is_remote_chunk_provider_failure_result result;
 	unsigned int mapping_claims = 0;
 	unsigned int eviction_claims = 0;
 	unsigned int provider_index;
 	unsigned int index;
-	int status = 0;
 
-	if (!module || !facts_out)
-		return -EINVAL;
+	if (!module || !facts_out ||
+	    !is_remote_chunk_provider_handle_well_formed(provider))
+		return IS_REMOTE_CHUNK_PROVIDER_FAILURE_INVALID;
+	*facts_out = facts;
 	is_remote_chunk_lock(&module->lock, &flags);
-	if (is_remote_chunk_provider_index_locked(module, provider,
+	if (is_remote_chunk_provider_roster_index_locked(module, provider,
 		&provider_index)) {
-		status = -ESTALE;
+		result = IS_REMOTE_CHUNK_PROVIDER_FAILURE_STALE_EPOCH;
+		goto out;
+	}
+	if (module->providers[provider_index].failed) {
+		*facts_out = module->providers[provider_index].failure_facts;
+		result = IS_REMOTE_CHUNK_PROVIDER_FAILURE_DUPLICATE;
 		goto out;
 	}
 	for (index = 0; index < module->chunk_count; index++) {
@@ -1955,14 +2129,25 @@ int is_remote_chunk_provider_failed(
 		}
 	}
 	if (module->next_mapping_generation >
-	    IS_REMOTE_CHUNK_ID_MAX - facts.affected_chunks ||
+		IS_REMOTE_CHUNK_ID_MAX - facts.affected_chunks ||
 	    module->assigned_chunks < facts.assigned_chunks ||
 	    module->usable_chunks < facts.usable_chunks ||
 	    module->active_mapping_claims < mapping_claims ||
-	    module->active_eviction_claims < eviction_claims) {
-		status = -EOVERFLOW;
+	    module->active_eviction_claims < eviction_claims ||
+	    module->next_transition_generation == IS_REMOTE_CHUNK_ID_MAX ||
+	    (mapping_claims &&
+	     (!is_remote_chunk_mapping_claim_well_formed(
+		&module->active_mapping_claim) ||
+	      !is_remote_chunk_provider_handle_equal(
+		module->active_mapping_claim.provider, provider)))) {
+		result = IS_REMOTE_CHUNK_PROVIDER_FAILURE_EXHAUSTED;
 		goto out;
 	}
+	if (mapping_claims)
+		is_remote_chunk_mapping_terminal_record_locked(module,
+			&module->active_mapping_claim,
+			IS_REMOTE_CHUNK_MAPPING_TERMINAL_PROVIDER_FAILURE);
+	module->next_transition_generation++;
 	for (index = 0; index < module->chunk_count; index++) {
 		struct is_remote_chunk *chunk = &module->chunks[index];
 
@@ -1978,11 +2163,13 @@ int is_remote_chunk_provider_failed(
 	module->providers[provider_index].placement_eligible = 0;
 	module->providers[provider_index].exclusion =
 		IS_REMOTE_CHUNK_PROVIDER_EXCLUDE_UNHEALTHY;
+	module->providers[provider_index].failure_facts = facts;
 	is_remote_chunk_wake_lease_waiters_locked(module);
 	*facts_out = facts;
+	result = IS_REMOTE_CHUNK_PROVIDER_FAILURE_APPLIED;
 out:
 	is_remote_chunk_unlock(&module->lock, &flags);
-	return status;
+	return result;
 }
 
 int is_remote_chunk_io_lease_acquire(
