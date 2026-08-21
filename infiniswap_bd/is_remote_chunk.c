@@ -202,8 +202,8 @@ struct is_remote_chunk_module {
 #endif
 	struct is_remote_chunk *chunks;
 	struct is_remote_chunk_provider *providers;
-	unsigned int *placement_candidates;
-	unsigned int *placement_sample;
+	unsigned int *placement_candidate_indices;
+	unsigned int *placement_sample_indices;
 	unsigned long *valid_sectors;
 	enum is_remote_chunk_mode mode;
 	unsigned int chunk_count;
@@ -824,13 +824,13 @@ int is_remote_chunk_module_create(
 	if (config->provider_count) {
 		module->providers = is_remote_chunk_allocate_array(
 			config->provider_count, sizeof(*module->providers));
-		module->placement_candidates = is_remote_chunk_allocate_array(
+		module->placement_candidate_indices = is_remote_chunk_allocate_array(
 			config->provider_count,
-			sizeof(*module->placement_candidates));
-		module->placement_sample = is_remote_chunk_allocate_array(
-			config->provider_count, sizeof(*module->placement_sample));
-		if (!module->providers || !module->placement_candidates ||
-		    !module->placement_sample) {
+			sizeof(*module->placement_candidate_indices));
+		module->placement_sample_indices = is_remote_chunk_allocate_array(
+			config->provider_count, sizeof(*module->placement_sample_indices));
+		if (!module->providers || !module->placement_candidate_indices ||
+		    !module->placement_sample_indices) {
 			status = -ENOMEM;
 			goto free_provider_storage;
 		}
@@ -885,8 +885,8 @@ destroy_lock:
 free_validity:
 	is_remote_chunk_validity_free(module->valid_sectors);
 free_provider_storage:
-	is_remote_chunk_free(module->placement_sample);
-	is_remote_chunk_free(module->placement_candidates);
+	is_remote_chunk_free(module->placement_sample_indices);
+	is_remote_chunk_free(module->placement_candidate_indices);
 	is_remote_chunk_free(module->providers);
 	is_remote_chunk_free(module->chunks);
 free_module:
@@ -932,8 +932,8 @@ int is_remote_chunk_module_destroy(struct is_remote_chunk_module *module)
 	is_remote_chunk_wait_destroy(module);
 	is_remote_chunk_lock_destroy(&module->lock);
 	is_remote_chunk_validity_free(module->valid_sectors);
-	is_remote_chunk_free(module->placement_sample);
-	is_remote_chunk_free(module->placement_candidates);
+	is_remote_chunk_free(module->placement_sample_indices);
+	is_remote_chunk_free(module->placement_candidate_indices);
 	is_remote_chunk_free(module->providers);
 	is_remote_chunk_free(module->chunks);
 	is_remote_chunk_free(module);

@@ -1999,8 +1999,7 @@ static int is_create_remote_chunk_module(struct is_device *device,
 	config = (struct is_remote_chunk_config) {
 		.mode = remote_only ? IS_REMOTE_CHUNK_MODE_REMOTE_ONLY :
 			IS_REMOTE_CHUNK_MODE_BACKED,
-		.chunk_count = remote_configured ?
-			(unsigned int)remote_chunk_count : 1U,
+		.chunk_count = (unsigned int)remote_chunk_count,
 		.hot_policy = device->remote_chunk_hot_policy_config,
 		.providers = providers,
 		.provider_count = provider_count,
