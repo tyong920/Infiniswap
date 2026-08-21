@@ -774,8 +774,7 @@ static int is_remote_chunk_mapping_begin_locked(
 		return -ESHUTDOWN;
 	if (!is_remote_chunk_provider_valid_locked(module, provider))
 		return -ESTALE;
-	if (module->active_mapping_claims ||
-	    is_remote_chunk_claim_active_locked(module, claim_out))
+	if (is_remote_chunk_claim_active_locked(module, claim_out))
 		return -EBUSY;
 	for (index = 0; index < chunk_count; index++) {
 		unsigned int logical_chunk = logical_chunks[index];

@@ -288,16 +288,9 @@ static int map_backed_chunk(struct is_remote_chunk_module *module,
 	struct is_remote_chunk_mapping_request request = { 0 };
 	struct is_remote_chunk_mapping_grant grant =
 		mapping_grant(logical_chunk, provider_chunk);
-	bool mapping_needed = false;
 	int status;
 
-	status = is_remote_chunk_note_activity(module, logical_chunk, 1,
-		IS_REMOTE_CHUNK_ACTIVITY_WRITE, &mapping_needed);
-	if (!status)
-		status = is_remote_chunk_note_activity(module, logical_chunk, 1,
-			IS_REMOTE_CHUNK_ACTIVITY_WRITE, &mapping_needed);
-	if (!status && !mapping_needed)
-		status = -EINVAL;
+	status = make_chunk_hot(module, logical_chunk);
 	if (!status)
 		status = begin_backed_mapping(module, provider, &request.claim,
 			&request.logical_chunk);

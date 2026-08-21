@@ -341,6 +341,25 @@ is_remote_chunk_exclusion(enum is_placement_exclude_reason reason)
 	}
 }
 
+static int is_provider_observation_result_error(
+	enum is_remote_chunk_provider_observation_result result)
+{
+	switch (result) {
+	case IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_APPLIED:
+	case IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_STALE:
+	case IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_DUPLICATE:
+		return 0;
+	case IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_CONFLICT:
+		return -EPROTO;
+	case IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_STALE_EPOCH:
+		return -ESTALE;
+	case IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_SHUTDOWN:
+		return -ESHUTDOWN;
+	default:
+		return -EINVAL;
+	}
+}
+
 static int is_session_record_provider_observation(
 	struct is_rdma_session *session, unsigned int available_chunks,
 	bool placement_eligible, enum is_placement_exclude_reason exclusion,
@@ -362,15 +381,9 @@ static int is_session_record_provider_observation(
 		&observation);
 	if (result == IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_STALE)
 		return 0;
-	if (result == IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_CONFLICT)
-		return -EPROTO;
-	if (result == IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_STALE_EPOCH)
-		return -ESTALE;
-	if (result == IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_SHUTDOWN)
-		return -ESHUTDOWN;
-	if (result != IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_APPLIED &&
-	    result != IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_DUPLICATE)
-		return -EINVAL;
+	ret = is_provider_observation_result_error(result);
+	if (ret)
+		return ret;
 	session->provider_observation = observation;
 	session->has_provider_observation = true;
 	if (!is_remote_only_session(session))
@@ -419,17 +432,7 @@ static int is_session_repeat_provider_observation(
 	result = is_remote_chunk_provider_observe(
 		session->device->remote_chunks, session->provider_handle,
 		&session->provider_observation);
-	if (result == IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_APPLIED ||
-	    result == IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_DUPLICATE ||
-	    result == IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_STALE)
-		return 0;
-	if (result == IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_CONFLICT)
-		return -EPROTO;
-	if (result == IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_STALE_EPOCH)
-		return -ESTALE;
-	if (result == IS_REMOTE_CHUNK_PROVIDER_OBSERVATION_SHUTDOWN)
-		return -ESHUTDOWN;
-	return -EINVAL;
+	return is_provider_observation_result_error(result);
 }
 
 static bool is_session_transport_unavailable_locked(
@@ -1881,6 +1884,7 @@ static void is_fabric_mapping_work(struct work_struct *work)
 		(void)is_remote_chunk_mapping_abort(device->remote_chunks,
 			&session->mapping_claim);
 		session->pending_request_id = 0;
+		(void)is_session_record_unavailable_observation(session);
 	} else {
 		is_arm_control_deadline(session);
 	}
