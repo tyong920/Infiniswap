@@ -138,11 +138,33 @@ struct is_remote_chunk_transport_mapping {
 	unsigned int logical_chunk;
 };
 
+enum is_remote_chunk_mapping_pool {
+	IS_REMOTE_CHUNK_MAPPING_POOL_OPPORTUNISTIC = 1,
+	IS_REMOTE_CHUNK_MAPPING_POOL_COMMITTED,
+};
+
 struct is_remote_chunk_mapping_grant {
 	unsigned int logical_chunk;
 	unsigned int provider_chunk;
 	unsigned long long remote_address;
 	unsigned int remote_key;
+};
+
+struct is_remote_chunk_mapping_request {
+	struct is_remote_chunk_provider_handle provider;
+	enum is_remote_chunk_mapping_pool pool;
+	unsigned int logical_chunk;
+	struct is_remote_chunk_mapping_claim claim;
+};
+
+enum is_remote_chunk_next_mapping_result {
+	IS_REMOTE_CHUNK_NEXT_MAPPING_REQUEST = 0,
+	IS_REMOTE_CHUNK_NEXT_MAPPING_NO_HOT_RANGE,
+	IS_REMOTE_CHUNK_NEXT_MAPPING_PENDING_PROVIDER_FACTS,
+	IS_REMOTE_CHUNK_NEXT_MAPPING_NO_ELIGIBLE_CAPACITY,
+	IS_REMOTE_CHUNK_NEXT_MAPPING_CLAIM_ACTIVE,
+	IS_REMOTE_CHUNK_NEXT_MAPPING_SHUTDOWN,
+	IS_REMOTE_CHUNK_NEXT_MAPPING_INVALID_INPUT,
 };
 
 struct is_remote_chunk_provider_activity {
@@ -280,12 +302,13 @@ int is_remote_chunk_mapping_begin_explicit(
 	const unsigned int *logical_chunks, unsigned int chunk_count,
 	struct is_remote_chunk_mapping_claim *claim_out);
 
-/* Backed Mode selects the next unmapped Hot Range inside the module. */
-int is_remote_chunk_mapping_begin_hot(
+/*
+ * Backed Mode atomically selects one Hot Range and Memory Provider, reserves
+ * Opportunistic Pool capacity, and returns a generation-bound claim.
+ */
+enum is_remote_chunk_next_mapping_result is_remote_chunk_next_mapping(
 	struct is_remote_chunk_module *module,
-	struct is_remote_chunk_provider_handle provider,
-	struct is_remote_chunk_mapping_claim *claim_out,
-	unsigned int *logical_chunk_out);
+	struct is_remote_chunk_mapping_request *request_out);
 
 int is_remote_chunk_mapping_commit(
 	struct is_remote_chunk_module *module,

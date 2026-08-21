@@ -28,6 +28,8 @@ jobs:
       - name: Build and test the public interface
         run: |
           cc -std=c11 -Wall -Wextra -Wpedantic -Werror -pthread \
+            -DIS_REMOTE_CHUNK_ALLOCATION_TEST \
+            -Wl,--wrap=calloc \
             ${{ matrix.cflags }} \
             infiniswap_bd/is_remote_chunk.c \
             infiniswap_bd/tests/remote-chunk-test.c \
