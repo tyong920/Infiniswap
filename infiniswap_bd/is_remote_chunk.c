@@ -71,21 +71,21 @@ static void is_remote_chunk_validity_free(unsigned long *validity)
 
 static unsigned long long is_remote_chunk_allocate_module_identity(void)
 {
-	s64 current = atomic64_read(&is_remote_chunk_next_module_identity);
+	s64 previous = atomic64_read(&is_remote_chunk_next_module_identity);
 
 	for (;;) {
-		unsigned long long current_value = (unsigned long long)current;
+		unsigned long long previous_value = (unsigned long long)previous;
 		unsigned long long next_value;
 		s64 observed;
 
-		if (current_value >= IS_REMOTE_CHUNK_ID_MAX - 1ULL)
+		if (previous_value >= IS_REMOTE_CHUNK_ID_MAX - 1ULL)
 			return 0;
-		next_value = current_value + 1ULL;
+		next_value = previous_value + 1ULL;
 		observed = atomic64_cmpxchg(&is_remote_chunk_next_module_identity,
-			current, (s64)next_value);
-		if (observed == current)
+			previous, (s64)next_value);
+		if (observed == previous)
 			return next_value;
-		current = observed;
+		previous = observed;
 	}
 }
 #else
@@ -158,17 +158,17 @@ static void is_remote_chunk_validity_free(unsigned long *validity)
 
 static unsigned long long is_remote_chunk_allocate_module_identity(void)
 {
-	unsigned long long current = atomic_load_explicit(
+	unsigned long long previous = atomic_load_explicit(
 		&is_remote_chunk_next_module_identity, memory_order_relaxed);
 
 	for (;;) {
 		unsigned long long next;
 
-		if (current >= IS_REMOTE_CHUNK_ID_MAX - 1ULL)
+		if (previous >= IS_REMOTE_CHUNK_ID_MAX - 1ULL)
 			return 0;
-		next = current + 1ULL;
+		next = previous + 1ULL;
 		if (atomic_compare_exchange_weak_explicit(
-			&is_remote_chunk_next_module_identity, &current, next,
+			&is_remote_chunk_next_module_identity, &previous, next,
 			memory_order_relaxed, memory_order_relaxed))
 			return next;
 	}
