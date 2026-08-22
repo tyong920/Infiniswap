@@ -21,14 +21,6 @@ target_compile_options(infiniswap-protocol PRIVATE -Wall -Wextra -Wpedantic -Wer
 target_include_directories(
   infiniswap-protocol PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../common)
 
-add_library(
-  infiniswap-placement STATIC
-  ${CMAKE_CURRENT_SOURCE_DIR}/../common/infiniswap_placement.c)
-target_compile_features(infiniswap-placement PUBLIC c_std_11)
-target_compile_options(infiniswap-placement PRIVATE -Wall -Wextra -Wpedantic -Werror)
-target_include_directories(
-  infiniswap-placement PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../common)
-
 add_library(infiniswap-memory STATIC infiniswap_memory_manager.c)
 target_compile_features(infiniswap-memory PUBLIC c_std_11)
 target_compile_definitions(infiniswap-memory PUBLIC _POSIX_C_SOURCE=200809L)
@@ -139,11 +131,6 @@ if(BUILD_TESTING)
   target_compile_options(protocol-test PRIVATE -Wall -Wextra -Wpedantic -Werror)
   target_link_libraries(protocol-test PRIVATE infiniswap-protocol)
   add_test(NAME protocol COMMAND protocol-test)
-
-  add_executable(placement-test tests/placement_test.c)
-  target_compile_options(placement-test PRIVATE -Wall -Wextra -Wpedantic -Werror)
-  target_link_libraries(placement-test PRIVATE infiniswap-placement)
-  add_test(NAME placement COMMAND placement-test)
 
   add_executable(
     protocol-previous-build-test

@@ -2170,21 +2170,11 @@ int is_device_activate(struct is_device *device)
 		mutex_lock(&device->remote_state_lock);
 		remote_state_locked = true;
 	}
-	if (remote_only) {
-		struct is_remote_chunk_snapshot *snapshot = NULL;
-		bool capacity_ready = false;
-
-		if (!is_remote_chunk_snapshot_take(device->remote_chunks, &snapshot))
-			capacity_ready = (u64)snapshot->usable_chunks *
-				IS_REMOTE_CHUNK_BYTES == device->capacity_bytes;
-		is_remote_chunk_snapshot_release(snapshot);
-		if (atomic_read(&device->remote_lost) ||
-		    atomic_read(&device->connection_state) !=
-			    IS_CONNECTION_CONNECTED ||
-		    !capacity_ready) {
-			ret = -ENOTCONN;
-			goto release_resources;
-		}
+	if (remote_only &&
+	    (atomic_read(&device->remote_lost) ||
+	     atomic_read(&device->connection_state) != IS_CONNECTION_CONNECTED)) {
+		ret = -ENOTCONN;
+		goto release_resources;
 	}
 
 	ret = is_remote_io_transaction_engine_init(&device->transaction_engine,

@@ -819,15 +819,15 @@ static void is_remote_chunk_mapping_terminal_record_locked(
 		sizeof(module->active_mapping_claim));
 }
 
-static int is_remote_chunk_mapping_begin_locked(
+static int is_remote_chunk_mapping_claim_create_locked(
 	struct is_remote_chunk_module *module,
 	struct is_remote_chunk_provider_handle provider,
-	const unsigned int *logical_chunks, unsigned int chunk_count,
+	unsigned int logical_chunk,
 	struct is_remote_chunk_mapping_claim *claim_out)
 {
 	struct is_remote_chunk_mapping_claim_internal claim = { 0 };
 	bool selected[IS_REMOTE_CHUNK_MAX_CHUNKS] = { false };
-	unsigned int index;
+	struct is_remote_chunk *chunk;
 
 	if (module->quiescing)
 		return -ESHUTDOWN;
@@ -835,22 +835,16 @@ static int is_remote_chunk_mapping_begin_locked(
 		return -ESTALE;
 	if (module->active_mapping_claims)
 		return -EBUSY;
-	for (index = 0; index < chunk_count; index++) {
-		unsigned int logical_chunk = logical_chunks[index];
-
-		if (logical_chunk >= module->chunk_count)
-			return -ERANGE;
-		if (selected[logical_chunk])
-			return -EINVAL;
-		if (module->chunks[logical_chunk].state !=
-		    IS_REMOTE_CHUNK_UNMAPPED)
-			return -EBUSY;
-		selected[logical_chunk] = true;
-	}
+	if (logical_chunk >= module->chunk_count)
+		return -ERANGE;
+	chunk = &module->chunks[logical_chunk];
+	if (chunk->state != IS_REMOTE_CHUNK_UNMAPPED)
+		return -EBUSY;
 	if (module->next_mapping_claim_id == IS_REMOTE_CHUNK_ID_MAX ||
 	    module->next_transition_generation == IS_REMOTE_CHUNK_ID_MAX)
 		return -EOVERFLOW;
 
+	selected[logical_chunk] = true;
 	claim.magic = IS_REMOTE_CHUNK_CLAIM_MAGIC;
 	claim.module_identity = module->identity;
 	claim.provider = provider;
@@ -858,21 +852,14 @@ static int is_remote_chunk_mapping_begin_locked(
 	claim.transition_generation = ++module->next_transition_generation;
 	claim.batch_digest = is_remote_chunk_batch_digest(selected,
 		module->chunk_count);
-	claim.chunk_count = chunk_count;
-	claim.capacity_debit = chunk_count;
+	claim.chunk_count = 1;
+	claim.capacity_debit = 1;
 	is_remote_chunk_mapping_terminal_supersede_locked(module);
 	module->active_mapping_claim = claim;
-	for (index = 0; index < module->chunk_count; index++) {
-		struct is_remote_chunk *chunk;
-
-		if (!selected[index])
-			continue;
-		chunk = &module->chunks[index];
-		chunk->state = IS_REMOTE_CHUNK_MAPPING;
-		chunk->provider = provider;
-		chunk->mapping_claim_id = claim.claim_id;
-		chunk->transition_generation = claim.transition_generation;
-	}
+	chunk->state = IS_REMOTE_CHUNK_MAPPING;
+	chunk->provider = provider;
+	chunk->mapping_claim_id = claim.claim_id;
+	chunk->transition_generation = claim.transition_generation;
 	module->active_mapping_claims++;
 	is_remote_chunk_claim_encode(claim_out, &claim);
 	return 0;
@@ -1062,32 +1049,54 @@ static void is_remote_chunk_provider_debits_locked(
 	*mapping_out = mapping;
 }
 
+static unsigned int is_remote_chunk_reconcile_available(
+	unsigned int reported_available, unsigned int observed_debits,
+	unsigned int current_debits)
+{
+	if (current_debits >= observed_debits) {
+		unsigned int new_debits = current_debits - observed_debits;
+
+		return reported_available > new_debits ?
+			reported_available - new_debits : 0;
+	}
+	if (reported_available > IS_REMOTE_CHUNK_U32_MAX -
+		(observed_debits - current_debits))
+		return IS_REMOTE_CHUNK_U32_MAX;
+	return reported_available + observed_debits - current_debits;
+}
+
 static unsigned int is_remote_chunk_provider_effective_available_locked(
 	const struct is_remote_chunk_module *module,
 	const struct is_remote_chunk_provider *provider)
 {
 	unsigned int assigned;
 	unsigned int mapping;
-	unsigned int current_debits;
 
 	if (provider->failed || !provider->has_observation ||
 	    !provider->placement_eligible)
 		return 0;
 	is_remote_chunk_provider_debits_locked(module, provider->handle,
 		&assigned, &mapping);
-	current_debits = assigned + mapping;
-	if (current_debits >= provider->observation_debited_chunks) {
-		unsigned int new_debits = current_debits -
-			provider->observation_debited_chunks;
+	return is_remote_chunk_reconcile_available(
+		provider->reported_available_chunks,
+		provider->observation_debited_chunks, assigned + mapping);
+}
 
-		return provider->reported_available_chunks > new_debits ?
-			provider->reported_available_chunks - new_debits : 0;
-	}
-	if (provider->reported_available_chunks > IS_REMOTE_CHUNK_U32_MAX -
-		(provider->observation_debited_chunks - current_debits))
-		return IS_REMOTE_CHUNK_U32_MAX;
-	return provider->reported_available_chunks +
-		provider->observation_debited_chunks - current_debits;
+static unsigned int is_remote_chunk_provider_diagnostic_available_locked(
+	const struct is_remote_chunk_module *module,
+	const struct is_remote_chunk_provider *provider)
+{
+	unsigned int assigned;
+	unsigned int ignored_mapping;
+
+	if (provider->failed || !provider->has_observation ||
+	    !provider->placement_eligible)
+		return 0;
+	is_remote_chunk_provider_debits_locked(module, provider->handle,
+		&assigned, &ignored_mapping);
+	return is_remote_chunk_reconcile_available(
+		provider->reported_available_chunks,
+		provider->observation_assigned_chunks, assigned);
 }
 
 static unsigned int is_remote_chunk_random_below_locked(
@@ -1350,29 +1359,6 @@ int is_remote_chunk_note_activity(
 	return 0;
 }
 
-int is_remote_chunk_mapping_begin_explicit(
-	struct is_remote_chunk_module *module,
-	struct is_remote_chunk_provider_handle provider,
-	const unsigned int *logical_chunks, unsigned int chunk_count,
-	struct is_remote_chunk_mapping_claim *claim_out)
-{
-	is_remote_chunk_lock_flags_t flags = 0;
-	int status;
-
-	if (!module || !logical_chunks || !chunk_count || !claim_out ||
-	    chunk_count > module->chunk_count)
-		return -EINVAL;
-	is_remote_chunk_lock(&module->lock, &flags);
-	if (module->mode != IS_REMOTE_CHUNK_MODE_REMOTE_ONLY) {
-		is_remote_chunk_unlock(&module->lock, &flags);
-		return -EOPNOTSUPP;
-	}
-	status = is_remote_chunk_mapping_begin_locked(module, provider,
-		logical_chunks, chunk_count, claim_out);
-	is_remote_chunk_unlock(&module->lock, &flags);
-	return status;
-}
-
 enum is_remote_chunk_next_mapping_result is_remote_chunk_next_mapping(
 	struct is_remote_chunk_module *module,
 	struct is_remote_chunk_mapping_request *request_out)
@@ -1471,8 +1457,8 @@ enum is_remote_chunk_next_mapping_result is_remote_chunk_next_mapping(
 	request.pool = remote_only ? IS_REMOTE_CHUNK_MAPPING_POOL_COMMITTED :
 		IS_REMOTE_CHUNK_MAPPING_POOL_OPPORTUNISTIC;
 	request.logical_chunk = logical_chunk;
-	status = is_remote_chunk_mapping_begin_locked(module, request.provider,
-		&logical_chunk, 1, &request.claim);
+	status = is_remote_chunk_mapping_claim_create_locked(module,
+		request.provider, logical_chunk, &request.claim);
 	if (status) {
 		is_remote_chunk_unlock(&module->lock, &flags);
 		return status == -ESHUTDOWN ?
@@ -2433,6 +2419,9 @@ int is_remote_chunk_snapshot_take(
 		provider_snapshot->placement_weight = provider->placement_weight;
 		provider_snapshot->reported_available_chunks =
 			provider->reported_available_chunks;
+		provider_snapshot->diagnostic_available_chunks =
+			is_remote_chunk_provider_diagnostic_available_locked(module,
+				provider);
 		provider_snapshot->observation_assigned_chunks =
 			provider->observation_assigned_chunks;
 		provider_snapshot->observation_sequence =

@@ -87,7 +87,7 @@ struct is_remote_chunk_provider_handle {
 	unsigned long long opaque[2];
 };
 
-/* Initialize caller-owned claim storage before its first mapping begin. */
+/* Initialize caller-owned claim storage before requesting a mapping. */
 struct is_remote_chunk_mapping_claim {
 	union {
 		void *pointer_alignment;
@@ -247,6 +247,7 @@ struct is_remote_chunk_provider_snapshot {
 	unsigned int assigned_chunks;
 	unsigned int usable_chunks;
 	unsigned int reported_available_chunks;
+	unsigned int diagnostic_available_chunks;
 	unsigned int observation_assigned_chunks;
 	unsigned long long observation_sequence;
 	enum is_remote_chunk_provider_exclusion exclusion;
@@ -321,13 +322,6 @@ int is_remote_chunk_note_activity(
 	struct is_remote_chunk_module *module, unsigned int logical_start,
 	unsigned int chunk_count, enum is_remote_chunk_activity_kind kind,
 	bool *mapping_needed);
-
-/* Explicit batches reserve Committed Remote Chunks in Remote-Only Mode. */
-int is_remote_chunk_mapping_begin_explicit(
-	struct is_remote_chunk_module *module,
-	struct is_remote_chunk_provider_handle provider,
-	const unsigned int *logical_chunks, unsigned int chunk_count,
-	struct is_remote_chunk_mapping_claim *claim_out);
 
 /*
  * Atomically selects the next mode-specific logical Remote Chunk and Memory

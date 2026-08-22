@@ -13,7 +13,7 @@ License: GPL-2
  On Debian systems, the complete text of the GNU General Public License version
  2 is available in /usr/share/common-licenses/GPL-2.
 
-Files: common/infiniswap_protocol.* common/infiniswap_placement.*
+Files: common/infiniswap_protocol.*
        infiniswap_bd/is_io_policy.h infiniswap_bd/is_rdma_operation_owner.*
        infiniswap_bd/is_remote_io_transaction.*
        infiniswap_bd/tests/rdma-operation-owner-test.c
