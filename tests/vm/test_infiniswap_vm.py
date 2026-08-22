@@ -198,6 +198,30 @@ class QemuScenarioTest(unittest.TestCase):
         self.assertLess(len(str(guest.qmp_socket).encode("utf-8")), 108)
         self.assertIn(str(guest.qmp_socket), qmp_argument)
 
+    def test_provider_specs_preserve_placement_weights(self):
+        backend = object.__new__(qemu_backend.QemuBackend)
+        handle = SimpleNamespace(
+            providers=[object(), object()],
+            consumer=SimpleNamespace(
+                links=[
+                    {"provider_ip": "192.0.2.2", "consumer_rail": "rxe0"},
+                    {"provider_ip": "192.0.3.2", "consumer_rail": "rxe1"},
+                ]
+            )
+        )
+
+        specs = backend._provider_specs(handle)
+
+        self.assertEqual(
+            specs,
+            [
+                "provider-0|192.0.2.2|19420|rxe0|"
+                "/etc/infiniswap-vm-provider-0.psk|100",
+                "provider-1|192.0.3.2|19420|rxe1|"
+                "/etc/infiniswap-vm-provider-1.psk|150",
+            ],
+        )
+
     def test_remote_first_verifies_only_the_write_that_observes_backing_failure(self):
         backend = ScenarioRecordingBackend()
         handle = SimpleNamespace(consumer=object())
@@ -236,7 +260,13 @@ class QemuScenarioTest(unittest.TestCase):
     def test_remote_chunk_certification_exercises_atomicity_and_mode_policies(self):
         backend = ScenarioRecordingBackend()
         consumer = SimpleNamespace(
-            name="consumer", links=[{"consumer_rail": "rxe0"}]
+            name="consumer",
+            links=[
+                {
+                    "consumer_rail": "rxe0",
+                    "provider_ip": "192.0.2.2",
+                }
+            ],
         )
         provider = SimpleNamespace(
             name="provider-0", links=[{"provider_rail": "rxe0"}]
@@ -289,6 +319,15 @@ class QemuScenarioTest(unittest.TestCase):
             calls["eviction-observe"], ("observe-eviction", "wait")
         )
         self.assertEqual(
+            calls["remote-only-admission-rejection"],
+            (
+                "expect-remote-only-admission-failure",
+                str(3 * qemu_backend.GIB),
+                "provider-0|192.0.2.2|19420|rxe0|"
+                "/etc/infiniswap-vm-provider-0.psk|100",
+            ),
+        )
+        self.assertEqual(
             calls["committed-under-pressure"],
             ("verify-remote-only-committed", "provider-0", "5"),
         )
@@ -323,6 +362,10 @@ class QemuScenarioTest(unittest.TestCase):
         )
         self.assertIn(
             "guest:provider-0:provider-pressure-remote-only.json",
+            result.artifacts,
+        )
+        self.assertIn(
+            "guest:consumer:remote-only-admission-rejection.json",
             result.artifacts,
         )
         self.assertIn(

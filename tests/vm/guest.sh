@@ -188,12 +188,18 @@ create_device() {
   local mode=$1 policy=$2 group_backing=$3 capacity=$4 failure_deadline_ms=$5
   shift 5
   local wait_for_connection=yes
-  if [[ ${1:-} == --allow-not-connected ]]; then
-    wait_for_connection=no
+  local expect_admission_failure=no
+  while (($#)); do
+    case $1 in
+      --allow-not-connected) wait_for_connection=no ;;
+      --expect-admission-failure) expect_admission_failure=yes ;;
+      *) break ;;
+    esac
     shift
-  fi
+  done
   local -a specs=("$@") providers=()
   local spec provider_id address port rail psk_file psk numa provider_list=
+  local placement_weight
 
   stop_device
   load_module
@@ -216,7 +222,7 @@ create_device() {
   printf '100\n' >"$group/swap_priority"
 
   for spec in "${specs[@]}"; do
-    IFS='|' read -r provider_id address port rail psk_file <<<"$spec"
+    IFS='|' read -r provider_id address port rail psk_file placement_weight <<<"$spec"
     providers+=("$provider_id")
   done
   provider_list=$(IFS=,; echo "${providers[*]}")
@@ -225,7 +231,8 @@ create_device() {
   printf '7\n' >"$group/placement_seed"
 
   for spec in "${specs[@]}"; do
-    IFS='|' read -r provider_id address port rail psk_file <<<"$spec"
+    IFS='|' read -r provider_id address port rail psk_file placement_weight <<<"$spec"
+    placement_weight=${placement_weight:-100}
     psk=$(<"$psk_file")
     [[ $psk =~ ^[[:xdigit:]]{64}$ ]] || fail "invalid Consumer PSK file"
     numa=$(cat "/sys/class/infiniband/$rail/device/numa_node" 2>/dev/null || echo -1)
@@ -237,13 +244,44 @@ create_device() {
     printf '%s\n' "$numa" >"$group/rdma_numa_node"
     printf 'key-vm\n' >"$group/provider_key_id"
     printf '%s\n' "$psk" >"$group/provider_psk"
-    printf '100\n' >"$group/placement_weight"
+    printf '%s\n' "$placement_weight" >"$group/placement_weight"
   done
+  if [[ $expect_admission_failure == yes ]]; then
+    if printf 'activate\n' >"$group/state" 2>/dev/null; then
+      fail "insufficient Remote-Only capacity activated a device"
+    fi
+    [[ $(<"$group/state") == created ]] ||
+      fail "failed Remote-Only admission changed lifecycle state"
+    [[ ! -e $device ]] || fail "failed Remote-Only admission exposed a device"
+    [[ $(<"$group/remote_capacity_bytes") == 0 ]] ||
+      fail "failed Remote-Only admission retained partial capacity"
+    [[ $(<"$group/mapped_remote_chunks") == 0 ]] ||
+      fail "failed Remote-Only admission retained partial mappings"
+    printf '{"schema_version":1,"kind":"infiniswap.remote-only-admission",' \
+      >"$artifacts/remote-only-admission-rejection.json"
+    printf '"status":"rejected","requested_capacity_bytes":%s,' "$capacity" \
+      >>"$artifacts/remote-only-admission-rejection.json"
+    printf '"remote_capacity_bytes":0,"mapped_remote_chunks":0,' \
+      >>"$artifacts/remote-only-admission-rejection.json"
+    printf '"device_exposed":false}\n' \
+      >>"$artifacts/remote-only-admission-rejection.json"
+    stop_device
+    return 0
+  fi
+
   printf 'activate\n' >"$group/state"
   wait_for_path "$device" present
   if [[ $wait_for_connection == yes ]]; then
     wait_for_field connection_state connected
   fi
+}
+
+expect_remote_only_admission_failure() {
+  local capacity=$1
+  shift
+
+  create_device remote-only strict "$backing" "$capacity" 2000 \
+    --expect-admission-failure "$@"
 }
 
 write_pattern() {
@@ -1050,6 +1088,9 @@ case $command in
     if timeout 10 dd if=/dev/zero of="$device" bs=4096 count=1 oflag=direct status=none; then
       fail "terminal device accepted I/O"
     fi
+    ;;
+  expect-remote-only-admission-failure)
+    expect_remote_only_admission_failure "$@"
     ;;
   mark-kernel) mark_kernel ;;
   check-kernel) check_kernel ;;

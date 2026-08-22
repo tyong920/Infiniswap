@@ -648,8 +648,14 @@ class QemuBackend:
         for index in indices:
             link = handle.consumer.links[index]
             specs.append(
-                "provider-%d|%s|19420|%s|/etc/infiniswap-vm-provider-%d.psk"
-                % (index, link["provider_ip"], link["consumer_rail"], index)
+                "provider-%d|%s|19420|%s|/etc/infiniswap-vm-provider-%d.psk|%d"
+                % (
+                    index,
+                    link["provider_ip"],
+                    link["consumer_rail"],
+                    index,
+                    100 + index * 50,
+                )
             )
         return specs
 
@@ -1180,6 +1186,7 @@ class QemuBackend:
         self._reset_transports(handle)
 
         provider = handle.providers[0]
+        provider_spec = self._provider_specs(handle, (0,))[0]
         self._helper(
             handle,
             provider,
@@ -1191,6 +1198,15 @@ class QemuBackend:
             "auto",
             "1",
             "2",
+        )
+        self._helper(
+            handle,
+            handle.consumer,
+            "remote-only-admission-rejection",
+            "expect-remote-only-admission-failure",
+            str(3 * GIB),
+            provider_spec,
+            timeout=180,
         )
         self._create_device(
             handle, "remote-only", provider_indices=(0,), capacity_gib=1
@@ -1288,14 +1304,16 @@ class QemuBackend:
             status="passed",
             detail=(
                 "atomic eviction drained accepted I/O, used Backing Store fallback, "
-                "preserved Committed Remote Chunks under pressure, and retained "
-                "terminal Remote-Lost behavior"
+                "rejected insufficient aggregate Committed Pool capacity without "
+                "partial exposure, preserved Committed Remote Chunks under pressure, "
+                "and retained terminal Remote-Lost behavior"
             ),
             artifacts=(
                 "guest:consumer:remote-chunk-contracts.json",
                 "guest:consumer:atomic-eviction.json",
                 "guest:consumer:fio-atomic-eviction.json",
                 "guest:consumer:status-atomic-eviction.json",
+                "guest:consumer:remote-only-admission-rejection.json",
                 "guest:consumer:status-remote-chunk-remote-lost.json",
                 "guest:provider-0:provider-pressure-backed.json",
                 "guest:provider-0:provider-pressure-remote-only.json",
