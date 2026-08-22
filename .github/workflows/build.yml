@@ -242,10 +242,11 @@ jobs:
           test -n "$kdir"
           echo "kdir=$kdir" >> "$GITHUB_OUTPUT"
 
-      - name: Build Memory Consumer module
+      - name: Build Memory Consumer module with warnings as errors
         run: >-
           make -C infiniswap_bd
           KDIR="${{ steps.headers.outputs.kdir }}"
+          KCFLAGS="-Werror"
           modules
 
       - name: Check whitespace

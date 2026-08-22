@@ -13,6 +13,10 @@
 *.swo
 *.bak
 
+# Python bytecode
+__pycache__/
+*.py[cod]
+
 # CMake output
 build/
 cmake-build-*/

@@ -13,6 +13,7 @@ import signal
 import socket
 import subprocess
 import tarfile
+import tempfile
 import time
 import urllib.request
 from dataclasses import dataclass, field
@@ -75,6 +76,7 @@ class CaseHandle:
     entry: Dict[str, object]
     case_dir: Path
     work: Path
+    qmp_dir: Path
     key_path: Path
     source_archive: Path
     image_path: Path
@@ -106,10 +108,13 @@ class QemuBackend:
         source_archive = work / "source.tar.gz"
         self._create_source_archive(source_archive)
         guests, data_ports = self._guest_layout(entry, work)
+        # Keep QMP socket paths below Linux sockaddr_un's 108-byte limit.
+        qmp_dir = Path(tempfile.mkdtemp(prefix="infiniswap-qmp-", dir="/tmp"))
         handle = CaseHandle(
             entry=entry,
             case_dir=case_dir,
             work=work,
+            qmp_dir=qmp_dir,
             key_path=key_path,
             source_archive=source_archive,
             image_path=image_path,
@@ -240,7 +245,8 @@ class QemuBackend:
         if retain:
             retained = handle.case_dir / "RETAINED"
             retained.write_text(
-                "VMs retained after failure. QMP sockets and disks are under work/.\n",
+                "VMs retained after failure. QMP sockets are under %s; "
+                "disks are under work/.\n" % handle.qmp_dir,
                 encoding="utf-8",
             )
             return
@@ -433,7 +439,7 @@ class QemuBackend:
         )
 
     def _qemu_command(self, handle, guest: Guest):
-        guest.qmp_socket = guest.work / "qmp.sock"
+        guest.qmp_socket = handle.qmp_dir / (guest.name + ".sock")
         command = [
             "ionice",
             "-c",
@@ -2093,4 +2099,5 @@ class QemuBackend:
 
     def _force_cleanup(self, handle) -> None:
         self._force_processes(handle)
+        shutil.rmtree(handle.qmp_dir, ignore_errors=True)
         shutil.rmtree(handle.work, ignore_errors=True)

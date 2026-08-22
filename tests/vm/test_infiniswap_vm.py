@@ -167,6 +167,37 @@ class QemuScenarioTest(unittest.TestCase):
             ),
         )
 
+    def test_qemu_command_uses_short_external_qmp_socket_path(self):
+        backend = object.__new__(qemu_backend.QemuBackend)
+        long_case = Path("/tmp") / ("long-artifact-path-" * 8)
+        guest = qemu_backend.Guest(
+            name="consumer",
+            role="consumer",
+            resources={"vcpus": 1, "memory_gib": 4},
+            work=long_case / "work" / "consumer",
+            ssh_port=2200,
+            mgmt_mac="52:54:00:00:00:01",
+        )
+        handle = SimpleNamespace(
+            case_dir=long_case,
+            entry={"kernel": "6.8"},
+            qmp_dir=Path("/tmp/infiniswap-qmp-test"),
+        )
+
+        self.assertGreaterEqual(
+            len(str(guest.work / "qmp.sock").encode("utf-8")),
+            108,
+        )
+        command = backend._qemu_command(handle, guest)
+
+        self.assertEqual(
+            guest.qmp_socket,
+            handle.qmp_dir / "consumer.sock",
+        )
+        qmp_argument = command[command.index("-qmp") + 1]
+        self.assertLess(len(str(guest.qmp_socket).encode("utf-8")), 108)
+        self.assertIn(str(guest.qmp_socket), qmp_argument)
+
     def test_remote_first_verifies_only_the_write_that_observes_backing_failure(self):
         backend = ScenarioRecordingBackend()
         handle = SimpleNamespace(consumer=object())

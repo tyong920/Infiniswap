@@ -1061,7 +1061,8 @@ case $command in
     uname -r
     ;;
   build-consumer)
-    make -C "$repo/infiniswap_bd" "KDIR=/lib/modules/$(uname -r)/build" -j2 modules
+    make -C "$repo/infiniswap_bd" "KDIR=/lib/modules/$(uname -r)/build" \
+      KCFLAGS=-Werror -j2 modules
     ;;
   build-provider)
     cmake -S "$repo/infiniswap_daemon" -B "$repo/build/daemon" -G Ninja \
